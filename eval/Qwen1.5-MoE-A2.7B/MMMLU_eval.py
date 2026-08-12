@@ -93,7 +93,7 @@ def score_candidates_batch(model, tokenizer, prompts, device):
     attention_mask = enc["attention_mask"].to(device)
 
     outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-    log_probs = F.log_softmax(outputs.logits.float(), dim=-1)
+    log_probs = F.log_softmax(outputs.logits, dim=-1)
 
     seq_lens = attention_mask.sum(dim=1).tolist()
     n = input_ids.shape[0]
