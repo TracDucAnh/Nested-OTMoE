@@ -7,3 +7,10 @@ langcodes
 language_data 
 unicodedataplus
 python-dotenv
+
+torch>=2.1.0
+transformers>=4.37.0
+accelerate>=0.27.0
+safetensors>=0.4.0
+sentencepiece>=0.1.99
+numpy>=1.24.0
