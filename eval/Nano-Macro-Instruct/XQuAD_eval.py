@@ -45,6 +45,7 @@ from collections import Counter, OrderedDict
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from tqdm import tqdm
 
 
 # ----------------------------------------------------------------------------- #
@@ -247,7 +248,7 @@ def evaluate_language(model, tokenizer, lang, records, batch_size, max_new_token
     em_total, f1_total = 0.0, 0.0
     n = len(records)
 
-    for start in range(0, n, batch_size):
+    for start in tqdm(range(0, n, batch_size), desc=f"{lang}", unit="batch"):
         batch = records[start:start + batch_size]
         prompts = [
             build_prompt(tokenizer, r["context"], r["question"], use_chat_template) for r in batch
@@ -267,10 +268,7 @@ def evaluate_language(model, tokenizer, lang, records, batch_size, max_new_token
                 "f1": f1,
             }
 
-        done = min(start + batch_size, n)
-        print(f"  [{lang}] {done}/{n} examples", end="\r", flush=True)
-
-    print()
+    
     return {
         "num_examples": n,
         "em": 100.0 * em_total / n if n else 0.0,
@@ -333,7 +331,7 @@ def main():
     results = OrderedDict()
     t0 = time.time()
 
-    for lang in args.languages:
+    for lang in tqdm(args.languages, desc="languages"):
         data_path = os.path.join(args.data_root, lang, "validation.json")
         if not os.path.exists(data_path):
             print(f"[WARN] Skipping '{lang}': {data_path} not found")
