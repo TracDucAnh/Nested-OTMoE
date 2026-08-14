@@ -22,15 +22,20 @@ Only `test.json` is used for every language folder under
 
 OOM-safe dynamic batching
 --------------------------
-Batches are processed with `--batch_size` as the *starting* size. If a batch
-raises a CUDA/CPU out-of-memory error, we:
-  1. free whatever memory we can (gc.collect + torch.cuda.empty_cache),
-  2. split the offending batch in half and retry each half recursively
-     (halving again if needed), and
-  3. remember the smaller size so future batches for this run start smaller
-     too (it will slowly grow back after a streak of OOM-free batches).
-If a single example (batch size 1) still OOMs, that example is skipped
-(logged and marked in the output) instead of crashing the whole run.
+Every chunk of data is first attempted at the full `--batch_size`. If a
+chunk raises a CUDA/CPU out-of-memory error, we:
+  1. free whatever memory we can (gc.collect + torch.cuda.empty_cache) --
+     this only works because we've already exited the `except` block by
+     that point, so the exception's traceback (which would otherwise pin
+     the failed batch's GPU tensors in memory) has been released,
+  2. split the offending chunk in half and retry each half recursively
+     (halving again if needed).
+This shrinking is purely local to the chunk that OOM'd: it does NOT lower
+the starting size for the next chunk of data. Each new chunk always starts
+fresh at the full `--batch_size` again, since GPU memory is freed between
+chunks. If a single example (batch size 1) still OOMs, that example is
+skipped (logged and marked in the output) instead of crashing the whole
+run.
 
 Usage
 -----
@@ -92,34 +97,22 @@ def clear_memory():
 
 
 class DynamicBatcher:
-    """Tracks a "safe" batch size across a run.
+    """Holds the batch-size bounds for a run.
 
-    Halves on OOM (down to `min_batch_size`) and slowly grows back by 1 after
-    a streak of `grow_after` OOM-free batches, up to the original requested
-    size. This means one OOM doesn't permanently cripple throughput for the
-    rest of the evaluation, but we also don't immediately jump back into
-    the same OOM.
+    Every new outer chunk of data starts fresh at `initial_batch_size` --
+    an OOM on one chunk does NOT lower the starting size for the *next*
+    chunk. The halving on OOM (down to `min_batch_size`) only happens
+    *within* a single chunk's divide-and-conquer retry (see
+    `score_chunk_with_oom_retry`) and is discarded once that chunk is
+    done; it never leaks into subsequent chunks.
     """
 
-    def __init__(self, initial_batch_size: int, min_batch_size: int = 1, grow_after: int = 20):
+    def __init__(self, initial_batch_size: int, min_batch_size: int = 1):
         self.initial_batch_size = max(1, initial_batch_size)
         self.min_batch_size = max(1, min_batch_size)
-        self.grow_after = grow_after
-        self.size = self.initial_batch_size
-        self._success_streak = 0
-
-    def shrink(self):
-        self.size = max(self.min_batch_size, self.size // 2)
-        self._success_streak = 0
-
-    def note_success(self):
-        self._success_streak += 1
-        if self._success_streak >= self.grow_after and self.size < self.initial_batch_size:
-            self.size = min(self.initial_batch_size, self.size + 1)
-            self._success_streak = 0
 
 
-def score_chunk_with_oom_retry(model, tokenizer, chunk, build_prompt_fn, device, batcher, min_batch_size=1):
+def score_chunk_with_oom_retry(model, tokenizer, chunk, build_prompt_fn, device, min_batch_size=1):
     """Score `chunk` (a list of examples), recursively halving on OOM.
 
     Returns a list of (example, pred_index_or_None) pairs aligned with
@@ -173,12 +166,14 @@ def score_chunk_with_oom_retry(model, tokenizer, chunk, build_prompt_fn, device,
         return [(ex, None) for ex in chunk]
 
     new_size = max(min_batch_size, len(chunk) // 2)
-    print(f"[OOM] batch_size={len(chunk)} failed -> halving to {new_size} and retrying")
-    batcher.shrink()
+    print(
+        f"[OOM] batch_size={len(chunk)} failed -> halving to {new_size} and retrying "
+        f"(next outer chunk still starts fresh at the full --batch_size)"
+    )
     mid = len(chunk) // 2
-    left = score_chunk_with_oom_retry(model, tokenizer, chunk[:mid], build_prompt_fn, device, batcher, min_batch_size)
+    left = score_chunk_with_oom_retry(model, tokenizer, chunk[:mid], build_prompt_fn, device, min_batch_size)
     clear_memory()
-    right = score_chunk_with_oom_retry(model, tokenizer, chunk[mid:], build_prompt_fn, device, batcher, min_batch_size)
+    right = score_chunk_with_oom_retry(model, tokenizer, chunk[mid:], build_prompt_fn, device, min_batch_size)
     return left + right
 
 
@@ -260,11 +255,15 @@ def evaluate_language(model, tokenizer, lang, data_root, device, batch_size, max
     pbar = tqdm(total=len(data), desc=f"MMMLU[{lang}]")
     idx = 0
     while idx < len(data):
-        cur_bs = batcher.size
+        # Always start each new chunk at the full requested batch size.
+        # An OOM on a previous chunk only shrinks *that* chunk's own
+        # divide-and-conquer retry internally (see score_chunk_with_oom_retry);
+        # it does not carry over and shrink subsequent chunks.
+        cur_bs = batcher.initial_batch_size
         chunk = data[idx : idx + cur_bs]
 
         pair_results = score_chunk_with_oom_retry(
-            model, tokenizer, chunk, build_prompt, device, batcher, min_batch_size
+            model, tokenizer, chunk, build_prompt, device, min_batch_size
         )
 
         for ex, pred in pair_results:
@@ -299,7 +298,6 @@ def evaluate_language(model, tokenizer, lang, data_root, device, batch_size, max
 
         idx += len(chunk)
         pbar.update(len(chunk))
-        batcher.note_success()
         clear_memory()
     pbar.close()
 
