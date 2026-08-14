@@ -131,27 +131,55 @@ def score_chunk_with_oom_retry(model, tokenizer, chunk, build_prompt_fn, device,
         return []
 
     prompts = [build_prompt_fn(ex) for ex in chunk]
+
+    # NOTE on the fix below: we deliberately do NOT call clear_memory() or
+    # recurse from *inside* the `except` block. In Python 3, an `except X as e`
+    # clause keeps `e` (and therefore its traceback) alive for the entire
+    # duration of that block. The traceback holds a reference to every stack
+    # frame between where the exception was raised and where it was caught --
+    # including score_candidates_batch's frame, with its still-allocated GPU
+    # tensors (input_ids, attention_mask, logits, log_probs, ...). While `e`
+    # is alive, gc.collect()/torch.cuda.empty_cache() cannot reclaim that
+    # memory, so clear_memory() was effectively a no-op. Worse, because the
+    # old code recursed *inside* the except block, every OOM'd ancestor call
+    # in the recursion tree kept its own `e`/traceback (and its own failed
+    # batch's tensors) alive simultaneously, all the way down -- so by the
+    # time batch_size reached 1, GPU memory was still clogged with every
+    # larger failed batch above it, and even a single tiny example could OOM.
+    #
+    # The fix: catch the exception, record that it happened, then let the
+    # `except` block end (Python auto-clears `e`/the traceback at that
+    # point). Only after we're back to a clean scope do we call
+    # clear_memory() and recurse -- so the memory is actually freed before
+    # each retry.
+    oom = False
     try:
         scores = score_candidates_batch(model, tokenizer, prompts, device)
     except RuntimeError as e:
         if not is_oom_error(e):
             raise
-        clear_memory()
-        if len(chunk) <= min_batch_size:
-            q_preview = str(chunk[0].get("Question", ""))[:80]
-            print(f"[OOM][WARN] batch_size=1 still OOM, skipping example: {q_preview!r}")
-            return [(ex, None) for ex in chunk]
-        new_size = max(min_batch_size, len(chunk) // 2)
-        print(f"[OOM] batch_size={len(chunk)} failed -> halving to {new_size} and retrying")
-        batcher.shrink()
-        mid = len(chunk) // 2
-        left = score_chunk_with_oom_retry(model, tokenizer, chunk[:mid], build_prompt_fn, device, batcher, min_batch_size)
-        clear_memory()
-        right = score_chunk_with_oom_retry(model, tokenizer, chunk[mid:], build_prompt_fn, device, batcher, min_batch_size)
-        return left + right
-    else:
+        oom = True
+    # `e` and its traceback are now out of scope and cleared.
+
+    if not oom:
         preds = scores.argmax(axis=1)
         return list(zip(chunk, preds))
+
+    clear_memory()
+
+    if len(chunk) <= min_batch_size:
+        q_preview = str(chunk[0].get("Question", ""))[:80]
+        print(f"[OOM][WARN] batch_size=1 still OOM, skipping example: {q_preview!r}")
+        return [(ex, None) for ex in chunk]
+
+    new_size = max(min_batch_size, len(chunk) // 2)
+    print(f"[OOM] batch_size={len(chunk)} failed -> halving to {new_size} and retrying")
+    batcher.shrink()
+    mid = len(chunk) // 2
+    left = score_chunk_with_oom_retry(model, tokenizer, chunk[:mid], build_prompt_fn, device, batcher, min_batch_size)
+    clear_memory()
+    right = score_chunk_with_oom_retry(model, tokenizer, chunk[mid:], build_prompt_fn, device, batcher, min_batch_size)
+    return left + right
 
 
 def build_prompt(ex: dict) -> str:
