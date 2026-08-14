@@ -1,0 +1,5 @@
+=== BÁO CÁO TOÀN VẸN DỮ LIỆU FLORES-200 ===
+1. Tổng số ngôn ngữ (cột): 128
+2. Tổng số bản ghi (hàng): 1997
+----------------------------------------
+KẾT LUẬN: Dữ liệu SẠCH 100%. Không có ID nào bị khuyết ngôn ngữ.

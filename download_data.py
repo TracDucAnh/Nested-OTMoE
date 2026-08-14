@@ -93,6 +93,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# HF_TOKEN = os.getenv("HF_TOKEN")
+
 HF_TOKEN = os.getenv("HF_TOKEN")
 
 if HF_TOKEN:
@@ -451,9 +453,8 @@ def download_bible():
                 lang2=lang2,
                 trust_remote_code=True,
             )
-        except Exception:
-            # Không phải cặp nào trong C(n,2) cũng thực sự có bitext trên
-            # OPUS -> bỏ qua lặng lẽ để không spam log cho hàng nghìn cặp.
+        except Exception as e:
+            print(f"\n[LỖI CỤ THỂ cặp {lang1}-{lang2}]: {e}")
             skipped += 1
             continue
 
