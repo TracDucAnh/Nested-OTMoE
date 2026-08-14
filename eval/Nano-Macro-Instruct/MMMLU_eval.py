@@ -356,6 +356,99 @@ def evaluate_language(
     return acc, total, skipped, records
 
 
+# --------------------------------------------------------------------------
+# Incremental save / resume helpers
+# --------------------------------------------------------------------------
+# The idea: mmmlu_results.json is the single source of truth for "which
+# languages are already done". After every language finishes, we merge its
+# result into whatever is already on disk and rewrite the file immediately
+# (that's the "append" behaviour -- old entries are kept, the new one is
+# added/updated). On a later run, any language already present there is
+# skipped and we move on to the next one that has no result yet.
+def load_results_json(output_dir):
+    """Load a previously saved mmmlu_results.json, if any, and return its
+    `per_language` dict (language -> {"accuracy", "n_examples", "n_skipped"}).
+    Returns {} if the file doesn't exist or can't be parsed."""
+    path = os.path.join(output_dir, "mmmlu_results.json")
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            summary = json.load(f)
+        return summary.get("per_language", {}) or {}
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"[WARN] Could not read existing results at {path} ({e}); starting fresh.")
+        return {}
+
+
+def load_subject_partial(output_dir):
+    """Load the running per-subject correct/total counts accumulated so far
+    (subject -> {"correct": int, "total": int}). This lets the final
+    per-subject breakdown stay correct across resumed runs without having to
+    keep every raw example record for already-finished languages in memory."""
+    path = os.path.join(output_dir, "mmmlu_subject_partial.json")
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"[WARN] Could not read existing subject partials at {path} ({e}); starting fresh.")
+        return {}
+
+
+def save_subject_partial(output_dir, subject_stats):
+    path = os.path.join(output_dir, "mmmlu_subject_partial.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(subject_stats, f, ensure_ascii=False, indent=2)
+
+
+def update_subject_partial(subject_stats, records):
+    """Fold one language's records into the running per-subject counts."""
+    for r in records:
+        subj = r.get("subject", "") or ""
+        entry = subject_stats.setdefault(subj, {"correct": 0, "total": 0})
+        entry["total"] += 1
+        if r.get("correct"):
+            entry["correct"] += 1
+    return subject_stats
+
+
+def save_results_incremental(output_dir, results, model_name, total_skipped):
+    """Write mmmlu_results.json / mmmlu_results.csv to disk right now, from
+    whatever is currently in `results` (already-done languages loaded from a
+    previous run + newly-finished ones from this run). Called right after
+    each language finishes so progress is never lost if the run stops
+    partway through, and so a later run can resume via load_results_json().
+    """
+    overall_correct = sum(r["accuracy"] * r["n_examples"] for r in results.values())
+    overall_total = sum(r["n_examples"] for r in results.values())
+    overall_micro_acc = overall_correct / overall_total if overall_total > 0 else 0.0
+    macro_acc = sum(r["accuracy"] for r in results.values()) / len(results) if results else 0.0
+
+    summary = {
+        "model": model_name,
+        "per_language": results,
+        "overall_micro_accuracy": overall_micro_acc,
+        "macro_average_accuracy": macro_acc,
+        "total_skipped": total_skipped,
+    }
+    json_path = os.path.join(output_dir, "mmmlu_results.json")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+
+    df = pd.DataFrame(
+        [
+            {"language": lang, "accuracy": r["accuracy"], "n_examples": r["n_examples"], "n_skipped": r["n_skipped"]}
+            for lang, r in results.items()
+        ]
+    ).sort_values("language")
+    csv_path = os.path.join(output_dir, "mmmlu_results.csv")
+    df.to_csv(csv_path, index=False)
+
+    return overall_micro_acc, macro_acc
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name_or_path", default="Nano-Macro-Instruct")
@@ -371,6 +464,15 @@ def main():
         "--no_chat_template",
         action="store_true",
         help="Disable chat-template formatting and use raw completion-style prompts instead (base-model style).",
+    )
+    parser.add_argument(
+        "--overwrite_existing",
+        action="store_true",
+        help=(
+            "Ignore any existing mmmlu_results.json / mmmlu_subject_partial.json in --output_dir and "
+            "re-evaluate every language from scratch. Default is to resume: languages that already have "
+            "a saved result are skipped, and results are saved to disk immediately after each language."
+        ),
     )
     args = parser.parse_args()
     use_chat_template = not args.no_chat_template
@@ -406,10 +508,28 @@ def main():
     )
     print(f"Languages to evaluate ({len(languages)}): {languages}")
 
-    results = {}
-    all_records = []
-    total_skipped = 0
+    # Resume support: `results` / `subject_stats` are seeded from whatever is
+    # already saved in --output_dir (unless --overwrite_existing). Any
+    # language already present in `results` is skipped below; everything
+    # else is evaluated normally and then appended into the same files.
+    if args.overwrite_existing:
+        results = {}
+        subject_stats = {}
+    else:
+        results = load_results_json(args.output_dir)
+        subject_stats = load_subject_partial(args.output_dir)
+    total_skipped = sum(r.get("n_skipped", 0) for r in results.values())
+
+    already_done = [lang for lang in languages if lang in results]
+    if already_done:
+        print(f"[RESUME] {len(already_done)} language(s) already have saved results and will be skipped: {already_done}")
+
     for lang in languages:
+        if lang in results:
+            r = results[lang]
+            print(f"[{lang}] SKIP (already evaluated): accuracy = {r['accuracy']:.4f}  ({r['n_examples']} examples, {r['n_skipped']} skipped)")
+            continue
+
         acc, total, skipped, records = evaluate_language(
             model,
             tokenizer,
@@ -426,20 +546,32 @@ def main():
         print(f"[{lang}] accuracy = {acc:.4f}  ({total} examples, {skipped} skipped)")
         for r in records:
             r["language"] = lang
-        all_records.extend(records)
 
         if args.save_predictions:
             pd.DataFrame(records).to_csv(
                 os.path.join(args.output_dir, f"mmmlu_predictions_{lang}.csv"), index=False
             )
 
+        update_subject_partial(subject_stats, records)
+        save_subject_partial(args.output_dir, subject_stats)
+
+        # Save immediately after this language finishes: mmmlu_results.json
+        # / mmmlu_results.csv are rewritten from `results`, which contains
+        # every language done so far (this run + any resumed from disk). If
+        # the process is killed right after this, the next run will pick up
+        # exactly where it left off.
+        save_results_incremental(args.output_dir, results, args.model_name_or_path, total_skipped)
+
         # free memory before moving on to the next language
         clear_memory()
 
-    overall_correct = sum(r["accuracy"] * r["n_examples"] for r in results.values())
-    overall_total = sum(r["n_examples"] for r in results.values())
-    overall_micro_acc = overall_correct / overall_total if overall_total > 0 else 0.0
-    macro_acc = sum(r["accuracy"] for r in results.values()) / len(results) if results else 0.0
+    # Final save. This also covers the edge case where every language was
+    # already done (all skipped) and the loop above never wrote anything.
+    overall_micro_acc, macro_acc = save_results_incremental(
+        args.output_dir, results, args.model_name_or_path, total_skipped
+    )
+    csv_path = os.path.join(args.output_dir, "mmmlu_results.csv")
+    json_path = os.path.join(args.output_dir, "mmmlu_results.json")
 
     print("=" * 60)
     print(f"Overall (micro, weighted by #examples) accuracy: {overall_micro_acc:.4f}")
@@ -447,38 +579,24 @@ def main():
     if total_skipped:
         print(f"Total skipped examples (persistent OOM): {total_skipped}")
 
-    df = pd.DataFrame(
-        [
-            {"language": lang, "accuracy": r["accuracy"], "n_examples": r["n_examples"], "n_skipped": r["n_skipped"]}
-            for lang, r in results.items()
-        ]
-    ).sort_values("language")
-    csv_path = os.path.join(args.output_dir, "mmmlu_results.csv")
-    df.to_csv(csv_path, index=False)
-
-    # Bonus: per-subject breakdown aggregated across all languages
-    if all_records:
-        subj_df = pd.DataFrame(all_records)
-        subj_summary = (
-            subj_df.groupby("subject")["correct"]
-            .agg(accuracy="mean", n_examples="count")
-            .reset_index()
-            .sort_values("subject")
-        )
+    # Bonus: per-subject breakdown aggregated across all languages. Built
+    # from `subject_stats`, which was accumulated incrementally (and
+    # reloaded from disk on resume), so it stays correct even when some
+    # languages were skipped in this particular run.
+    if subject_stats:
+        subj_summary = pd.DataFrame(
+            [
+                {
+                    "subject": subj,
+                    "accuracy": (s["correct"] / s["total"] if s["total"] else 0.0),
+                    "n_examples": s["total"],
+                }
+                for subj, s in subject_stats.items()
+            ]
+        ).sort_values("subject")
         subj_csv_path = os.path.join(args.output_dir, "mmmlu_subject_results.csv")
         subj_summary.to_csv(subj_csv_path, index=False)
         print(f"Saved: {subj_csv_path}")
-
-    summary = {
-        "model": args.model_name_or_path,
-        "per_language": results,
-        "overall_micro_accuracy": overall_micro_acc,
-        "macro_average_accuracy": macro_acc,
-        "total_skipped": total_skipped,
-    }
-    json_path = os.path.join(args.output_dir, "mmmlu_results.json")
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(summary, f, ensure_ascii=False, indent=2)
 
     print(f"\nSaved: {csv_path}")
     print(f"Saved: {json_path}")
