@@ -347,8 +347,8 @@ def plot_venn(lang_sets, names, popular_rows, union_all, output_dir: Path):
     ax.title.set_x(title_axes_frac)
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    out_path = output_dir / "language_coverage_venn.png"
-    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    out_path = output_dir / "language_coverage_venn.pdf"
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved: {out_path}")
 
