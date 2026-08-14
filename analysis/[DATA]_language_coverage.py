@@ -238,6 +238,15 @@ def plot_venn(lang_sets, names, popular_rows, union_all, output_dir: Path):
 
     fig, ax = plt.subplots(figsize=(13, 9))
 
+    # Horizontal center (in axes-fraction coords, 0-1) that the title should
+    # be aligned to. Defaults to 0.5 (middle of the axes); overridden below
+    # once we know where the venn circles themselves actually sit, since
+    # they are usually NOT centered on the axes (the axes also reserves
+    # empty space on the right for the legend, and -- for the real,
+    # size-proportional venn3 layout -- the three circles are different
+    # sizes/positions depending on the real, unequal set sizes).
+    diagram_x_center_frac = 0.5
+
     if HAS_VENN_LIB:
         v = venn3(
             [set_a, set_b, set_c],
@@ -248,7 +257,19 @@ def plot_venn(lang_sets, names, popular_rows, union_all, output_dir: Path):
             ],
             ax=ax,
         )
-        venn3_circles([set_a, set_b, set_c], ax=ax, linewidth=1.4, color="gray")
+        circles = venn3_circles([set_a, set_b, set_c], ax=ax, linewidth=1.4, color="gray")
+
+        # Compute the true left/right extent of the three circles (their
+        # actual centers +/- radii, as laid out by venn3's own algorithm)
+        # and convert that midpoint into an axes-fraction x, so the title
+        # can be centered over the diagram itself rather than over the
+        # whole axes box.
+        x_min = min(c.center[0] - c.radius for c in circles)
+        x_max = max(c.center[0] + c.radius for c in circles)
+        xlim = ax.get_xlim()
+        if xlim[1] != xlim[0]:
+            diagram_x_center_frac = ((x_min + x_max) / 2 - xlim[0]) / (xlim[1] - xlim[0])
+
         for patch_id in ("100", "010", "001", "110", "101", "011", "111"):
             patch = v.get_patch_by_id(patch_id)
             if patch is not None:
@@ -264,15 +285,10 @@ def plot_venn(lang_sets, names, popular_rows, union_all, output_dir: Path):
                 set_label.set_fontsize(18)
                 set_label.set_fontweight("bold")
     else:
+        # The schematic fallback lays its 3 circles out symmetrically
+        # (mirrored left/right), so the axes center (0.5) is already the
+        # correct horizontal center for the title -- no override needed.
         draw_schematic_venn(ax, names, set_a, set_b, set_c)
-
-    ax.set_title(
-        "Language Coverage Across Bible / FLORES / NTREX Datasets\n"
-        f"Total unique languages across all 3 datasets (union of language sets): {len(union_all)}",
-        fontsize=22,
-        fontweight="bold",
-        pad=24,
-    )
 
     # ---- legend: top popular languages, colored by which Venn region
     # (i.e. which combination of datasets) each one falls into ----
@@ -302,6 +318,34 @@ def plot_venn(lang_sets, names, popular_rows, union_all, output_dir: Path):
         legend.get_title().set_fontweight("bold")
 
     ax.set_axis_off()
+
+    # ---- Center the title on the FULL final page (diagram + legend
+    # together), not just on the venn circles. ----
+    # We measure the *actual* rendered bounding box of everything drawn so
+    # far (circles, region counts, dataset-name labels, legend) -- this is
+    # exactly what `bbox_inches="tight"` will crop the saved PNG to -- and
+    # find the horizontal midpoint of that box in the page's own
+    # (pre-crop) figure coordinates. This is more reliable than guessing a
+    # fixed x, because the legend's real footprint (via bbox_to_anchor)
+    # isn't known until things are actually laid out.
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    content_bbox = fig.get_tightbbox(renderer)  # inches, whole-figure coords
+    fig_width_in = fig.get_size_inches()[0]
+    page_center_fig_frac = ((content_bbox.x0 + content_bbox.x1) / 2) / fig_width_in
+
+    ax_pos = ax.get_position()  # axes rectangle, in figure-fraction coords
+    title_axes_frac = (page_center_fig_frac - ax_pos.x0) / ax_pos.width
+
+    ax.set_title(
+        "Language Coverage Across Bible / FLORES / NTREX Datasets\n"
+        f"Total unique languages across all 3 datasets (union of language sets): {len(union_all)}",
+        fontsize=22,
+        fontweight="bold",
+        pad=24,
+    )
+    ax.title.set_x(title_axes_frac)
+
     output_dir.mkdir(parents=True, exist_ok=True)
     out_path = output_dir / "language_coverage_venn.png"
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
