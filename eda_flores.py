@@ -10,7 +10,7 @@ from tqdm import tqdm
 # 1. THIẾT LẬP ĐƯỜNG DẪN
 # ---------------------------------------------------------
 SCRIPT_DIR = Path(__file__).resolve().parent
-FLORES_INPUT_PATH = SCRIPT_DIR / "data" / "processed_alignment" / "ntrex.json"
+FLORES_INPUT_PATH = SCRIPT_DIR / "data" / "processed_alignment" / "flores.json"
 
 # Tạo cấu trúc thư mục EDA
 EDA_DIR = SCRIPT_DIR / "EDA"
