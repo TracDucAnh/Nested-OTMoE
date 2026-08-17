@@ -17,12 +17,44 @@ Translations are scored at the corpus level with:
                so sacrebleu can download the FLORES-200 SPM model.
     - chrF++ : sacrebleu chrF with word_order=2 (character + word n-grams).
 
+Length-sorted batching
+-----------------------
+Within each pair, examples not yet translated are sorted by source-sentence
+length before being sliced into batches. This groups similarly-long
+sentences together so far less padding is wasted per batch (a batch of one
+very long sentence + many short ones pads every short sentence up to the
+long one's length) -- purely a speed optimization, output order is restored
+afterwards.
+
+OOM-safe dynamic batching
+--------------------------
+Every chunk of data is first attempted at the full `--batch_size`. If a
+chunk raises a CUDA/CPU out-of-memory error, we free memory (gc.collect +
+torch.cuda.empty_cache) and split the offending chunk in half, retrying each
+half recursively (halving again if needed). This shrinking is purely local
+to the chunk that OOM'd: it does NOT lower the starting size for the next
+chunk -- each new chunk always starts fresh at the full `--batch_size`. If a
+single example (batch size 1) still OOMs, that example is skipped (logged
+and marked "skipped": true in the predictions file) instead of crashing the
+run.
+
+Resume support
+--------------
+`<pair>_predictions.json` in `--output_dir` doubles as a checkpoint. As soon
+as a batch finishes translating, every example finished so far (both
+resumed-from-checkpoint and newly translated) is written into that file
+immediately (atomically, via a temp file + os.replace, so a crash mid-write
+never corrupts it). On the next run, any example id already present in that
+file is skipped and NOT retranslated -- only the remaining ids are sent to
+the model. Once every requested pair is fully checkpointed, the (large)
+model is not even loaded.
+
 Usage (run from eval/Nano-Macro-Instruct/):
     python MT_eval.py \
         --model_name_or_path Nano-Macro-Instruct \
         --data_root ../../data/mt_translation \
         --output_dir ./result \
-        --batch_size 128 \
+        --batch_size 1024 \
         --max_new_tokens 256
 
 Only a subset of pairs:
@@ -40,10 +72,12 @@ Requires (on top of the shared requirements.txt): sacrebleu>=2.4.0
 
 import argparse
 import csv
+import gc
 import json
 import os
 import re
 import sys
+import tempfile
 import time
 from collections import OrderedDict
 
@@ -134,7 +168,113 @@ def load_mt_pair(path: str, src_code: str, tgt_code: str):
             raise ValueError(
                 f"Record {r.get('id', '?')} in {path} is missing '{src_code}' or '{tgt_code}' field."
             )
+        if "id" not in r:
+            raise ValueError(f"Record missing 'id' field in {path}; ids are required for checkpoint/resume.")
     return raw
+
+
+# ----------------------------------------------------------------------------- #
+# OOM-safe dynamic batching helpers
+# ----------------------------------------------------------------------------- #
+def is_oom_error(err: BaseException) -> bool:
+    """True if `err` looks like a CUDA / CPU out-of-memory error."""
+    oom_cls = getattr(torch.cuda, "OutOfMemoryError", None)
+    if oom_cls is not None and isinstance(err, oom_cls):
+        return True
+    if not isinstance(err, RuntimeError):
+        return False
+    msg = str(err).lower()
+    return any(
+        s in msg
+        for s in (
+            "out of memory",
+            "cuda error: out of memory",
+            "cublas_status_alloc_failed",
+            "not enough memory",
+        )
+    )
+
+
+def clear_memory():
+    """Best-effort release of GPU/CPU memory before the next batch."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+
+class DynamicBatcher:
+    """Holds the batch-size bounds for a run.
+
+    Every new outer chunk of data starts fresh at `initial_batch_size` -- an
+    OOM on one chunk does NOT lower the starting size for the *next* chunk.
+    The halving on OOM (down to `min_batch_size`) only happens *within* a
+    single chunk's divide-and-conquer retry (see
+    `translate_chunk_with_oom_retry`) and is discarded once that chunk is
+    done; it never leaks into subsequent chunks.
+    """
+
+    def __init__(self, initial_batch_size: int, min_batch_size: int = 1):
+        self.initial_batch_size = max(1, initial_batch_size)
+        self.min_batch_size = max(1, min_batch_size)
+
+
+def translate_chunk_with_oom_retry(model, tokenizer, chunk, src_code, tgt_code,
+                                    use_chat_template, max_new_tokens, device, min_batch_size=1):
+    """Translate `chunk` (a list of records), recursively halving on OOM.
+
+    Returns a list of (record, translation_or_None) pairs aligned with
+    `chunk`. `translation` is None only when even a single example could
+    not be translated (persistent OOM at batch size 1) -- that example is
+    skipped rather than crashing the run.
+    """
+    if not chunk:
+        return []
+
+    prompts = [
+        build_prompt(tokenizer, r[src_code], src_code, tgt_code, use_chat_template) for r in chunk
+    ]
+
+    # We deliberately catch-then-exit-the-except-block before clearing
+    # memory / recursing, rather than doing it from inside `except`: an
+    # `except X as e` clause keeps `e` (and its traceback, which pins every
+    # GPU tensor in the failed call's stack frames) alive for the whole
+    # block, so clear_memory() would otherwise be a no-op.
+    oom = False
+    try:
+        preds = translate_batch(model, tokenizer, prompts, max_new_tokens, device)
+    except RuntimeError as e:
+        if not is_oom_error(e):
+            raise
+        oom = True
+    # `e` and its traceback are now out of scope and cleared.
+
+    if not oom:
+        return list(zip(chunk, preds))
+
+    clear_memory()
+
+    if len(chunk) <= min_batch_size:
+        text_preview = str(chunk[0].get(src_code, ""))[:80]
+        print(f"[OOM][WARN] batch_size=1 still OOM, skipping example: {text_preview!r}")
+        return [(ex, None) for ex in chunk]
+
+    new_size = max(min_batch_size, len(chunk) // 2)
+    print(
+        f"[OOM] batch_size={len(chunk)} failed -> halving to {new_size} and retrying "
+        f"(next outer chunk still starts fresh at the full --batch_size)"
+    )
+    mid = len(chunk) // 2
+    left = translate_chunk_with_oom_retry(
+        model, tokenizer, chunk[:mid], src_code, tgt_code, use_chat_template,
+        max_new_tokens, device, min_batch_size,
+    )
+    clear_memory()
+    right = translate_chunk_with_oom_retry(
+        model, tokenizer, chunk[mid:], src_code, tgt_code, use_chat_template,
+        max_new_tokens, device, min_batch_size,
+    )
+    return left + right
 
 
 # ----------------------------------------------------------------------------- #
@@ -184,38 +324,131 @@ def compute_corpus_metrics(hyps, refs):
 
 
 # ----------------------------------------------------------------------------- #
+# Checkpoint / resume helpers
+# ----------------------------------------------------------------------------- #
+def _atomic_write_bytes(path: str, data: bytes) -> None:
+    """Write `data` to `path` atomically: write to a temp file in the same
+    directory, then os.replace() it into place. This means a crash or kill
+    mid-write can never leave a truncated/corrupted predictions file behind
+    -- important since this file also serves as the resume checkpoint."""
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp_mt_", dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp_path, path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
+
+
+def atomic_write_json(path: str, obj) -> None:
+    _atomic_write_bytes(path, json.dumps(obj, ensure_ascii=False, indent=2).encode("utf-8"))
+
+
+def load_existing_predictions(pred_path: str) -> "OrderedDict[str, dict]":
+    """Load a pair's `<pair>_predictions.json` from a previous (possibly
+    interrupted) run, if any. Returns an OrderedDict keyed by example id --
+    every id in it is skipped (not retranslated) this run."""
+    if not os.path.exists(pred_path):
+        return OrderedDict()
+    try:
+        with open(pred_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"[WARN] Could not read checkpoint {pred_path} ({e}); starting this pair fresh.")
+        return OrderedDict()
+    out = OrderedDict()
+    for rec in data:
+        rid = rec.get("id")
+        if rid is not None:
+            out[rid] = rec
+    return out
+
+
+# ----------------------------------------------------------------------------- #
 # Per-pair evaluation
 # ----------------------------------------------------------------------------- #
 def evaluate_pair(model, tokenizer, pair, records, src_code, tgt_code,
-                   batch_size, max_new_tokens, device, use_chat_template, limit=None):
-    if limit:
-        records = records[:limit]
-
+                   batch_size, max_new_tokens, device, use_chat_template,
+                   pred_path, min_batch_size=1):
+    id_to_index = {r["id"]: i for i, r in enumerate(records)}
     n = len(records)
-    predictions = []
-    hyps, refs = [], []
 
-    for start in tqdm(range(0, n, batch_size), desc=pair, unit="batch", leave=False):
-        batch = records[start:start + batch_size]
-        prompts = [
-            build_prompt(tokenizer, r[src_code], src_code, tgt_code, use_chat_template) for r in batch
-        ]
-        preds = translate_batch(model, tokenizer, prompts, max_new_tokens, device)
+    # Resume: anything already checkpointed from a previous run is skipped.
+    # Drop any stale ids that no longer belong to this pair's current data
+    # (e.g. the source file changed between runs).
+    done = OrderedDict(
+        (rid, rec) for rid, rec in load_existing_predictions(pred_path).items() if rid in id_to_index
+    )
+    if done:
+        print(f"  [resume] {len(done)}/{n} example(s) already translated in a previous run; skipping them.")
 
-        for record, pred in zip(batch, preds):
-            hyps.append(pred)
-            refs.append(record[tgt_code])
-            out_rec = OrderedDict()
-            out_rec["id"] = record["id"]
-            out_rec[src_code] = record[src_code]
-            out_rec[tgt_code] = record[tgt_code]
-            out_rec[f"translated_{tgt_code}"] = pred
-            predictions.append(out_rec)
+    remaining = [r for r in records if r["id"] not in done]
+    n_skipped_new = 0
 
-    spbleu, chrfpp = compute_corpus_metrics(hyps, refs) if n else (0.0, 0.0)
+    if remaining:
+        # Sort by source-sentence length before batching: groups
+        # similarly-long sentences together so batches waste far less
+        # padding, which speeds up decoding noticeably. Original dataset
+        # order is restored below when we checkpoint / compute metrics.
+        remaining = sorted(remaining, key=lambda r: len(r[src_code]))
+
+        batcher = DynamicBatcher(initial_batch_size=batch_size, min_batch_size=min_batch_size)
+        idx = 0
+        pbar = tqdm(total=len(remaining), desc=pair, unit="ex", leave=False)
+        while idx < len(remaining):
+            # Every new chunk starts fresh at the full requested batch size;
+            # an OOM only shrinks *that* chunk's own retry, not later ones.
+            cur_bs = batcher.initial_batch_size
+            chunk = remaining[idx: idx + cur_bs]
+
+            chunk_results = translate_chunk_with_oom_retry(
+                model, tokenizer, chunk, src_code, tgt_code, use_chat_template,
+                max_new_tokens, device, min_batch_size,
+            )
+
+            for record, pred in chunk_results:
+                out_rec = OrderedDict()
+                out_rec["id"] = record["id"]
+                out_rec[src_code] = record[src_code]
+                out_rec[tgt_code] = record[tgt_code]
+                if pred is None:
+                    out_rec[f"translated_{tgt_code}"] = ""
+                    out_rec["skipped"] = True
+                    n_skipped_new += 1
+                else:
+                    out_rec[f"translated_{tgt_code}"] = pred
+                    out_rec["skipped"] = False
+                done[record["id"]] = out_rec
+
+            idx += len(chunk)
+            pbar.update(len(chunk))
+
+            # Checkpoint right after this batch: persist everything finished
+            # so far (resumed + new), restored to original dataset order.
+            # A crash/kill immediately after this line loses nothing except
+            # work not yet attempted.
+            ordered = sorted(done.values(), key=lambda r: id_to_index[r["id"]])
+            atomic_write_json(pred_path, ordered)
+
+            clear_memory()
+        pbar.close()
+
+        if n_skipped_new:
+            print(f"  [{pair}] WARNING: {n_skipped_new} example(s) skipped this run due to persistent OOM at batch_size=1.")
+
+    predictions = sorted(done.values(), key=lambda r: id_to_index[r["id"]])
+    hyps = [r[f"translated_{tgt_code}"] for r in predictions]
+    refs = [r[tgt_code] for r in predictions]
+    n_skipped_total = sum(1 for r in predictions if r.get("skipped"))
+
+    spbleu, chrfpp = compute_corpus_metrics(hyps, refs) if predictions else (0.0, 0.0)
 
     return {
-        "num_examples": n,
+        "num_examples": len(predictions),
+        "num_skipped": n_skipped_total,
         "spBLEU": spbleu,
         "chrF++": chrfpp,
         "predictions": predictions,
@@ -233,7 +466,10 @@ def main():
     parser.add_argument("--output_dir", type=str, default="./result")
     parser.add_argument("--pairs", type=str, nargs="+", default=MT_PAIRS,
                          help="Subset of language pairs to evaluate, e.g. vi-zh hi-ur")
-    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--batch_size", type=int, default=1024,
+                         help="Batch size each chunk starts at; halves locally (per-chunk only) on OOM.")
+    parser.add_argument("--min_batch_size", type=int, default=1,
+                         help="Never split batches smaller than this before skipping an example.")
     parser.add_argument("--max_new_tokens", type=int, default=256)
     parser.add_argument("--limit", type=int, default=None,
                          help="Optional cap on number of examples per pair, for quick debugging")
@@ -244,6 +480,11 @@ def main():
         action="store_true",
         help="Disable chat-template formatting and use raw completion-style prompts instead (base-model style).",
     )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Ignore any existing <pair>_predictions.json checkpoints and retranslate every example from scratch.",
+    )
     args = parser.parse_args()
     use_chat_template = not args.no_chat_template
 
@@ -251,58 +492,98 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
 
-    print(f"Loading tokenizer & model: {args.model_name_or_path}")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=args.trust_remote_code)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "left"  # required for batched causal-LM generation
-
-    if use_chat_template and not getattr(tokenizer, "chat_template", None):
-        print("[WARN] Tokenizer has no chat_template; falling back to raw completion-style prompts.")
-        use_chat_template = False
-    elif use_chat_template:
-        print("[INFO] Using tokenizer chat_template to format prompts (Instruct-model mode).")
-
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_name_or_path,
-        torch_dtype=dtype_map[args.dtype],
-        trust_remote_code=args.trust_remote_code,
-        device_map="auto" if device == "cuda" else None,
-    )
-    if device == "cpu":
-        model.to(device)
-    model.eval()
-
-    results = OrderedDict()
-    t0 = time.time()
-
-    for pair in tqdm(args.pairs, desc="pairs"):
+    # ------------------------------------------------------------------- #
+    # Pre-scan every requested pair's data + existing checkpoint *before*
+    # loading the model, so a fully-checkpointed run (everything already
+    # translated in a previous session) never has to load it at all.
+    # ------------------------------------------------------------------- #
+    pair_records, pair_pred_paths = OrderedDict(), {}
+    work_remaining = False
+    for pair in args.pairs:
         src_code, tgt_code = pair.split("-")
         data_path = os.path.join(args.data_root, f"{pair}.json")
         if not os.path.exists(data_path):
             print(f"[WARN] Skipping '{pair}': {data_path} not found")
             continue
 
-        print(f"\n=== Evaluating pair: {pair} ({lang_name(src_code)} -> {lang_name(tgt_code)}) ===")
         records = load_mt_pair(data_path, src_code, tgt_code)
+        if args.limit:
+            records = records[: args.limit]
+        pair_records[pair] = records
+
+        pred_path = os.path.join(args.output_dir, f"{pair}_predictions.json")
+        pair_pred_paths[pair] = pred_path
+
+        if args.overwrite:
+            n_done = 0
+        else:
+            ids_in_data = {r["id"] for r in records}
+            n_done = sum(1 for rid in load_existing_predictions(pred_path) if rid in ids_in_data)
+
+        if n_done < len(records):
+            work_remaining = True
+        if n_done:
+            print(f"[{pair}] {n_done}/{len(records)} example(s) already checkpointed.")
+
+    if args.overwrite:
+        for pred_path in pair_pred_paths.values():
+            if os.path.exists(pred_path):
+                os.remove(pred_path)
+
+    if not pair_records:
+        print("No language pairs were found (no data). Exiting.")
+        sys.exit(1)
+
+    tokenizer = model = None
+    if work_remaining:
+        print(f"Loading tokenizer & model: {args.model_name_or_path}")
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=args.trust_remote_code)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.padding_side = "left"  # required for batched causal-LM generation
+
+        if use_chat_template and not getattr(tokenizer, "chat_template", None):
+            print("[WARN] Tokenizer has no chat_template; falling back to raw completion-style prompts.")
+            use_chat_template = False
+        elif use_chat_template:
+            print("[INFO] Using tokenizer chat_template to format prompts (Instruct-model mode).")
+
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_name_or_path,
+            torch_dtype=dtype_map[args.dtype],
+            trust_remote_code=args.trust_remote_code,
+            device_map="auto" if device == "cuda" else None,
+        )
+        if device == "cpu":
+            model.to(device)
+        model.eval()
+    else:
+        print("Nothing left to translate -- every requested pair is already fully checkpointed.")
+
+    results = OrderedDict()
+    t0 = time.time()
+
+    for pair in tqdm(list(pair_records.keys()), desc="pairs"):
+        src_code, tgt_code = pair.split("-")
+        records = pair_records[pair]
+
+        print(f"\n=== Evaluating pair: {pair} ({lang_name(src_code)} -> {lang_name(tgt_code)}) ===")
         pair_result = evaluate_pair(
             model, tokenizer, pair, records, src_code, tgt_code,
             batch_size=args.batch_size,
             max_new_tokens=args.max_new_tokens,
             device=device,
             use_chat_template=use_chat_template,
-            limit=args.limit,
+            pred_path=pair_pred_paths[pair],
+            min_batch_size=args.min_batch_size,
         )
         results[pair] = pair_result
         print(
             f"  {pair}: spBLEU={pair_result['spBLEU']:.2f}  chrF++={pair_result['chrF++']:.2f}  "
-            f"(n={pair_result['num_examples']})"
+            f"(n={pair_result['num_examples']}, skipped={pair_result['num_skipped']})"
         )
-
-        # Save per-pair predictions immediately (safe against crashes on later pairs)
-        pred_path = os.path.join(args.output_dir, f"{pair}_predictions.json")
-        with open(pred_path, "w", encoding="utf-8") as f:
-            json.dump(pair_result["predictions"], f, ensure_ascii=False, indent=2)
+        # predictions.json for this pair was already checkpointed batch-by-
+        # batch inside evaluate_pair -- nothing left to save here.
 
     # ------------------------------------------------------------------- #
     # Aggregate CSV report (overall = macro-average across pairs)
@@ -312,7 +593,7 @@ def main():
         sys.exit(1)
 
     csv_path = os.path.join(args.output_dir, "mt_summary.csv")
-    fieldnames = ["pair", "src_lang", "tgt_lang", "num_examples", "spBLEU", "chrF++"]
+    fieldnames = ["pair", "src_lang", "tgt_lang", "num_examples", "num_skipped", "spBLEU", "chrF++"]
     with open(csv_path, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -323,6 +604,7 @@ def main():
                 "src_lang": src_code,
                 "tgt_lang": tgt_code,
                 "num_examples": r["num_examples"],
+                "num_skipped": r["num_skipped"],
                 "spBLEU": round(r["spBLEU"], 2),
                 "chrF++": round(r["chrF++"], 2),
             })
@@ -333,6 +615,7 @@ def main():
             "src_lang": "",
             "tgt_lang": "",
             "num_examples": sum(r["num_examples"] for r in results.values()),
+            "num_skipped": sum(r["num_skipped"] for r in results.values()),
             "spBLEU": round(overall_spbleu, 2),
             "chrF++": round(overall_chrfpp, 2),
         })
@@ -346,8 +629,11 @@ def main():
     print(f"{'OVERALL':<10}{sum(r['num_examples'] for r in results.values()):<12}"
           f"{overall_spbleu:<12.2f}{overall_chrfpp:<12.2f}")
     print("=" * 58)
+    total_skipped = sum(r["num_skipped"] for r in results.values())
+    if total_skipped:
+        print(f"Total skipped examples (persistent OOM): {total_skipped}")
     print(f"Total time: {time.time() - t0:.1f}s")
-    print(f"\nSaved per-pair predictions and mt_summary.csv to: {args.output_dir}")
+    print(f"\nSaved per-pair predictions (checkpointed batch-by-batch) and mt_summary.csv to: {args.output_dir}")
 
 
 if __name__ == "__main__":
