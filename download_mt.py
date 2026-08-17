@@ -76,10 +76,14 @@ import sys
 import zipfile
 from typing import Dict, List, Optional, Set, Tuple
 
+from dotenv import load_dotenv
+load_dotenv()
+
 try:
     import requests
 except ImportError:
     sys.exit("Thieu thu vien 'requests'. Chay: pip install requests")
+
 
 
 # =============================================================================
