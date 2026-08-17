@@ -19,7 +19,11 @@ NGUON THEO TUNG CAP
 
 LOC DU LIEU
     KHONG loc gi ca cho ca 5 cap — lay nguyen cau goc tu nguon, chi ghep theo
-    dong (line-aligned) va cat bot neu vuot --max-rows.
+    dong (line-aligned). Neu tong so dong vuot --max-rows (mac dinh 20,000,
+    du cho zero-shot eval), script SAMPLE NGAU NHIEN (khong lay N dong dau)
+    voi --seed co dinh (mac dinh 42) de tai lap duoc ket qua. Nhanh NLLB
+    dung reservoir sampling (mot luot doc toan bo stream); nhanh VLSP2022/
+    JW300 dung random.sample tren du lieu da doc het vao bo nho.
 
 ===============================================================================
 CITATION (NLLB) — cap sw-ar lay tu nhanh CCMatrix trong cung dataset nay
@@ -46,10 +50,11 @@ volume = {630}, journal = {Nature}, doi = {10.1038/s41586-024-07335-x}
 ===============================================================================
 CACH DUNG
 ===============================================================================
-    python download_mt.py                    # ca 5 cap
-    python download_mt.py vi-zh              # mot cap
+    python download_mt.py                    # ca 5 cap, sample 20K/cap, seed=42
+    python download_mt.py vi-zh              # mot cap (vi du: vi-zh)
     python download_mt.py --list             # liet ke cap da dang ky roi thoat
-    python download_mt.py --max-rows 20000   # gioi han so dong giu lai / cap
+    python download_mt.py --max-rows 20000   # so dong SAMPLE NGAU NHIEN giu lai / cap
+    python download_mt.py --seed 42          # seed cho sample ngau nhien
     python download_mt.py --hf-token hf_xxx  # token HF neu chua `huggingface-cli login`
     python download_mt.py --vlsp-split dev   # dung split dev/test thay vi train
 
@@ -71,6 +76,7 @@ import gzip
 import io
 import json
 import os
+import random
 import re
 import sys
 import zipfile
@@ -108,7 +114,8 @@ PAIRS: Dict[str, dict] = {
 # THAM SO MAC DINH
 # =============================================================================
 OUTDIR_DEFAULT = os.path.join("data", "mt_translation")
-MAX_ROWS_DEFAULT = 500_000
+MAX_ROWS_DEFAULT = 20_000   # zero-shot eval: 20K mau/cap la du
+SEED_DEFAULT = 42
 
 HF_RAW = "https://huggingface.co/datasets/allenai/nllb/raw/main/"
 
@@ -277,15 +284,19 @@ def process_pair_nllb(pair: str, cfg: dict, reg, args) -> Optional[dict]:
     reader = io.TextIOWrapper(gzip.GzipFile(fileobj=resp.raw),
                               encoding="utf-8", errors="replace")
 
-    records: List[dict] = []
+    # Reservoir sampling (thuat toan R) — sample NGAU NHIEN DEU toi da
+    # args.max_rows dong tu toan bo stream (khong biet truoc tong so dong),
+    # chi doc MOT LUOT, deterministic theo args.seed.
+    rng = random.Random(args.seed)
+    k = args.max_rows
+    reservoir: List[Tuple[str, str]] = []
     n_read = 0
     n_badcol = 0
+    n_valid = 0
     ncols = A_NCOLS if branch == "A" else B_NCOLS
     src_idx, tgt_idx = (A_SRC, A_TGT) if branch == "A" else (B_SRC, B_TGT)
 
     for line in reader:
-        if len(records) >= args.max_rows:
-            break
         n_read += 1
         parts = line.rstrip("\n").split("\t")
         if len(parts) != ncols:
@@ -294,11 +305,22 @@ def process_pair_nllb(pair: str, cfg: dict, reg, args) -> Optional[dict]:
 
         # Lay nguyen cau goc — khong normalize, khong loc, khong khu trung lap.
         s0, s1 = parts[src_idx], parts[tgt_idx]
-        rid = f"nllb_{pair}_{len(records)}"
-        records.append({"id": rid, key0: s0, key1: s1})
+        if n_valid < k:
+            reservoir.append((s0, s1))
+        else:
+            j = rng.randint(0, n_valid)
+            if j < k:
+                reservoir[j] = (s0, s1)
+        n_valid += 1
 
     resp.close()
-    print(f"  Doc {n_read:,} dong -> giu {len(records):,}"
+
+    records: List[dict] = [
+        {"id": f"nllb_{pair}_{i}", key0: s0, key1: s1}
+        for i, (s0, s1) in enumerate(reservoir)
+    ]
+    print(f"  Doc {n_read:,} dong ({n_valid:,} dong hop le) -> sample ngau nhien "
+          f"(seed={args.seed}) giu {len(records):,}"
           + (f" (bo {n_badcol:,} dong sai so cot)" if n_badcol else ""))
 
     return write_output(pair, key0, key1, records, args)
@@ -366,16 +388,23 @@ def process_vlsp(pair: str, cfg: dict, args) -> Optional[dict]:
         print(f"  !! So dong khong khop: {lang0}={len(lines0):,} vs "
               f"{lang1}={len(lines1):,}. Cat theo min.")
     n = min(len(lines0), len(lines1))
+
+    # Sample NGAU NHIEN toi da args.max_rows dong (khong con lay N dong dau),
+    # deterministic theo args.seed.
+    rng = random.Random(args.seed)
     if n > args.max_rows:
-        n = args.max_rows
+        idxs: List[int] = sorted(rng.sample(range(n), args.max_rows))
+    else:
+        idxs = list(range(n))
 
     records: List[dict] = []
-    for i in range(n):
+    for i in idxs:
         s0, s1 = lines0[i].strip(), lines1[i].strip()
-        rid = f"vlsp2022_{pair}_{i}"
+        rid = f"vlsp2022_{pair}_{len(records)}"
         records.append({"id": rid, lang0: s0, lang1: s1})
 
-    print(f"  Doc {len(lines0):,} dong -> giu {len(records):,} (khong loc)")
+    print(f"  Doc {len(lines0):,} dong -> sample ngau nhien (seed={args.seed}) "
+          f"giu {len(records):,} (khong loc)")
     return write_output(pair, lang0, lang1, records, args)
 
 
@@ -431,16 +460,23 @@ def process_jw300(pair: str, cfg: dict, args) -> Optional[dict]:
         print(f"  !! So dong khong khop: {lang0}={len(lines0):,} vs "
               f"{lang1}={len(lines1):,}. Cat theo min.")
     n = min(len(lines0), len(lines1))
+
+    # Sample NGAU NHIEN toi da args.max_rows dong (khong con lay N dong dau),
+    # deterministic theo args.seed.
+    rng = random.Random(args.seed)
     if n > args.max_rows:
-        n = args.max_rows
+        idxs: List[int] = sorted(rng.sample(range(n), args.max_rows))
+    else:
+        idxs = list(range(n))
 
     records: List[dict] = []
-    for i in range(n):
+    for i in idxs:
         s0, s1 = lines0[i].strip(), lines1[i].strip()
-        rid = f"jw300_{pair}_{i}"
+        rid = f"jw300_{pair}_{len(records)}"
         records.append({"id": rid, lang0: s0, lang1: s1})
 
-    print(f"  Doc {len(lines0):,} dong -> giu {len(records):,} (khong loc)")
+    print(f"  Doc {len(lines0):,} dong -> sample ngau nhien (seed={args.seed}) "
+          f"giu {len(records):,} (khong loc)")
     return write_output(pair, lang0, lang1, records, args)
 
 
@@ -453,16 +489,20 @@ def main() -> int:
                      "JW300, NLLB) thanh JSON.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Vi du:\n"
-               "  python download_mt.py\n"
+               "  python download_mt.py                  # 20K mau/cap, seed=42\n"
                "  python download_mt.py vi-zh\n"
-               "  python download_mt.py --max-rows 20000\n"
+               "  python download_mt.py --max-rows 20000 --seed 42\n"
                "  python download_mt.py --hf-token hf_xxx\n")
     p.add_argument("pairs", nargs="*", help="cap can xu ly (mac dinh: tat ca)")
     p.add_argument("--list", action="store_true",
                    help="liet ke cap da dang ky (kem nguon) roi thoat")
     p.add_argument("--outdir", default=OUTDIR_DEFAULT)
     p.add_argument("--max-rows", type=int, default=MAX_ROWS_DEFAULT,
-                   help=f"gioi han so dong GIU LAI cho moi cap (mac dinh {MAX_ROWS_DEFAULT:,})")
+                   help=f"so dong SAMPLE NGAU NHIEN giu lai cho moi cap "
+                        f"(mac dinh {MAX_ROWS_DEFAULT:,})")
+    p.add_argument("--seed", type=int, default=SEED_DEFAULT,
+                   help=f"seed cho sample ngau nhien, de tai lap ket qua "
+                        f"(mac dinh {SEED_DEFAULT})")
     p.add_argument("--hf-token", default=None,
                    help="HuggingFace token cho dataset gated VLSP2022 (hoac dung "
                         "`huggingface-cli login` / bien moi truong HF_TOKEN truoc)")
