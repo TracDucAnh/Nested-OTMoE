@@ -114,7 +114,7 @@ PAIRS: Dict[str, dict] = {
 # THAM SO MAC DINH
 # =============================================================================
 OUTDIR_DEFAULT = os.path.join("data", "mt_translation")
-MAX_ROWS_DEFAULT = 20_000   # zero-shot eval: 20K mau/cap la du
+MAX_ROWS_DEFAULT = 10_000   # zero-shot eval: 20K mau/cap la du
 SEED_DEFAULT = 42
 
 HF_RAW = "https://huggingface.co/datasets/allenai/nllb/raw/main/"
