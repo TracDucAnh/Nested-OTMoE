@@ -373,7 +373,10 @@ def compute_load_balancing_loss(router_logits_list: List[torch.Tensor], num_expe
         routing_weights = F.softmax(logits, dim=-1)
         _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)  # [tokens, top_k]
         expert_mask = F.one_hot(selected_experts, num_experts).float()  # [tokens, top_k, num_experts]
-        tokens_per_expert = expert_mask.sum(dim=1).mean(dim=0) / max(logits.shape[0], 1)  # [num_experts]
+        # LUU Y: .mean(dim=0) da chia trung binh theo so token roi (cho ra f_i dung chuan,
+        # trong khoang [0,1]) -> KHONG duoc chia them cho logits.shape[0] mot lan nua (bug
+        # cu chia 2 lan lam L_LB nho gia tao ~N lan, N = so token trong sub-batch dang tinh).
+        tokens_per_expert = expert_mask.sum(dim=1).mean(dim=0)  # [num_experts], = f_i
         avg_prob_per_expert = routing_weights.mean(dim=0)  # [num_experts]
         loss = num_experts * torch.sum(tokens_per_expert * avg_prob_per_expert)
         losses.append(loss)
@@ -423,34 +426,70 @@ def run_batch_with_dynamic_oom_handling(batch_texts, tokenizer, model, max_lengt
                                          min_batch_size):
     """Chay 1 batch (list text). Neu OOM: clear memory, chia doi, de quy. Neu OOM ca khi
     size = 1 (hoac == min_batch_size) thi skip sample do. Luon quay ve batch_size goc cho
-    batch tiep theo (khong giu trang thai giua cac batch)."""
+    batch tiep theo (khong giu trang thai giua cac batch).
+
+    QUAN TRONG ve vong doi exception: KHONG duoc goi clear_memory()/de quy retry ngay
+    ben trong khoi `except ... as e:`. Trong luc con o trong khoi except do, `e.__traceback__`
+    van giu tham chieu toi toan bo frame cua forward_backward_one_subbatch (input_ids, outputs,
+    logits, ...) cua LAN VUA OOM -> cac tensor GPU do van "reachable" -> gc.collect()/
+    torch.cuda.empty_cache() khong giai phong duoc gi ca, va lan retry (voi batch nho hon)
+    lai chay trong khi bo nho cua lan fail truoc van bi ghim, cong don qua tung cap chia doi.
+    Vi vay ta tach rieng buoc "thu chay 1 lan" (_attempt) khoi buoc "don dep + de quy retry"
+    (_run): _run chi don dep/retry SAU KHI _attempt() da return, tuc la sau khi khoi except
+    da thoat va Python da tu dong `del e` (giai phong that su traceback + frame)."""
     original_size = len(batch_texts)
     agg = {"lm_loss": 0.0, "lb_loss": 0.0, "total_loss": 0.0, "n_ok": 0, "n_skipped": 0}
 
-    def _run(sub_texts):
+    def _attempt(sub_texts) -> bool:
+        """Chi thu forward+backward DUNG 1 LAN. Tra ve True neu thanh cong, False neu OOM.
+        Khong lam gi khac trong except (khong clear_memory, khong retry) de dam bao khoi
+        except ket thuc ngay, Python tu xoa `e` va giai phong that su frame/tensor bi OOM."""
         try:
             lm, lb, tot, n = forward_backward_one_subbatch(
                 sub_texts, tokenizer, model, max_length, device,
                 router_logits_cache, num_experts, top_k, lb_loss_coef,
                 loss_weight=len(sub_texts) / max(original_size, 1),
             )
-            agg["lm_loss"] += lm * n
-            agg["lb_loss"] += lb * n
-            agg["total_loss"] += tot * n
-            agg["n_ok"] += n
         except RuntimeError as e:
             if not is_oom_error(e):
                 raise
-            model.zero_grad(set_to_none=True)
-            clear_memory()
-            if len(sub_texts) <= max(min_batch_size, 1):
-                logger.warning(f"OOM ngay ca voi sub-batch size={len(sub_texts)} -> skip sample nay.")
-                agg["n_skipped"] += len(sub_texts)
-                return
-            mid = len(sub_texts) // 2
-            logger.warning(f"OOM voi sub-batch size={len(sub_texts)} -> chia doi thanh {mid} + {len(sub_texts) - mid}.")
-            _run(sub_texts[:mid])
-            _run(sub_texts[mid:])
+            return False
+        agg["lm_loss"] += lm * n
+        agg["lb_loss"] += lb * n
+        agg["total_loss"] += tot * n
+        agg["n_ok"] += n
+        return True
+
+    def _run(sub_texts):
+        if _attempt(sub_texts):
+            return
+
+        # Toi day khoi except cua _attempt() da thoat hoan toan -> `e`/traceback da bi
+        # Python xoa -> frame cua forward_backward_one_subbatch (voi input_ids, outputs,
+        # logits, shift_logits...) that su khong con ai tham chieu nua.
+        #
+        # router_logits_cache: hook forward luu logits KHONG detach (de giu gradient cho
+        # LoRA cua router) -> neu lan OOM vua roi da kip chay qua vai router truoc khi fail,
+        # cache van con om nguyen do thi autograd cua lan do. Binh thuong cache chi duoc
+        # .clear() o DAU lan forward_backward_one_subbatch ke tiep -> qua muon, phai clear
+        # ngay tai day truoc khi goi clear_memory().
+        router_logits_cache.clear()
+
+        # KHONG goi model.zero_grad() o day: backward() cua cac sub-batch anh em (da chay
+        # thanh cong truoc do trong cung batch goc) da tich luy gradient hop le vao .grad
+        # theo co che gradient-accumulation (loss_weight = len(sub)/original_size). Goi
+        # zero_grad() se xoa sach ca phan gradient hop le do moi khi co 1 sub-batch OOM,
+        # lam sai lech gradient cua ca buoc optimizer.step() ke tiep.
+        clear_memory()
+
+        if len(sub_texts) <= max(min_batch_size, 1):
+            logger.warning(f"OOM ngay ca voi sub-batch size={len(sub_texts)} -> skip sample nay.")
+            agg["n_skipped"] += len(sub_texts)
+            return
+        mid = len(sub_texts) // 2
+        logger.warning(f"OOM voi sub-batch size={len(sub_texts)} -> chia doi thanh {mid} + {len(sub_texts) - mid}.")
+        _run(sub_texts[:mid])
+        _run(sub_texts[mid:])
 
     _run(batch_texts)
     n = max(agg["n_ok"], 1)
