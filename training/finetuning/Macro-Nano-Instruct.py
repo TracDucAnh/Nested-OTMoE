@@ -366,10 +366,37 @@ def infer_moe_dims(config, args):
 # ============================================================================================
 # MoE loss chuan: LM loss + Load Balancing loss (Switch/Mixtral style)
 # ============================================================================================
-def compute_load_balancing_loss(router_logits_list: List[torch.Tensor], num_experts: int, top_k: int):
+def compute_load_balancing_loss(router_logits_list: List[torch.Tensor], attention_mask: torch.Tensor,
+                                 num_experts: int, top_k: int):
+    """attention_mask: [batch, seq_len] (1 = token that, 0 = padding), CUNG kich thuoc batch/seq
+    voi input da dua vao model. Phai loai bo vi tri padding truoc khi tinh bat ky thong ke nao,
+    vi khong thi:
+      - Token padding (pad_token = eos_token, lap lai giong het nhau) se cho ra router logit
+        gan nhu giong nhau moi lan -> thoi phong / lam lech tan suat chon expert mot cach he
+        thong, khong phan anh dung phan bo cua token that trong cau.
+      - So luong token dung de tinh trung binh (N) cung bi dem du them ca padding, lam sai ca
+        f_i (ti le token/expert) lan gia tri loss cuoi cung.
+    Day la loi tuong tu nhu cach L_LM da loai padding qua ignore_index=-100, chi khac la L_LB
+    truoc do khong nhan attention_mask nen khong loc duoc."""
+    mask_flat = attention_mask.reshape(-1).bool()  # [tokens], cung thu tu voi logits.reshape(-1, ...)
+
     losses = []
     for logits in router_logits_list:
         logits = logits.reshape(-1, logits.shape[-1])  # [tokens, num_experts]
+        if logits.shape[0] == mask_flat.shape[0]:
+            logits = logits[mask_flat]  # bo cac vi tri padding truoc khi tinh thong ke
+        else:
+            # Kien truc MoE nay flatten/reshape token theo thu tu khac gia dinh o tren (batch
+            # truoc, seq sau) -> khong the index an toan theo mask_flat, bo qua loc padding cho
+            # lan nay thay vi index sai vi tri (van con tot hon crash, nhung se kem chinh xac).
+            logger.warning(
+                "compute_load_balancing_loss: kich thuoc router logits "
+                f"({logits.shape[0]}) khong khop attention_mask ({mask_flat.shape[0]}) -> "
+                "bo qua loc padding cho lan tinh nay, kiem tra lai thu tu flatten token cua "
+                "kien truc MoE nay neu thay canh bao lap lai nhieu lan."
+            )
+        if logits.shape[0] == 0:
+            continue
         routing_weights = F.softmax(logits, dim=-1)
         _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)  # [tokens, top_k]
         expert_mask = F.one_hot(selected_experts, num_experts).float()  # [tokens, top_k, num_experts]
@@ -381,7 +408,7 @@ def compute_load_balancing_loss(router_logits_list: List[torch.Tensor], num_expe
         loss = num_experts * torch.sum(tokens_per_expert * avg_prob_per_expert)
         losses.append(loss)
     if not losses:
-        return torch.tensor(0.0)
+        return torch.tensor(0.0, device=attention_mask.device)
     return torch.stack(losses).mean()
 
 
@@ -410,7 +437,7 @@ def forward_backward_one_subbatch(sub_texts, tokenizer, model, max_length, devic
     )
 
     if router_logits_cache and num_experts and top_k:
-        lb_loss = compute_load_balancing_loss(router_logits_cache, num_experts, top_k)
+        lb_loss = compute_load_balancing_loss(router_logits_cache, attention_mask, num_experts, top_k)
         lb_loss = lb_loss.to(lm_loss.device)
     else:
         lb_loss = torch.zeros((), device=lm_loss.device)
