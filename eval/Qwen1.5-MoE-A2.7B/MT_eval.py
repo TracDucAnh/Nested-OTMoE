@@ -7,11 +7,16 @@ For every pair, records are loaded from `data/mt_translation/<src>-<tgt>.json`
 (a flat list of {"id", "<src>", "<tgt>"} objects, normalized format shared
 across all pairs in this repo). The model is prompted zero-shot to translate
 each source sentence. Qwen1.5-MoE-A2.7B is the base (non-instruct) checkpoint,
-so this script uses the raw completion-style prompt by default (same
+so this script uses the raw completion-style prompt BY DEFAULT (same
 zero-shot base-model protocol as XQuAD_eval.py in this eval/ directory)
-instead of the tokenizer's chat template. If you point --model_name_or_path
-at a chat-tuned checkpoint instead (e.g. Qwen1.5-MoE-A2.7B-Chat), drop
---no_chat_template to use `add_generation_prompt=True` formatting.
+instead of the tokenizer's chat template -- no flag needed to get this.
+Applying a chat template (e.g. Qwen's default ChatML template, which
+auto-inserts a "You are a helpful assistant" system turn) to a base model
+that was never trained on that format causes it to degenerate into
+repeating fragments of the prompt instead of translating. If you point
+--model_name_or_path at a chat-tuned checkpoint instead (e.g.
+Qwen1.5-MoE-A2.7B-Chat), pass --use_chat_template to switch to
+`add_generation_prompt=True` formatting.
 
 Translations are scored at the corpus level with:
     - spBLEU : sacrebleu BLEU with FLORES-200 SentencePiece tokenization
@@ -51,14 +56,21 @@ file is skipped and NOT retranslated -- only the remaining ids are sent to
 the model. Once every requested pair is fully checkpointed, the (large)
 model is not even loaded.
 
-Usage (run from eval/Qwen1.5-MoE-A2.7B/):
+Usage (run from eval/Qwen1.5-MoE-A2.7B/), base checkpoint, no flags needed:
     python MT_eval.py \
         --model_name_or_path Qwen/Qwen1.5-MoE-A2.7B \
         --data_root ../../data/mt_translation \
         --output_dir ./result \
         --batch_size 1024 \
-        --max_new_tokens 256 \
-        --no_chat_template
+        --max_new_tokens 256
+
+Chat-tuned checkpoint instead (e.g. Qwen1.5-MoE-A2.7B-Chat) -- opt in to
+chat-template formatting explicitly:
+    python MT_eval.py \
+        --model_name_or_path Qwen/Qwen1.5-MoE-A2.7B-Chat \
+        --data_root ../../data/mt_translation \
+        --output_dir ./result \
+        --use_chat_template
 
 Only a subset of pairs:
     python MT_eval.py --pairs vi-zh hi-ur
@@ -131,7 +143,7 @@ INSTRUCTION_TEMPLATE = (
 )
 
 
-def build_prompt(tokenizer, text: str, src_code: str, tgt_code: str, use_chat_template: bool = True) -> str:
+def build_prompt(tokenizer, text: str, src_code: str, tgt_code: str, use_chat_template: bool = False) -> str:
     src_name, tgt_name = lang_name(src_code), lang_name(tgt_code)
     content = INSTRUCTION_TEMPLATE.format(src_name=src_name, tgt_name=tgt_name, text=text)
     if use_chat_template and getattr(tokenizer, "chat_template", None):
@@ -220,7 +232,8 @@ class DynamicBatcher:
 
 
 def translate_chunk_with_oom_retry(model, tokenizer, chunk, src_code, tgt_code,
-                                    use_chat_template, max_new_tokens, device, min_batch_size=1):
+                                    use_chat_template, max_new_tokens, device, min_batch_size=1,
+                                    repetition_penalty=1.3, no_repeat_ngram_size=4):
     """Translate `chunk` (a list of records), recursively halving on OOM.
 
     Returns a list of (record, translation_or_None) pairs aligned with
@@ -243,7 +256,9 @@ def translate_chunk_with_oom_retry(model, tokenizer, chunk, src_code, tgt_code,
     # block, so clear_memory() would otherwise be a no-op.
     oom = False
     try:
-        preds = translate_batch(model, tokenizer, prompts, max_new_tokens, device)
+        preds = translate_batch(model, tokenizer, prompts, max_new_tokens, device,
+                                 repetition_penalty=repetition_penalty,
+                                 no_repeat_ngram_size=no_repeat_ngram_size)
     except RuntimeError as e:
         if not is_oom_error(e):
             raise
@@ -269,11 +284,13 @@ def translate_chunk_with_oom_retry(model, tokenizer, chunk, src_code, tgt_code,
     left = translate_chunk_with_oom_retry(
         model, tokenizer, chunk[:mid], src_code, tgt_code, use_chat_template,
         max_new_tokens, device, min_batch_size,
+        repetition_penalty=repetition_penalty, no_repeat_ngram_size=no_repeat_ngram_size,
     )
     clear_memory()
     right = translate_chunk_with_oom_retry(
         model, tokenizer, chunk[mid:], src_code, tgt_code, use_chat_template,
         max_new_tokens, device, min_batch_size,
+        repetition_penalty=repetition_penalty, no_repeat_ngram_size=no_repeat_ngram_size,
     )
     return left + right
 
@@ -295,19 +312,28 @@ def clean_translation(text: str) -> str:
 
 
 @torch.no_grad()
-def translate_batch(model, tokenizer, prompts, max_new_tokens, device):
+def translate_batch(model, tokenizer, prompts, max_new_tokens, device,
+                     repetition_penalty=1.3, no_repeat_ngram_size=4):
     inputs = tokenizer(
         prompts, return_tensors="pt", padding=True, truncation=True, max_length=4096
     ).to(device)
 
-    output_ids = model.generate(
-        **inputs,
+    gen_kwargs = dict(
         max_new_tokens=max_new_tokens,
         do_sample=False,
         num_beams=1,
         pad_token_id=tokenizer.pad_token_id,
         eos_token_id=tokenizer.eos_token_id,
     )
+    # Safety net against degenerate greedy-decoding loops (e.g. the model
+    # getting stuck repeating a fragment of the prompt). Independent of, and
+    # in addition to, using the right (raw completion-style) prompt format.
+    if repetition_penalty and repetition_penalty != 1.0:
+        gen_kwargs["repetition_penalty"] = repetition_penalty
+    if no_repeat_ngram_size and no_repeat_ngram_size > 0:
+        gen_kwargs["no_repeat_ngram_size"] = no_repeat_ngram_size
+
+    output_ids = model.generate(**inputs, **gen_kwargs)
 
     gen_only = output_ids[:, inputs["input_ids"].shape[1]:]
     decoded = tokenizer.batch_decode(gen_only, skip_special_tokens=True)
@@ -373,7 +399,8 @@ def load_existing_predictions(pred_path: str) -> "OrderedDict[str, dict]":
 # ----------------------------------------------------------------------------- #
 def evaluate_pair(model, tokenizer, pair, records, src_code, tgt_code,
                    batch_size, max_new_tokens, device, use_chat_template,
-                   pred_path, min_batch_size=1):
+                   pred_path, min_batch_size=1, repetition_penalty=1.3,
+                   no_repeat_ngram_size=4):
     id_to_index = {r["id"]: i for i, r in enumerate(records)}
     n = len(records)
 
@@ -408,6 +435,7 @@ def evaluate_pair(model, tokenizer, pair, records, src_code, tgt_code,
             chunk_results = translate_chunk_with_oom_retry(
                 model, tokenizer, chunk, src_code, tgt_code, use_chat_template,
                 max_new_tokens, device, min_batch_size,
+                repetition_penalty=repetition_penalty, no_repeat_ngram_size=no_repeat_ngram_size,
             )
 
             for record, pred in chunk_results:
@@ -472,14 +500,25 @@ def main():
     parser.add_argument("--min_batch_size", type=int, default=1,
                          help="Never split batches smaller than this before skipping an example.")
     parser.add_argument("--max_new_tokens", type=int, default=256)
+    parser.add_argument("--repetition_penalty", type=float, default=1.3,
+                         help="Passed to model.generate(); >1.0 discourages degenerate repetition loops, "
+                              "which greedy (do_sample=False) decoding is otherwise prone to.")
+    parser.add_argument("--no_repeat_ngram_size", type=int, default=4,
+                         help="Passed to model.generate(); blocks any n-gram of this size from repeating. "
+                              "Set to 0 to disable.")
     parser.add_argument("--limit", type=int, default=None,
                          help="Optional cap on number of examples per pair, for quick debugging")
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16", "float32"])
     parser.add_argument("--trust_remote_code", action="store_true", default=True)
     parser.add_argument(
-        "--no_chat_template",
+        "--use_chat_template",
         action="store_true",
-        help="Disable chat-template formatting and use raw completion-style prompts instead (base-model style).",
+        help="Force tokenizer chat-template formatting (Instruct-model style: "
+             "apply_chat_template(add_generation_prompt=True)). Default is OFF, which uses raw "
+             "completion-style prompts -- the correct setting for base (non-instruct) checkpoints "
+             "such as the default Qwen1.5-MoE-A2.7B. Only pass this when --model_name_or_path points "
+             "at a chat-tuned checkpoint (e.g. Qwen1.5-MoE-A2.7B-Chat); applying a chat template to a "
+             "base model causes it to degenerate into repeating the prompt instead of translating.",
     )
     parser.add_argument(
         "--overwrite",
@@ -487,7 +526,7 @@ def main():
         help="Ignore any existing <pair>_predictions.json checkpoints and retranslate every example from scratch.",
     )
     args = parser.parse_args()
-    use_chat_template = not args.no_chat_template
+    use_chat_template = args.use_chat_template
 
     os.makedirs(args.output_dir, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -544,10 +583,14 @@ def main():
         tokenizer.padding_side = "left"  # required for batched causal-LM generation
 
         if use_chat_template and not getattr(tokenizer, "chat_template", None):
-            print("[WARN] Tokenizer has no chat_template; falling back to raw completion-style prompts.")
+            print("[WARN] --use_chat_template was set but tokenizer has no chat_template; "
+                  "falling back to raw completion-style prompts.")
             use_chat_template = False
         elif use_chat_template:
             print("[INFO] Using tokenizer chat_template to format prompts (Instruct-model mode).")
+        else:
+            print("[INFO] Using raw completion-style prompts (base-model mode, default). "
+                  "Pass --use_chat_template if this is a chat-tuned checkpoint.")
 
         model = AutoModelForCausalLM.from_pretrained(
             args.model_name_or_path,
@@ -577,6 +620,8 @@ def main():
             use_chat_template=use_chat_template,
             pred_path=pair_pred_paths[pair],
             min_batch_size=args.min_batch_size,
+            repetition_penalty=args.repetition_penalty,
+            no_repeat_ngram_size=args.no_repeat_ngram_size,
         )
         results[pair] = pair_result
         print(

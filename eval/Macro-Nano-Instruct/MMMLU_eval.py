@@ -451,7 +451,7 @@ def save_results_incremental(output_dir, results, model_name, total_skipped):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_name_or_path", default="Nano-Macro-Instruct")
+    parser.add_argument("--model_name_or_path", default="Macro-Nano-Instruct")
     parser.add_argument("--data_root", default="data/downstream/mmmlu")
     parser.add_argument("--languages", nargs="+", default=None)
     parser.add_argument("--batch_size", type=int, default=8, help="Starting batch size; shrinks/grows dynamically on OOM.")

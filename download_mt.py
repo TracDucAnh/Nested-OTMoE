@@ -104,7 +104,7 @@ PAIRS: Dict[str, dict] = {
     # nhung CO trong CCMATRIX_PAIRS (nhanh du phong CCMatrix). Vi vay chuyen
     # sang nguon "nllb": ham classify() trong script se tu nhan dien day la
     # nhanh (B)/CCMatrix va tai tu statmt_base (khong can JW300 nua).
-    "sw-ar": {"source": "nllb", "nllb": ("arb_Arab", "swh_Latn"), "short": ("sw", "ar")},
+    "sw-ar": {"source": "nllb", "nllb": ("swh_Latn", "arb_Arab"), "short": ("sw", "ar")},
     "fr-wo": {"source": "nllb", "nllb": ("fra_Latn", "wol_Latn"), "short": ("fr", "wo")},
     "hi-ur": {"source": "nllb", "nllb": ("hin_Deva", "urd_Arab"), "short": ("hi", "ur")},
 }
@@ -347,7 +347,7 @@ def process_vlsp(pair: str, cfg: dict, args) -> Optional[dict]:
         print(f"  !! Khong liet ke duoc file trong repo '{repo_id}': {type(e).__name__}: {e}")
         print("     Dataset nay bi GATED. Vao trang HuggingFace cua dataset, dang nhap,")
         print("     bam 'Agree' de xin quyen truy cap, roi chay `huggingface-cli login`")
-        print("     (hoac truyen --hf-token hf_xxx) truoc khi chay lai script.")
+        print("     (hoac truyen --hf-token hf_xxx) truoc khi chay lai script nay.")
         return None
 
     cand = [f for f in files if f.startswith(subdir + "/")]
