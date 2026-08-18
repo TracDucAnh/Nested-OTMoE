@@ -41,6 +41,7 @@ import math
 import os
 import random
 import re
+import shutil
 import time
 from typing import List, Optional, Sequence
 
@@ -163,6 +164,11 @@ def build_argparser() -> argparse.ArgumentParser:
 
     # Checkpoint / resume
     p.add_argument("--save_steps", type=int, default=200)
+    p.add_argument("--save_total_limit", type=int, default=1,
+                    help="So checkpoint local moi nhat duoc giu lai, cac checkpoint cu hon "
+                         "se tu dong bi xoa de tranh lang phi disk. Vi du =1 (mac dinh): "
+                         "luu xong checkpoint-400 thi checkpoint-200 se bi xoa ngay. "
+                         "Dat <=0 de tat tinh nang nay (giu lai tat ca checkpoint).")
     p.add_argument("--resume_from_checkpoint", type=str, default=None,
                     help="'auto' de tu tim checkpoint moi nhat trong output_dir, hoac duong dan cu the")
 
@@ -575,6 +581,27 @@ def find_resume_checkpoint(output_dir, resume_arg: Optional[str]) -> Optional[st
     return resume_arg if os.path.isdir(resume_arg) else None
 
 
+def cleanup_old_checkpoints(output_dir, keep: int):
+    """Chi giu lai `keep` checkpoint moi nhat (theo global_step trong ten checkpoint-<step>),
+    xoa cac checkpoint-* con lai de tranh lang phi disk.
+    keep <= 0 -> khong xoa gi ca (giu lai tat ca)."""
+    if keep is None or keep <= 0:
+        return
+    candidates = [
+        c for c in glob.glob(os.path.join(output_dir, "checkpoint-*"))
+        if os.path.isdir(c) and re.fullmatch(r"checkpoint-\d+", os.path.basename(c))
+    ]
+    if len(candidates) <= keep:
+        return
+    candidates.sort(key=lambda p: int(p.rsplit("-", 1)[-1]))
+    for old_ckpt in candidates[:-keep]:
+        try:
+            shutil.rmtree(old_ckpt)
+            logger.info(f"Da xoa checkpoint cu de tiet kiem disk: {old_ckpt}")
+        except OSError as e:
+            logger.warning(f"Khong xoa duoc checkpoint cu {old_ckpt}: {e}")
+
+
 # ============================================================================================
 # Diagnostics: jsonl + plot
 # ============================================================================================
@@ -872,6 +899,7 @@ def main():
                                                 epoch, step_in_epoch, global_step)
                     plot_losses(jsonl_path, plot_path)
                     logger.info(f"Da luu checkpoint local: {ckpt_dir}")
+                    cleanup_old_checkpoints(args.output_dir, args.save_total_limit)
                     if args.push_to_hub:
                         push_to_hub(ckpt_dir, diagnostics_dir, args.hub_model_id,
                                     args.hub_private, readme_text)
@@ -883,6 +911,7 @@ def main():
         final_ckpt = save_checkpoint(args.output_dir, model, optimizer, scheduler,
                                       args.num_train_epochs - 1, steps_per_epoch - 1, global_step)
         plot_losses(jsonl_path, plot_path)
+        cleanup_old_checkpoints(args.output_dir, args.save_total_limit)
         if args.push_to_hub:
             push_to_hub(final_ckpt, diagnostics_dir, args.hub_model_id, args.hub_private, readme_text)
         logger.info("Training hoan tat.")
@@ -891,6 +920,7 @@ def main():
         logger.warning("Nhan KeyboardInterrupt — luu checkpoint khan cap truoc khi thoat ...")
         save_checkpoint(args.output_dir, model, optimizer, scheduler, epoch, step_in_epoch, global_step)
         plot_losses(jsonl_path, plot_path)
+        cleanup_old_checkpoints(args.output_dir, args.save_total_limit)
         raise
     finally:
         for h in hooks:
