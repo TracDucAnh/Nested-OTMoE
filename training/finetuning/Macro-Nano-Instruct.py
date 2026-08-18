@@ -159,7 +159,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--lora_layer_end_ratio", type=float, default=2.0 / 3.0)
 
     # Checkpoint / resume
-    p.add_argument("--save_steps", type=int, default=1000)
+    p.add_argument("--save_steps", type=int, default=200)
     p.add_argument("--resume_from_checkpoint", type=str, default=None,
                     help="'auto' de tu tim checkpoint moi nhat trong output_dir, hoac duong dan cu the")
 
