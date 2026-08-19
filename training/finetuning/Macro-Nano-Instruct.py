@@ -781,8 +781,9 @@ def main():
 
     # ------------------------------------------------------------------------------- optimizer
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate, weight_decay=args.weight_decay)
-
+    optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate,
+                                weight_decay=args.weight_decay, foreach=True)  # hoặc fused=True nếu CUDA hỗ trợ
+    
     steps_per_epoch = len(batch_sampler)
     total_steps = steps_per_epoch * args.num_train_epochs
     scheduler = get_linear_schedule_with_warmup(
