@@ -801,6 +801,8 @@ def main():
         if os.path.exists(state_path):
             state = torch.load(state_path, map_location="cpu")
             optimizer.load_state_dict(state["optimizer"])
+            for group in optimizer.param_groups:
+                group["foreach"] = True
             if state.get("scheduler"):
                 scheduler.load_state_dict(state["scheduler"])
             start_epoch = state["epoch"]
