@@ -49,6 +49,23 @@ goc):
     checkpoint truoc do (vd checkpoint-(N - save_steps)) se bi xoa
     (shutil.rmtree) ngay lap tuc.
 
+Fix NCCL Watchdog Timeout / SIGABRT (c10d::ProcessGroupNCCL::ncclCommWatchdog()):
+  - Nguyen nhan cot loi: voi backbone MoE + LoRA CHI tren 1 layer, router chi
+    chon top_k << num_experts cho moi token, nen rat de co (cac) expert LoRA
+    khong nhan token nao tren mot GPU o mot step nao do -> khong co gradient.
+    Voi find_unused_parameters=False (mac dinh cu cua PyTorch), DDP Reducer
+    cho vo han gradient con thieu do trong backward(), dan den NCCL Watchdog
+    het han sau 10 phut (mac dinh) va gui SIGABRT (exit code -6), keo theo
+    torchrun dung ca cac rank khac.
+  - Fix: DDP duoc khoi tao voi find_unused_parameters=True (CLI:
+    --find_unused_parameters / --no_find_unused_parameters, mac dinh True) de
+    DDP tu duyet lai autograd graph sau moi forward va bo qua dung cac tham
+    so khong duoc dung trong step do thay vi cho vo han.
+  - Bien phap phong ho them (khong lien quan MoE, vd DataLoader stall khi doc
+    tu Lustre/NFS): --nccl_timeout_minutes (mac dinh 30, thay cho 10 phut mac
+    dinh cua PyTorch) va persistent_workers/--dataloader_prefetch_factor cho
+    DataLoader.
+
 Vi kien truc chi tiet cua Marco-Nano-Instruct khong duoc cung cap truoc,
 script nay TU DONG DO TIM cac module attention / router / experts bang ten
 (regex) thay vi hard-code, va cho phep override qua CLI neu can.
@@ -78,6 +95,7 @@ import random
 import re
 import shutil
 import time
+from datetime import timedelta
 from typing import List, Optional, Sequence, Tuple
 
 import torch
@@ -224,6 +242,33 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--local_rank", type=int, default=-1,
                     help="Duoc torchrun/torch.distributed.launch tu dong truyen qua bien moi "
                          "truong LOCAL_RANK; CLI arg nay chi la fallback.")
+    p.add_argument("--find_unused_parameters", dest="find_unused_parameters",
+                    action="store_true", default=True,
+                    help="[FIX NCCL Watchdog SIGABRT] BAT BUOC = True (mac dinh) khi finetune "
+                         "MoE bang LoRA CHI tren 1 layer: moi token router chi chon top_k trong "
+                         "so num_experts, nen o mot step/GPU bat ky rat de co (cac) expert LoRA "
+                         "khong nhan duoc token nao -> khong co gradient. Neu DDP dat "
+                         "find_unused_parameters=False, Reducer se CHO VO HAN gradient cua cac "
+                         "expert do trong backward() -> sau --nccl_timeout_minutes phut, NCCL "
+                         "Watchdog coi la deadlock va bien no thanh SIGABRT (exit code -6), dung "
+                         "ca cac rank khac. Chi tat bang --no_find_unused_parameters neu chac "
+                         "chan MOI expert trong layer duoc LoRA deu duoc it nhat 1 token dung "
+                         "tren MOI GPU o MOI step (vd batch rat lon / khong dung MoE).")
+    p.add_argument("--no_find_unused_parameters", dest="find_unused_parameters",
+                    action="store_false")
+    p.add_argument("--nccl_timeout_minutes", type=int, default=30,
+                    help="[FIX NCCL Watchdog SIGABRT] Timeout (phut) cho moi thao tac dong bo "
+                         "NCCL (all_reduce gradient, dist.barrier(), ...). Mac dinh cua PyTorch "
+                         "chi la 10 phut — qua ngan lam bien do an toan cho cac stall tam thoi "
+                         "khong lien quan MoE (vd DataLoader doc cham/lag khi data nam tren "
+                         "Lustre/NFS). Tang gia tri nay LA BIEN PHAP PHONG HO THEM, khong thay "
+                         "the cho --find_unused_parameters (fix tan goc nguyen nhan MoE).")
+    p.add_argument("--dataloader_prefetch_factor", type=int, default=4,
+                    help="So batch moi DataLoader worker doc truoc (chi co hieu luc khi "
+                         "--num_workers > 0). Tang gia tri nay + persistent_workers=True (tu "
+                         "dong bat khi num_workers > 0) giup giam nguy co DataLoader bi stall "
+                         "khi doc du lieu tu file-system mang (vd Lustre), mot nguyen nhan phu "
+                         "co the gay trieu chung treo NCCL giong het truong hop MoE.")
 
     # Misc
     p.add_argument("--seed", type=int, default=42)
@@ -268,7 +313,15 @@ def setup_distributed(args) -> Tuple[bool, int, int, int, torch.device]:
     if world_size > 1:
         local_rank = int(os.environ.get("LOCAL_RANK", args.local_rank if args.local_rank >= 0 else 0))
         backend = "nccl" if torch.cuda.is_available() else "gloo"
-        dist.init_process_group(backend=backend, init_method="env://")
+        # [FIX NCCL Watchdog SIGABRT] Mac dinh PyTorch chi cho 10 phut (600s) cho moi thao tac
+        # dong bo NCCL. Voi backbone MoE + LoRA tren 1 layer, nguyen nhan chinh gay treo la
+        # find_unused_parameters (xem noi khoi tao DDP ben duoi); timeout duoc tang o day chi
+        # la bien do an toan PHU cho cac stall tam thoi khac (vd DataLoader doc tu Lustre lag).
+        dist.init_process_group(
+            backend=backend,
+            init_method="env://",
+            timeout=timedelta(minutes=args.nccl_timeout_minutes),
+        )
         if torch.cuda.is_available():
             torch.cuda.set_device(local_rank)
             device = torch.device(f"cuda:{local_rank}")
@@ -704,6 +757,9 @@ Voi moi record, cau `{args.eng_key}` duoc ghep voi tung ngon ngu khac trong cung
 ## Training
 - {args.num_train_epochs} epoch, batch_size = {args.batch_size} (per-process).
 - Multi-GPU: DistributedDataParallel (torchrun), checkpoint chi giu ban moi nhat.
+- DDP: find_unused_parameters = {args.find_unused_parameters} (bat buoc True voi MoE + LoRA
+  1 layer de tranh NCCL Watchdog SIGABRT khi co expert khong nhan token trong 1 step/GPU),
+  NCCL timeout = {args.nccl_timeout_minutes} phut.
 
 ## Diagnostics
 Xem `diagnostics/loss_log.jsonl` (log theo tung step, phan biet step_type=task/align) va
@@ -817,7 +873,28 @@ def main():
 
     if is_distributed:
         ddp_kwargs = dict(device_ids=[local_rank], output_device=local_rank) if torch.cuda.is_available() else {}
-        model = DDP(model, find_unused_parameters=False, **ddp_kwargs)
+        # [FIX NCCL Watchdog SIGABRT — nguyen nhan cot loi]
+        # Voi moi token, router chi chon top_k trong so num_experts -> o mot step/GPU bat ky,
+        # rat de co (cac) expert dang duoc gan LoRA nhung KHONG nhan duoc token nao, nen
+        # autograd graph cua LoRA A/B thuoc expert do KHONG duoc tao trong forward() -> KHONG
+        # co gradient sau backward(). Truoc day find_unused_parameters=False khien DDP Reducer
+        # gia dinh MOI tham so requires_grad=True deu phai co gradient va CHO VO HAN gradient
+        # con thieu do; sau args.nccl_timeout_minutes phut (mac dinh cua PyTorch la 10 phut)
+        # NCCL Watchdog (ncclCommWatchdog) coi day la deadlock va bien no thanh SIGABRT (exit
+        # code -6), keo theo torchrun SIGTERM cac rank con lai.
+        # find_unused_parameters=True bat DDP tu duyet lai autograd graph SAU MOI forward de
+        # xac dinh chinh xac tham so nao THAT SU tham gia tinh loss cua step do, roi danh dau
+        # ngay cac tham so khong duoc dung la "da san sang" (grad = None/khong cho) thay vi
+        # cho toi vo han -> het treo. Chap nhan chi phi duyet graph them moi forward (nho vi
+        # chi co LoRA tren 1 layer duy nhat) de doi lay su on dinh bat buoc voi kien truc MoE
+        # + routing dong (khac nhau moi batch, moi GPU, moi step task/align).
+        model = DDP(model, find_unused_parameters=args.find_unused_parameters, **ddp_kwargs)
+        if is_main_process:
+            logger.info(
+                f"[DDP] find_unused_parameters={args.find_unused_parameters}, "
+                f"nccl_timeout_minutes={args.nccl_timeout_minutes} "
+                f"(fix NCCL Watchdog SIGABRT do MoE routing top_k < num_experts)."
+            )
 
     router_logits_cache: list = []
     hooks = register_router_hooks(get_underlying_model(model), router_target_names, router_logits_cache)
@@ -836,17 +913,29 @@ def main():
         raise RuntimeError("Khong doc duoc cap bitext nao — kiem tra lai --data_dir / --data_files / --eng_key.")
 
     dataset = BitextPairDataset(pairs)
+
+    # [FIX NCCL Watchdog SIGABRT — bien phap phu] persistent_workers + prefetch_factor giup
+    # worker doc/tokenize truoc nhieu batch hon, giam nguy co DataLoader bi stall khi doc du
+    # lieu tu file-system mang (vd Lustre) — mot nguyen nhan phu co the tao ra trieu chung
+    # treo NCCL giong het truong hop MoE (chenh lech dung 10 phut giua 2 step trong log).
+    extra_loader_kwargs = {}
+    if args.num_workers > 0:
+        extra_loader_kwargs["persistent_workers"] = True
+        extra_loader_kwargs["prefetch_factor"] = args.dataloader_prefetch_factor
+
     if is_distributed:
         sampler = DistributedSampler(dataset, num_replicas=world_size, rank=global_rank,
                                       shuffle=True, seed=args.seed, drop_last=True)
         dataloader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler,
                                  collate_fn=collate_bitext, num_workers=args.num_workers,
-                                 drop_last=True, pin_memory=torch.cuda.is_available())
+                                 drop_last=True, pin_memory=torch.cuda.is_available(),
+                                 **extra_loader_kwargs)
     else:
         sampler = RandomSampler(dataset)
         dataloader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler,
                                  collate_fn=collate_bitext, num_workers=args.num_workers,
-                                 drop_last=True, pin_memory=torch.cuda.is_available())
+                                 drop_last=True, pin_memory=torch.cuda.is_available(),
+                                 **extra_loader_kwargs)
 
     # ------------------------------------------------------------------------------- optimizer
     trainable_params = [p for p in model.parameters() if p.requires_grad]

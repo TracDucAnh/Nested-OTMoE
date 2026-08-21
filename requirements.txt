@@ -9,7 +9,7 @@ unicodedataplus
 python-dotenv
 
 torch>=2.1.0
-transformers>=4.37.0,<5.0.0
+transformers==4.56.0
 accelerate>=0.27.0
 safetensors>=0.4.0
 sentencepiece>=0.1.99
