@@ -65,6 +65,15 @@ Fix NCCL Watchdog Timeout / SIGABRT (c10d::ProcessGroupNCCL::ncclCommWatchdog())
     tu Lustre/NFS): --nccl_timeout_minutes (mac dinh 30, thay cho 10 phut mac
     dinh cua PyTorch) va persistent_workers/--dataloader_prefetch_factor cho
     DataLoader.
+  - He qua cua find_unused_parameters=True: align step truoc day goi model(...)
+    2 LAN RIENG (1 cho eng_texts, 1 cho other_texts) roi moi backward() 1 lan
+    duy nhat -> pattern "2 forward, 1 backward" nay khien DDP bao loi runtime
+    "Parameter ... has been marked as ready twice" (autograd hook cua cung 1
+    tham so, vd LoRA cua 1 expert duoc ca eng lan other dung, fire 2 lan trong
+    1 iteration). Da fix bang cach GHEP eng_texts + other_texts thanh 1 batch
+    NOI va chi goi model(...) DUNG 1 LAN cho ca 2 phia (xem
+    encode_layer_representation()); ket qua toan hoc (mean-pooled hidden state
+    tung cau tai align_layer) khong doi, chi khac ky thuat thuc thi.
 
 Vi kien truc chi tiet cua Marco-Nano-Instruct khong duoc cung cap truoc,
 script nay TU DONG DO TIM cac module attention / router / experts bang ten
@@ -564,9 +573,26 @@ def mean_pool_hidden(hidden_states: torch.Tensor, attention_mask: torch.Tensor) 
     return summed / counts
 
 
-def encode_layer_representation(texts: List[str], tokenizer, model, align_layer: int,
-                                 max_length: int, device, router_logits_cache: list) -> torch.Tensor:
-    enc = tokenizer(texts, padding=True, truncation=True, max_length=max_length, return_tensors="pt")
+def encode_layer_representation(eng_texts: List[str], other_texts: List[str], tokenizer, model,
+                                 align_layer: int, max_length: int, device,
+                                 router_logits_cache: list) -> Tuple[torch.Tensor, torch.Tensor]:
+    """[FIX DDP 'marked as ready twice'] Truoc day ham nay tokenize + goi model(...) RIENG
+    cho eng_texts va other_texts (2 forward pass) roi moi align_loss.backward() 1 lan duy
+    nhat o cuoi compute_alignment_step(). Voi DDP + find_unused_parameters=True, "2 forward
+    truoc 1 backward" khien autograd hook cua CUNG mot tham so (vd LoRA cua 1 expert duoc
+    ca eng va other cung dung) fire 2 LAN trong 1 iteration -> DDP bao loi "Parameter ... has
+    been marked as ready twice" (RuntimeError, khong phai NCCL Watchdog nhu truoc). Day KHONG
+    phai gradient checkpointing (khong dung o script nay), ma la ban chat cua pattern "2
+    forward, 1 backward" ma DDP mac dinh khong ho tro tot ngay ca voi static_graph (vi tap
+    expert duoc dung moi step/GPU thay doi lien tuc theo MoE routing, khong "tinh" giua cac
+    iteration nhu static_graph yeu cau).
+    Fix dung: GHEP eng_texts + other_texts thanh 1 batch NOI, tokenize + goi model(...) DUNG
+    1 LAN (1 forward pass duy nhat cho ca 2 phia), sau do moi tach pooled representation ra
+    lai thanh 2 nua. Ket qua toan hoc giong het cach cu (van la mean-pooled hidden state tai
+    dung align_layer cho tung cau), chi khac o cho ky thuat: 1 forward thay vi 2 forward."""
+    n_eng = len(eng_texts)
+    all_texts = list(eng_texts) + list(other_texts)
+    enc = tokenizer(all_texts, padding=True, truncation=True, max_length=max_length, return_tensors="pt")
     input_ids = enc["input_ids"].to(device, non_blocking=True)
     attention_mask = enc["attention_mask"].to(device, non_blocking=True)
 
@@ -577,16 +603,16 @@ def encode_layer_representation(texts: List[str], tokenizer, model, align_layer:
     # dung "Layer ID" nhu truc x trong Figure 1/4 cua paper MidAlign.
     hidden = outputs.hidden_states[align_layer]
     pooled = mean_pool_hidden(hidden, attention_mask)
-    return pooled
+    return pooled[:n_eng], pooled[n_eng:]
 
 
 def compute_alignment_step(eng_texts: List[str], other_texts: List[str], tokenizer, model,
                             align_layer: int, max_length: int, device, temperature: float,
                             router_logits_cache: list):
-    pooled_eng = encode_layer_representation(eng_texts, tokenizer, model, align_layer,
-                                              max_length, device, router_logits_cache)
-    pooled_other = encode_layer_representation(other_texts, tokenizer, model, align_layer,
-                                                max_length, device, router_logits_cache)
+    # 1 forward pass duy nhat cho ca eng_texts va other_texts (xem docstring
+    # encode_layer_representation() — fix DDP "marked as ready twice").
+    pooled_eng, pooled_other = encode_layer_representation(
+        eng_texts, other_texts, tokenizer, model, align_layer, max_length, device, router_logits_cache)
 
     a = F.normalize(pooled_eng, dim=-1)
     b = F.normalize(pooled_other, dim=-1)
