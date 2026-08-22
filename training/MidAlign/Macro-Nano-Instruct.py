@@ -65,6 +65,18 @@ Fix NCCL Watchdog Timeout / SIGABRT (c10d::ProcessGroupNCCL::ncclCommWatchdog())
     tu Lustre/NFS): --nccl_timeout_minutes (mac dinh 30, thay cho 10 phut mac
     dinh cua PyTorch) va persistent_workers/--dataloader_prefetch_factor cho
     DataLoader.
+  - Fix bo sung (zero_grad_anchor(), xem dinh nghia truoc compute_task_step):
+    cong vao loss (task va align) 1 "neo" = 0.0 * sum(p.sum() cho MOI tham so
+    trainable). Gia tri toan hoc luon = 0 nen KHONG doi loss/gradient that,
+    nhung buoc MOI tham so — ke ca LoRA cua expert khong nhan token nao trong
+    step do — THAT SU xuat hien trong autograd graph voi gradient = 0 thay vi
+    None. Nho vay training AN TOAN VOI CA find_unused_parameters=True LAN
+    False (--no_find_unused_parameters), khong con phu thuoc DDP phai tu
+    duyet lai graph. Da CO Y KHONG dung cach gop 2 forward pass (task +
+    align) lam 1 de ep moi expert deu duoc dung: cach do da thu va gay OOM vi
+    phai giu dong thoi 2 do thi activation trong VRAM; zero_grad_anchor() chi
+    thao tac tren cac tensor tham so co san (khong forward them qua model)
+    nen khong lam tang peak memory.
 
 Vi kien truc chi tiet cua Marco-Nano-Instruct khong duoc cung cap truoc,
 script nay TU DONG DO TIM cac module attention / router / experts bang ten
@@ -244,16 +256,16 @@ def build_argparser() -> argparse.ArgumentParser:
                          "truong LOCAL_RANK; CLI arg nay chi la fallback.")
     p.add_argument("--find_unused_parameters", dest="find_unused_parameters",
                     action="store_true", default=True,
-                    help="[FIX NCCL Watchdog SIGABRT] BAT BUOC = True (mac dinh) khi finetune "
-                         "MoE bang LoRA CHI tren 1 layer: moi token router chi chon top_k trong "
-                         "so num_experts, nen o mot step/GPU bat ky rat de co (cac) expert LoRA "
-                         "khong nhan duoc token nao -> khong co gradient. Neu DDP dat "
-                         "find_unused_parameters=False, Reducer se CHO VO HAN gradient cua cac "
-                         "expert do trong backward() -> sau --nccl_timeout_minutes phut, NCCL "
-                         "Watchdog coi la deadlock va bien no thanh SIGABRT (exit code -6), dung "
-                         "ca cac rank khac. Chi tat bang --no_find_unused_parameters neu chac "
-                         "chan MOI expert trong layer duoc LoRA deu duoc it nhat 1 token dung "
-                         "tren MOI GPU o MOI step (vd batch rat lon / khong dung MoE).")
+                    help="[FIX NCCL Watchdog SIGABRT] Mac dinh True. Cung voi zero_grad_anchor() "
+                         "(cong 0.0 * sum(param) vao loss truoc backward(), xem dinh nghia truoc "
+                         "compute_task_step) — 2 co che nay DOC LAP nhau va CA HAI cung dam bao "
+                         "MOI tham so LoRA (ke ca expert khong nhan token nao trong 1 step/GPU, "
+                         "do router chi chon top_k << num_experts) deu co gradient (0 hoac that) "
+                         "thay vi None, nen KHONG con nguy co DDP Reducer cho vo han gradient -> "
+                         "NCCL Watchdog SIGABRT (exit code -6). Vi zero_grad_anchor() da tu no du "
+                         "de chan loi nay, --no_find_unused_parameters (tat co che duyet lai "
+                         "graph cua DDP, nhanh hon 1 chut) gio AN TOAN de dung, khong con la "
+                         "nguyen nhan truc tiep gay SIGABRT nhu truoc nua.")
     p.add_argument("--no_find_unused_parameters", dest="find_unused_parameters",
                     action="store_false")
     p.add_argument("--nccl_timeout_minutes", type=int, default=30,
@@ -518,6 +530,38 @@ def compute_load_balancing_loss(router_logits_list: List[torch.Tensor], attentio
     if not losses:
         return torch.tensor(0.0, device=attention_mask.device)
     return torch.stack(losses).mean()
+
+
+# ============================================================================================
+# [FIX NCCL Watchdog SIGABRT — bo sung, KHONG them forward pass nao]
+#
+# find_unused_parameters=True (o noi khoi tao DDP) da sua duoc goc van de, nhung no la 1
+# CO CHE CUA DDP: yeu cau DDP duyet lai toan bo autograd graph SAU MOI forward, va CHI co
+# hieu luc khi --find_unused_parameters duoc BAT. Neu chay voi --no_find_unused_parameters
+# (vd de tiet kiem chi phi duyet graph moi step) ma van con (cac) expert LoRA khong nhan
+# token nao trong 1 step/GPU nao do, loi NCCL Watchdog -> SIGABRT y het log gap phai se quay
+# lai, vi luc do khong con ai bao DDP Reducer bo qua tham so thieu gradient nua.
+#
+# Fix bo sung o day KHONG phu thuoc --find_unused_parameters: cong them vao loss 1 "neo"
+# = 0.0 * sum(p.sum() cho MOI tham so trainable). Ve mat toan hoc gia tri neo nay LUON = 0
+# (nhan voi 0.0) nen KHONG lam sai lech loss/gradient that; nhung ve mat autograd, moi tham
+# so trainable — ke ca LoRA cua (cac) expert khong duoc router chon token nao trong step do
+# — gio THAT SU xuat hien trong graph va nhan duoc gradient = 0 (thay vi None), nen DDP
+# Reducer luon thay du gradient o MOI iteration, du find_unused_parameters la True hay False.
+#
+# Da CO Y KHONG chon cach gop 2 forward pass (task + align) lam 1 de "ep" moi expert deu
+# duoc dung: cach do lam tang dinh (peak) activation memory vi phai giu dong thoi 2 do thi
+# tinh toan trong VRAM -> da gay OOM khi thu. Cach "neo" ben duoi chi thao tac tren cac
+# TENSOR THAM SO da co san (khong forward lai qua model, khong sinh activation moi), nen chi
+# phi gan nhu bang 0 va khong lam tang peak memory.
+# ============================================================================================
+def zero_grad_anchor(trainable_params: List[torch.Tensor], device) -> torch.Tensor:
+    """Tra ve 1 scalar tensor = 0.0 nhung phu thuoc (autograd) vao TOAN BO trainable_params.
+    Cong ket qua nay vao loss TRUOC khi goi backward() de dam bao khong con "unused
+    parameter" trong DDP, bat ke find_unused_parameters=True/False."""
+    if not trainable_params:
+        return torch.zeros((), device=device)
+    return sum(p.sum() for p in trainable_params) * 0.0
 
 
 # ============================================================================================
@@ -1005,20 +1049,23 @@ def main():
                         other_texts, tokenizer, model, args.max_length, device,
                         router_logits_cache, num_experts, top_k, lb_loss_coef,
                     )
-                    task_total.backward()
+                    # Log gia tri loss "sach" (chua cong neo) truoc, roi moi cong neo de backward.
                     log_kwargs = dict(lm_loss=lm_loss.item(), lb_loss=lb_loss.item(),
                                        task_total_loss=task_total.item(), align_loss=None)
                     postfix = {"type": "task", "L_LM": f"{lm_loss.item():.4f}",
                                "L_LB": f"{lb_loss.item():.4f}"}
+                    # [FIX NCCL Watchdog SIGABRT] cong neo 0.0 * sum(param) — xem zero_grad_anchor().
+                    (task_total + zero_grad_anchor(trainable_params, device)).backward()
                 else:
                     align_loss = compute_alignment_step(
                         eng_texts, other_texts, tokenizer, model, args.align_layer,
                         args.max_length, device, args.align_temperature, router_logits_cache,
                     )
-                    align_loss.backward()
                     log_kwargs = dict(lm_loss=None, lb_loss=None, task_total_loss=None,
                                        align_loss=align_loss.item())
                     postfix = {"type": "align", "L_align": f"{align_loss.item():.4f}"}
+                    # [FIX NCCL Watchdog SIGABRT] cong neo 0.0 * sum(param) — xem zero_grad_anchor().
+                    (align_loss + zero_grad_anchor(trainable_params, device)).backward()
 
                 torch.nn.utils.clip_grad_norm_(trainable_params, args.gradient_clip_norm)
                 optimizer.step()
