@@ -542,6 +542,36 @@ def compute_load_balancing_loss(router_logits_list: List[torch.Tensor], attentio
 
 
 # ============================================================================================
+# [FIX RuntimeError "Expected to mark a variable ready only once"]
+# `compute_alignment_step` ben duoi goi model(...) HAI LAN rieng biet trong CUNG 1 iteration
+# (1 lan cho eng_texts, 1 lan cho other_texts) roi moi backward() MOT LAN cho tong align_loss.
+# Day la pattern "nhieu forward - mot backward" (kieu Siamese network). Voi backbone MoE, neu
+# router CUA STEP DO tinh co chon TRUNG 1 expert (vd expert 33 o layer 15) cho ca token trong
+# batch eng LAN batch other, thi tham so LoRA cua expert do xuat hien trong CA HAI do thi
+# forward rieng biet; khi goi backward() 1 lan, autograd hook cua DDP Reducer cho tham so do
+# bi kich hoat 2 LAN trong cung 1 iteration -> DDP mac dinh coi day la loi ("moi tham so chi
+# duoc ready dung 1 lan/iteration") va raise RuntimeError. Day la ly do loi CHI xuat hien sau
+# hang chuc nghin step: no phu thuoc hoan toan vao viec router co tinh co chon trung expert
+# giua 2 batch eng/other hay khong (ngau nhien theo noi dung tung batch), khong lien quan gi
+# den do dai sample.
+#
+# Fix: goi `model._set_static_graph()` DUY NHAT 1 LAN ngay sau khi wrap DDP, TRUOC forward
+# dau tien cua toan bo qua trinh train (xem noi khoi tao DDP ben duoi). `static_graph=True`
+# chuyen DDP Reducer sang co che gom all-reduce SAU KHI toan bo backward cua iteration hoan
+# tat (thay vi ban all-reduce ngay khi tung tham so "ready"), nen 1 tham so nhan gradient tu
+# nhieu nhanh forward khac nhau trong cung 1 iteration (dung truong hop tren) khong con gay
+# loi nua — day chinh la use-case PyTorch liet ke ro trong doc cua static_graph ("multiple
+# forward passes are computed in one iteration with multiple corresponding backward passes").
+# Dieu kien de static_graph AN TOAN: tap tham so tham gia gradient phai KHONG doi giua cac
+# iteration — dieu nay da duoc dam bao san boi `zero_grad_anchor` o duoi (moi LoRA param, du
+# expert co duoc router chon hay khong, deu duoc "neo" vao graph voi grad=0 moi step), nen
+# static_graph hoan toan tuong thich va an toan de bat cung luc voi zero_grad_anchor.
+# KHONG lam thay doi cach tokenize/batch (khong gop eng+other), nen KHONG anh huong peak
+# memory/OOM nhu cach gop batch da thu truoc do.
+# ============================================================================================
+
+
+# ============================================================================================
 # [FIX NCCL Watchdog SIGABRT — bo sung, KHONG them forward pass nao]
 #
 # find_unused_parameters=True (o noi khoi tao DDP) da sua duoc goc van de, nhung no la 1
@@ -944,11 +974,21 @@ def main():
         # chi co LoRA tren 1 layer duy nhat) de doi lay su on dinh bat buoc voi kien truc MoE
         # + routing dong (khac nhau moi batch, moi GPU, moi step task/align).
         model = DDP(model, find_unused_parameters=args.find_unused_parameters, **ddp_kwargs)
+        # [FIX RuntimeError "Expected to mark a variable ready only once"] — xem giai thich
+        # day du ngay phia tren dinh nghia zero_grad_anchor(). PHAI goi truoc forward dau
+        # tien cua toan bo qua trinh train (dat ngay sau khi wrap DDP la dung cho).
+        # An toan de dung dong thoi voi find_unused_parameters=True: static_graph se tu
+        # phat hien unused params trong ~1-2 iteration dau (PyTorch chi in 1 warning noi
+        # find_unused_parameters gio thanh du thua, khong phai loi).
+        model._set_static_graph()
         if is_main_process:
             logger.info(
                 f"[DDP] find_unused_parameters={args.find_unused_parameters}, "
+                f"static_graph=True, "
                 f"nccl_timeout_minutes={args.nccl_timeout_minutes} "
-                f"(fix NCCL Watchdog SIGABRT do MoE routing top_k < num_experts)."
+                f"(fix NCCL Watchdog SIGABRT do MoE routing top_k < num_experts, "
+                f"va fix 'marked ready twice' do compute_alignment_step goi model() "
+                f"2 lan/iteration)."
             )
 
     router_logits_cache: list = []
