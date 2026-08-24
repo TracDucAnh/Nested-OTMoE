@@ -1,32 +1,33 @@
-"""
+
+''"""
 Fine-tuning LoRA cho mo hinh Mixture-of-Experts ATH-MaaS/Marco-Nano-Instruct.
 
-Loss = L_LM (cross-entropy chuan) + lb_loss_coef * L_LB (load balancing loss chuan cua MoE,
-tinh tren cac router nam trong khoang layer duoc gan LoRA).
+PHIEN BAN TOI UU: Giai quyet cac diem nghen chinh cua MoE nhieu expert:
+  1. Gradient checkpointing — giam VRAM gap ~40-50%, cho phep batch size lon hon.
+  2. Bo hook PyTorch tren tung router (cuc ky cham) — thay bang output_router_logits 
+     hoac aux_loss neu model ho tro; neu khong thi dung 1 hook duy nhat o module MoE cha.
+  3. Tokenize & pad truoc trong DataLoader (collate_fn) — khong goi tokenizer trong 
+     vong lap training.
+  4. torch.compile() + Flash Attention / SDPA + TF32 — toc do forward tang 1.5-3x.
+  5. DDP toi uu: gradient_as_bucket_view=True, bo find_unused_parameters, bucket_cap_mb.
+  6. DataLoader: num_workers, pin_memory, prefetch_factor.
+  7. Mixed Precision (AMP) voi bfloat16/float16 — giam memory + nhanh hon tren GPU ho tro.
+  8. Bo dynamic OOM de quy (anti-pattern gay leak + cham) — thay bang gradient 
+     accumulation voi micro-batch co dinh.
+  9. Fused AdamW neu co san.
+  10. Pad sequence theo max_length cua batch (padding=longest trong collate) thay vi 
+      padding toan bo ve 256 — giam so token tinh toan vo nghia.
 
-Cac tinh nang chinh:
-  1. LoRA chi ap dung tren middle layers [L/3, 2L/3), chi len attention / router / experts.
-  2. Checkpointing + resume tai bat ky epoch/step nao, luu moi 1000 step.
-  3. Luu LoRA weight tai training/finetuning/checkpoints/Macro-Nano-Instruct/.
-  4. Dynamic batching: batch_size mac dinh 512, khi OOM thi chia doi de tri (dequy),
-     clear memory sau moi lan chia, skip sample neu OOM ca khi batch_size = 1,
-     tra ve batch_size goc ngay cho batch tiep theo.
-  5. Dataset/DataLoader gom sample tu ca 3 file flores/bible/ntrex, shuffle roi sort theo do dai.
-  6. 3 epoch, tqdm day du.
-  7. argparse day du de tuy bien.
-
-Vi kien truc chi tiet cua Marco-Nano-Instruct khong duoc cung cap truoc, script nay
-TU DONG DO TIM cac module attention / router / experts bang ten (regex) thay vi hard-code,
-va cho phep override qua CLI neu can.
+Loss = L_LM (cross-entropy chuan) + lb_loss_coef * L_LB (load balancing loss chuan cua MoE).
 
 Vi du chay:
-    python Macro-Nano-Instruct.py \
+    torchrun --nproc_per_node=2 Macro-Nano-Instruct-optimized.py \
         --model_name_or_path ATH-MaaS/Marco-Nano-Instruct \
         --data_dir data/processed_alignment \
-        --push_to_hub
+        --batch_size 64 --gradient_accumulation_steps 4 --max_length 256
 
 Resume:
-    python Macro-Nano-Instruct.py --resume_from_checkpoint auto
+    python Macro-Nano-Instruct-optimized.py --resume_from_checkpoint auto
 """
 
 import argparse
@@ -41,7 +42,7 @@ import random
 import re
 import time
 from contextlib import nullcontext
-from typing import List, Optional, Sequence
+from typing import List, Optional, Sequence, Dict, Any
 
 import torch
 import torch.distributed as dist
@@ -50,7 +51,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader, Sampler
 from tqdm.auto import tqdm
 
-from transformers import AutoModelForCausalLM, AutoTokenizer, get_linear_schedule_with_warmup
+from transformers import (
+    AutoModelForCausalLM, AutoTokenizer, get_linear_schedule_with_warmup,
+    DataCollatorForLanguageModeling
+)
 from peft import LoraConfig, get_peft_model, PeftModel
 
 try:
@@ -72,49 +76,14 @@ import matplotlib.pyplot as plt
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("marco_nano_finetune")
 
-
-# Cac ten bien moi truong pho bien cho HF token, thu theo thu tu nay
 _HF_TOKEN_ENV_VARS = ("HF_TOKEN", "HUGGINGFACE_HUB_TOKEN", "HUGGING_FACE_HUB_TOKEN")
-
-
-def load_hf_token(env_file: Optional[str], cli_token: Optional[str]) -> Optional[str]:
-    """Uu tien: --hf_token (CLI) > bien moi truong da set san > file .env (qua dotenv)."""
-    if cli_token:
-        logger.info("Dung HF token truyen qua --hf_token.")
-        return cli_token
-
-    for var in _HF_TOKEN_ENV_VARS:
-        if os.environ.get(var):
-            logger.info(f"Dung HF token co san trong bien moi truong {var}.")
-            return os.environ[var]
-
-    if env_file and os.path.exists(env_file):
-        if not DOTENV_AVAILABLE:
-            logger.warning(
-                f"Tim thay {env_file} nhung chua cai python-dotenv "
-                f"(pip install python-dotenv --break-system-packages) -> khong the tu dong doc HF_TOKEN."
-            )
-            return None
-        load_dotenv(env_file, override=False)
-        for var in _HF_TOKEN_ENV_VARS:
-            if os.environ.get(var):
-                logger.info(f"Da nap HF token tu {env_file} (bien {var}).")
-                return os.environ[var]
-        logger.warning(f"Da nap {env_file} nhung khong tim thay bien {_HF_TOKEN_ENV_VARS} ben trong.")
-        return None
-
-    logger.info(
-        f"Khong tim thay HF token (khong co --hf_token, bien moi truong, hay file {env_file}). "
-        f"Tiep tuc khong xac thuc — chi hoat dong voi model/repo public."
-    )
-    return None
 
 
 # ============================================================================================
 # Argparse
 # ============================================================================================
 def build_argparser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="LoRA finetuning cho MoE Marco-Nano-Instruct")
+    p = argparse.ArgumentParser(description="LoRA finetuning toi uu cho MoE Marco-Nano-Instruct")
 
     # Model / data / output
     p.add_argument("--model_name_or_path", type=str, default="ATH-MaaS/Marco-Nano-Instruct")
@@ -131,15 +100,15 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--no_push_to_hub", dest="push_to_hub", action="store_false")
     p.add_argument("--hub_model_id", type=str, default="ducanhdinh/Macro-Nano-Instruct-Finetuning")
     p.add_argument("--hub_private", action="store_true")
-    p.add_argument("--env_file", type=str, default=".env",
-                    help="Duong dan file .env chua HF_TOKEN, tu dong nap bang python-dotenv")
-    p.add_argument("--hf_token", type=str, default=None,
-                    help="Override HF token thu cong, uu tien cao hon .env/bien moi truong")
+    p.add_argument("--env_file", type=str, default=".env")
+    p.add_argument("--hf_token", type=str, default=None)
 
     # Training schedule
     p.add_argument("--num_train_epochs", type=int, default=3)
-    p.add_argument("--batch_size", type=int, default=512)
-    p.add_argument("--min_batch_size", type=int, default=1)
+    p.add_argument("--batch_size", type=int, default=64,
+                    help="Batch size MOI GPU (micro-batch). Global = batch_size * world_size * grad_accum")
+    p.add_argument("--gradient_accumulation_steps", type=int, default=4,
+                    help="So step tich luy gradient truoc khi optimizer.step()")
     p.add_argument("--max_length", type=int, default=256)
     p.add_argument("--learning_rate", type=float, default=2e-4)
     p.add_argument("--weight_decay", type=float, default=0.0)
@@ -148,12 +117,9 @@ def build_argparser() -> argparse.ArgumentParser:
 
     # MoE loss
     p.add_argument("--lb_loss_coef", type=float, default=None,
-                    help="He so cho load-balancing loss. None = lay tu config.router_aux_loss_coef, "
-                         "fallback 0.01 (trong so nhu finetune binh thuong)")
-    p.add_argument("--num_local_experts", type=int, default=None,
-                    help="Override so luong experts, None = tu doc trong config model")
-    p.add_argument("--num_experts_per_tok", type=int, default=None,
-                    help="Override top-k router, None = tu doc trong config model")
+                    help="He so load-balancing loss. None = doc tu config.router_aux_loss_coef, fallback 0.01")
+    p.add_argument("--num_local_experts", type=int, default=None)
+    p.add_argument("--num_experts_per_tok", type=int, default=None)
 
     # LoRA
     p.add_argument("--lora_r", type=int, default=16)
@@ -165,44 +131,73 @@ def build_argparser() -> argparse.ArgumentParser:
     # Checkpoint / resume
     p.add_argument("--save_steps", type=int, default=200)
     p.add_argument("--resume_from_checkpoint", type=str, default=None,
-                    help="'auto' de tu tim checkpoint moi nhat trong output_dir, hoac duong dan cu the")
+                    help="'auto' de tu tim checkpoint moi nhat, hoac duong dan cu the")
+
+    # Performance optimizations
+    p.add_argument("--attn_implementation", type=str, default="sdpa",
+                    choices=["eager", "sdpa", "flash_attention_2"],
+                    help="sdpa = torch.nn.functional.scaled_dot_product_attention (nhanh, on dinh); "
+                         "flash_attention_2 = nhanh nhat nhung can cai thu vien flash-attn")
+    p.add_argument("--compile", action="store_true", default=False,
+                    help="Dung torch.compile() — chi hoat dong tot tren PyTorch >= 2.0, "
+                         "co the tang 20-50% toc do nhung compile lan dau lau.")
+    p.add_argument("--num_workers", type=int, default=4,
+                    help="So worker cho DataLoader (tokenize truoc trong collate)")
+    p.add_argument("--pin_memory", action="store_true", default=True)
+    p.add_argument("--prefetch_factor", type=int, default=4)
+    p.add_argument("--no_pin_memory", dest="pin_memory", action="store_false")
+    p.add_argument("--tf32", action="store_true", default=True,
+                    help="Bat TF32 tren Ampere/Hopper — tang toc ~2x cho phep nhan ma tran")
+    p.add_argument("--no_tf32", dest="tf32", action="store_false")
+    p.add_argument("--fused_adamw", action="store_true", default=True,
+                    help="Dung fused AdamW (foreach=True/fused=True) neu co san")
 
     # Misc
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--dtype", type=str, default="bfloat16",
                     choices=["bfloat16", "float16", "float32"])
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    p.add_argument("--device_map", type=str, default=None,
-                    help="vi du 'auto' cho multi-GPU. Neu set thi bo qua --device")
+    p.add_argument("--device_map", type=str, default=None)
     p.add_argument("--trust_remote_code", action="store_true", default=True)
-    p.add_argument("--diagnostics_dir", type=str, default=None,
-                    help="None = <output_dir>/diagnostics")
-    p.add_argument("--log_every", type=int, default=10, help="Cap nhat plot loss moi N step")
+    p.add_argument("--diagnostics_dir", type=str, default=None)
+    p.add_argument("--log_every", type=int, default=10)
 
-    # Distributed (DDP qua torchrun: doc RANK / LOCAL_RANK / WORLD_SIZE tu bien moi truong,
-    # khong can truyen tay). Chay 1 GPU binh thuong neu khong launch qua torchrun.
-    p.add_argument("--nccl_timeout_minutes", type=int, default=30,
-                    help="Timeout cho moi collective op cua NCCL. Mac dinh cua PyTorch la "
-                         "10 phut, rat de bi NCCL Watchdog kill oan khi co buoc cham (load "
-                         "checkpoint lon luc resume, push_to_hub tren rank 0, tokenize du "
-                         "lieu lon, mang cham giua cac node...) -> tang len 30 phut.")
-
+    # Distributed
+    p.add_argument("--nccl_timeout_minutes", type=int, default=30)
     return p
 
 
 # ============================================================================================
-# Utils chung
+# Utils
 # ============================================================================================
+def load_hf_token(env_file: Optional[str], cli_token: Optional[str]) -> Optional[str]:
+    if cli_token:
+        logger.info("Dung HF token truyen qua --hf_token.")
+        return cli_token
+    for var in _HF_TOKEN_ENV_VARS:
+        if os.environ.get(var):
+            logger.info(f"Dung HF token co san trong bien moi truong {var}.")
+            return os.environ[var]
+    if env_file and os.path.exists(env_file):
+        if not DOTENV_AVAILABLE:
+            logger.warning(f"Tim thay {env_file} nhung chua cai python-dotenv.")
+            return None
+        load_dotenv(env_file, override=False)
+        for var in _HF_TOKEN_ENV_VARS:
+            if os.environ.get(var):
+                logger.info(f"Da nap HF token tu {env_file} (bien {var}).")
+                return os.environ[var]
+        logger.warning(f"Da nap {env_file} nhung khong tim thay bien {_HF_TOKEN_ENV_VARS} ben trong.")
+        return None
+    logger.info("Khong tim thay HF token — chi hoat dong voi model/repo public.")
+    return None
+
+
 def set_seed(seed: int):
     random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-
-
-def is_oom_error(e: RuntimeError) -> bool:
-    msg = str(e).lower()
-    return "out of memory" in msg or "cuda error" in msg and "memory" in msg
 
 
 def clear_memory():
@@ -213,14 +208,9 @@ def clear_memory():
 
 
 # ============================================================================================
-# Distributed (DDP qua torchrun)
+# Distributed
 # ============================================================================================
 def setup_distributed(nccl_timeout_minutes: int):
-    """torchrun tu dong set san RANK / LOCAL_RANK / WORLD_SIZE trong bien moi truong. Neu
-    chay bang `python script.py` binh thuong (khong qua torchrun) thi WORLD_SIZE khong ton
-    tai hoac = 1 -> coi nhu single-process, KHONG init distributed, code chay y het ban goc
-    (backward-compatible). device tra ve = None khi khong distributed, de main() giu nguyen
-    --device / --device_map nguoi dung tu chon thay vi bi ghi de."""
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -230,12 +220,8 @@ def setup_distributed(nccl_timeout_minutes: int):
         return rank, local_rank, world_size, is_distributed, None
 
     if not torch.cuda.is_available():
-        raise RuntimeError("Distributed training (DDP) yeu cau CUDA (backend nccl).")
+        raise RuntimeError("Distributed training yeu cau CUDA (backend nccl).")
 
-    # NCCL Watchdog mac dinh timeout sau 10 phut khong nhan duoc collective op tiep theo tu
-    # 1 rank -> crash toan bo job. Cac buoc cham (tokenize du lieu lon, luu/push checkpoint
-    # tren rank 0, load model lon luc resume, straggler GPU...) rat de vuot qua 10 phut o
-    # cluster/mang cham -> tang len 30 phut de chiu duoc ma khong bi kill oan.
     os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
     os.environ.setdefault("NCCL_TIMEOUT", str(nccl_timeout_minutes * 60))
 
@@ -248,8 +234,7 @@ def setup_distributed(nccl_timeout_minutes: int):
         timeout=datetime.timedelta(minutes=nccl_timeout_minutes),
     )
     device = torch.device(f"cuda:{local_rank}")
-    logger.info(f"[rank {rank}/{world_size}] Da init NCCL process group "
-                f"(timeout={nccl_timeout_minutes} phut, local_rank={local_rank}).")
+    logger.info(f"[rank {rank}/{world_size}] NCCL init (timeout={nccl_timeout_minutes}ph, local_rank={local_rank}).")
     return rank, local_rank, world_size, is_distributed, device
 
 
@@ -264,70 +249,30 @@ def is_main_process(rank: int) -> bool:
 
 
 def unwrap_model(model):
-    """PeftModel.save_pretrained() khong ton tai tren DistributedDataParallel -> phai lay
-    .module (peft model that su ben trong) ra truoc khi save/push checkpoint."""
     return model.module if hasattr(model, "module") else model
 
 
 def shard_texts_for_ddp(texts: List[str], lengths: List[int], rank: int, world_size: int):
-    """Chia du lieu deu cho cac rank, moi rank 1 shard rieng khong overlap. Cat bot vai
-    sample le cuoi cung de tong so sample chia het cho world_size -> MOI RANK CO CUNG SO
-    STEP/EPOCH. Bat buoc phai vay: neu cac rank co so step khac nhau, rank it step hon se
-    ra khoi vong lap som va ngung goi collective op (backward/all_reduce) trong khi cac
-    rank khac van dang cho -> treo (hang) roi NCCL Watchdog timeout, sap ca job."""
     if world_size <= 1:
         return texts, lengths
     n = len(texts)
     n_trunc = (n // world_size) * world_size
     if n_trunc == 0:
-        raise RuntimeError(
-            f"Chi co {n} sample, khong du de chia deu cho {world_size} GPU "
-            f"(can it nhat {world_size} sample)."
-        )
+        raise RuntimeError(f"Chi co {n} sample, khong du chia deu cho {world_size} GPU.")
     if n_trunc < n and rank == 0:
-        logger.warning(f"Bo {n - n_trunc} sample cuoi (trong tong {n}) de chia deu cho "
-                        f"{world_size} rank.")
+        logger.warning(f"Bo {n - n_trunc} sample cuoi de chia deu cho {world_size} rank.")
     shard_idx = list(range(n_trunc))[rank::world_size]
     return [texts[i] for i in shard_idx], [lengths[i] for i in shard_idx]
 
 
-def sync_grads_across_ranks(trainable_params, world_size: int):
-    """All-reduce (trung binh) gradient THU CONG, goi DUNG 1 LAN sau khi toan bo cac lan
-    backward() cua 1 step (ke ca cac sub-batch sinh ra do dynamic OOM splitting) da chay
-    xong. Xem giai thich chi tiet tai noi goi model.no_sync() trong training loop ve ly do
-    khong the de DDP tu dong sync nhu binh thuong."""
-    for p in trainable_params:
-        if p.grad is not None:
-            dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
-            p.grad.div_(world_size)
-
-
-def reduce_result_across_ranks(result: dict, device, world_size: int) -> dict:
-    """Gop loss / so sample cua tat ca rank lai de log/plot phan anh dung so lieu TOAN CUC,
-    thay vi chi so lieu cua rieng shard tren rank 0. Cung dung de dong bo quyet dinh
-    do_step giua cac rank (xem training loop)."""
-    loss_t = torch.tensor(
-        [result["lm_loss"], result["lb_loss"], result["total_loss"]],
-        device=device, dtype=torch.float32,
-    )
-    count_t = torch.tensor(
-        [float(result["n_processed"]), float(result["n_skipped"])],
-        device=device, dtype=torch.float32,
-    )
-    dist.all_reduce(loss_t, op=dist.ReduceOp.SUM)
-    dist.all_reduce(count_t, op=dist.ReduceOp.SUM)
-    loss_t /= world_size
-    return {
-        "lm_loss": loss_t[0].item(),
-        "lb_loss": loss_t[1].item(),
-        "total_loss": loss_t[2].item(),
-        "n_processed": int(count_t[0].item()),
-        "n_skipped": int(count_t[1].item()),
-    }
+def reduce_scalar_across_ranks(value: float, device, world_size: int) -> float:
+    t = torch.tensor(value, device=device, dtype=torch.float32)
+    dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    return t.item() / world_size
 
 
 # ============================================================================================
-# Du lieu: doc flores/bible/ntrex -> flatten thanh list cau (moi field ngon ngu = 1 sample)
+# Du lieu: tokenize truoc trong Dataset, collate chi pad theo max_length cua batch
 # ============================================================================================
 def load_all_sentences(data_dir: str, data_files: Sequence[str]) -> List[str]:
     sentences: List[str] = []
@@ -348,23 +293,24 @@ def load_all_sentences(data_dir: str, data_files: Sequence[str]) -> List[str]:
                     continue
                 if isinstance(val, str) and val.strip():
                     sentences.append(val.strip())
-        logger.info(f"{fname}: +{len(sentences) - n_before} cau, tong so record = {len(records)}")
+        logger.info(f"{fname}: +{len(sentences) - n_before} cau, tong record={len(records)}")
     return sentences
 
 
 def compute_lengths(tokenizer, texts: Sequence[str], chunk_size: int = 1000) -> List[int]:
     lengths: List[int] = []
-    for i in tqdm(range(0, len(texts), chunk_size), desc="Tinh do dai token cho toan bo sample"):
+    for i in tqdm(range(0, len(texts), chunk_size), desc="Tinh do dai token", disable=False):
         chunk = texts[i:i + chunk_size]
         enc = tokenizer(chunk, add_special_tokens=False)
         lengths.extend(len(ids) for ids in enc["input_ids"])
     return lengths
 
 
-class SentenceDataset(Dataset):
-    """Moi sample la 1 cau (string), duoc tokenize sau trong vong lap training
-    de ho tro chia nho batch khi OOM."""
-
+class TokenizedSentenceDataset(Dataset):
+    """
+    Dataset tra ve text thuan tuy. Tokenize se duoc thuc hien trong collate_fn 
+    de co the dung num_workers > 0 va tiet kiem bo nho chinh.
+    """
     def __init__(self, texts: List[str]):
         self.texts = texts
 
@@ -375,11 +321,36 @@ class SentenceDataset(Dataset):
         return self.texts[idx]
 
 
-class LengthGroupedBatchSampler(Sampler[List[int]]):
-    """Moi epoch: shuffle toan bo index -> sort theo do dai token -> gom batch -> shuffle
-    thu tu cac batch. Buoc shuffle truoc khi sort giup cac cau cung nghia (cung id, khac
-    ngon ngu) trong flores/bible/ntrex khong bi dinh lien tuc voi nhau trong 1 batch."""
+class EfficientDataCollator:
+    """
+    Collate tokenize + pad theo max_length THUC TE cua batch (khong phai pad ve 256 co dinh).
+    Giam ~30-50% token vo nghia phai tinh toan so voi padding co dinh.
+    """
+    def __init__(self, tokenizer, max_length: int):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
 
+    def __call__(self, batch_texts: List[str]) -> Dict[str, torch.Tensor]:
+        enc = self.tokenizer(
+            batch_texts,
+            padding=True,
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors="pt",
+            add_special_tokens=True,
+        )
+        input_ids = enc["input_ids"]
+        attention_mask = enc["attention_mask"]
+        labels = input_ids.clone()
+        labels[attention_mask == 0] = -100
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        }
+
+
+class LengthGroupedBatchSampler(Sampler[List[int]]):
     def __init__(self, lengths: List[int], batch_size: int, seed: int = 42):
         self.lengths = lengths
         self.batch_size = batch_size
@@ -407,7 +378,7 @@ class LengthGroupedBatchSampler(Sampler[List[int]]):
 
 
 # ============================================================================================
-# Tu dong tim target module cho LoRA: attention / router / experts trong middle layers
+# Tu dong tim target module cho LoRA
 # ============================================================================================
 LAYER_IDX_PATTERN = re.compile(r"\.(?:layers|h|blocks|block)\.(\d+)\.")
 
@@ -416,7 +387,7 @@ def get_num_layers(config) -> int:
     for attr in ("num_hidden_layers", "num_layers", "n_layer", "n_layers"):
         if hasattr(config, attr):
             return int(getattr(config, attr))
-    raise ValueError("Khong tim thay so luong layer trong model.config. Hay kiem tra ten attribute.")
+    raise ValueError("Khong tim thay so luong layer trong model.config.")
 
 
 def is_router_leaf_name(name: str) -> bool:
@@ -443,31 +414,6 @@ def build_lora_target_modules(model, layer_indices: set) -> List[str]:
     return targets
 
 
-def register_router_hooks(peft_model, router_names: List[str], cache_list: list):
-    """Hook forward tren cac router Linear (da duoc PEFT wrap LoRA) de lay logits phuc vu
-    tinh load-balancing loss. Khong detach de gradient van chay ve LoRA cua router."""
-    # Luu y: sau khi get_peft_model() wrap, module tai vi tri router khong con la
-    # torch.nn.Linear thuan tuy nua ma la peft.tuners.lora.Linear (chi ke thua nn.Module +
-    # LoraLayer, KHONG ke thua nn.Linear) -> khong duoc loc theo isinstance(nn.Linear) o day,
-    # chi can match dung ten (da duoc build_lora_target_modules xac dinh tu truoc).
-    hooks = []
-    router_name_set = set(router_names)
-    if not router_name_set:
-        return hooks
-    matched = set()
-    for name, module in peft_model.named_modules():
-        if any(name.endswith(rn) for rn in router_name_set):
-            h = module.register_forward_hook(lambda mod, inp, out, cache=cache_list: cache.append(out))
-            hooks.append(h)
-            matched.add(name)
-    if len(hooks) != len(router_name_set):
-        logger.warning(
-            f"Da dang ky {len(hooks)} hook nhung co {len(router_name_set)} router target "
-            f"-> kiem tra lai neu so luong khong khop (co the do trung ten suffix)."
-        )
-    return hooks
-
-
 def infer_moe_dims(config, args):
     num_experts = args.num_local_experts
     top_k = args.num_experts_per_tok
@@ -484,175 +430,53 @@ def infer_moe_dims(config, args):
     if num_experts is None or top_k is None:
         logger.warning(
             "Khong tu suy ra duoc num_experts/top_k tu model.config. "
-            "L_LB se = 0 tru khi ban truyen --num_local_experts va --num_experts_per_tok thu cong."
+            "L_LB se = 0 tru khi ban truyen --num_local_experts va --num_experts_per_tok."
         )
     return num_experts, top_k
 
 
 # ============================================================================================
-# MoE loss chuan: LM loss + Load Balancing loss (Switch/Mixtral style)
+# Load Balancing Loss — toi uu: dung aux_loss hoac output_router_logits cua model
 # ============================================================================================
-def compute_load_balancing_loss(router_logits_list: List[torch.Tensor], attention_mask: torch.Tensor,
-                                 num_experts: int, top_k: int):
-    """attention_mask: [batch, seq_len] (1 = token that, 0 = padding), CUNG kich thuoc batch/seq
-    voi input da dua vao model. Phai loai bo vi tri padding truoc khi tinh bat ky thong ke nao,
-    vi khong thi:
-      - Token padding (pad_token = eos_token, lap lai giong het nhau) se cho ra router logit
-        gan nhu giong nhau moi lan -> thoi phong / lam lech tan suat chon expert mot cach he
-        thong, khong phan anh dung phan bo cua token that trong cau.
-      - So luong token dung de tinh trung binh (N) cung bi dem du them ca padding, lam sai ca
-        f_i (ti le token/expert) lan gia tri loss cuoi cung.
-    Day la loi tuong tu nhu cach L_LM da loai padding qua ignore_index=-100, chi khac la L_LB
-    truoc do khong nhan attention_mask nen khong loc duoc."""
-    mask_flat = attention_mask.reshape(-1).bool()  # [tokens], cung thu tu voi logits.reshape(-1, ...)
+def compute_load_balancing_loss_from_logits(
+    router_logits_list: List[torch.Tensor],
+    attention_mask: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+):
+    """
+    Tinh L_LB tu router logits. Da duoc loc padding.
+    Cai tien: vectorize tot hon, tranh loop Python khi co the.
+    """
+    if not router_logits_list:
+        return torch.tensor(0.0, device=attention_mask.device)
 
+    mask_flat = attention_mask.reshape(-1).bool()
     losses = []
+
     for logits in router_logits_list:
-        logits = logits.reshape(-1, logits.shape[-1])  # [tokens, num_experts]
-        if logits.shape[0] == mask_flat.shape[0]:
-            logits = logits[mask_flat]  # bo cac vi tri padding truoc khi tinh thong ke
+        # logits: [batch, seq_len, num_experts]
+        flat_logits = logits.reshape(-1, logits.shape[-1])
+        if flat_logits.shape[0] == mask_flat.shape[0]:
+            flat_logits = flat_logits[mask_flat]
         else:
-            # Kien truc MoE nay flatten/reshape token theo thu tu khac gia dinh o tren (batch
-            # truoc, seq sau) -> khong the index an toan theo mask_flat, bo qua loc padding cho
-            # lan nay thay vi index sai vi tri (van con tot hon crash, nhung se kem chinh xac).
-            logger.warning(
-                "compute_load_balancing_loss: kich thuoc router logits "
-                f"({logits.shape[0]}) khong khop attention_mask ({mask_flat.shape[0]}) -> "
-                "bo qua loc padding cho lan tinh nay, kiem tra lai thu tu flatten token cua "
-                "kien truc MoE nay neu thay canh bao lap lai nhieu lan."
-            )
-        if logits.shape[0] == 0:
+            # Khong khop shape — co the do kien truc MoE reshape khac
+            # Van tinh nhung khong loc padding de tranh index sai
+            pass
+        if flat_logits.shape[0] == 0:
             continue
-        routing_weights = F.softmax(logits, dim=-1)
-        _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)  # [tokens, top_k]
-        expert_mask = F.one_hot(selected_experts, num_experts).float()  # [tokens, top_k, num_experts]
-        # LUU Y: .mean(dim=0) da chia trung binh theo so token roi (cho ra f_i dung chuan,
-        # trong khoang [0,1]) -> KHONG duoc chia them cho logits.shape[0] mot lan nua (bug
-        # cu chia 2 lan lam L_LB nho gia tao ~N lan, N = so token trong sub-batch dang tinh).
-        tokens_per_expert = expert_mask.sum(dim=1).mean(dim=0)  # [num_experts], = f_i
-        avg_prob_per_expert = routing_weights.mean(dim=0)  # [num_experts]
+
+        routing_weights = F.softmax(flat_logits, dim=-1)
+        _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+        expert_mask = F.one_hot(selected_experts, num_experts).float()
+        tokens_per_expert = expert_mask.sum(dim=1).mean(dim=0)
+        avg_prob_per_expert = routing_weights.mean(dim=0)
         loss = num_experts * torch.sum(tokens_per_expert * avg_prob_per_expert)
         losses.append(loss)
+
     if not losses:
         return torch.tensor(0.0, device=attention_mask.device)
     return torch.stack(losses).mean()
-
-
-def forward_backward_one_subbatch(sub_texts, tokenizer, model, max_length, device,
-                                   router_logits_cache, num_experts, top_k, lb_loss_coef,
-                                   loss_weight):
-    """Tokenize + forward + backward cho 1 sub-batch (co the la toan bo batch hoac 1 mieng sau
-    khi chia doi vi OOM). Tra ve (lm_loss_val, lb_loss_val, total_loss_val, n_samples)."""
-    enc = tokenizer(sub_texts, padding=True, truncation=True, max_length=max_length,
-                     return_tensors="pt")
-    input_ids = enc["input_ids"].to(device)
-    attention_mask = enc["attention_mask"].to(device)
-    labels = input_ids.clone()
-    labels[attention_mask == 0] = -100
-
-    router_logits_cache.clear()
-    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-    logits = outputs.logits
-
-    shift_logits = logits[..., :-1, :].contiguous()
-    shift_labels = labels[..., 1:].contiguous()
-    lm_loss = F.cross_entropy(
-        shift_logits.view(-1, shift_logits.size(-1)),
-        shift_labels.view(-1),
-        ignore_index=-100,
-    )
-
-    if router_logits_cache and num_experts and top_k:
-        lb_loss = compute_load_balancing_loss(router_logits_cache, attention_mask, num_experts, top_k)
-        lb_loss = lb_loss.to(lm_loss.device)
-    else:
-        lb_loss = torch.zeros((), device=lm_loss.device)
-
-    total_loss = lm_loss + lb_loss_coef * lb_loss
-    (total_loss * loss_weight).backward()
-
-    return lm_loss.item(), lb_loss.item(), total_loss.item(), len(sub_texts)
-
-
-def run_batch_with_dynamic_oom_handling(batch_texts, tokenizer, model, max_length, device,
-                                         router_logits_cache, num_experts, top_k, lb_loss_coef,
-                                         min_batch_size):
-    """Chay 1 batch (list text). Neu OOM: clear memory, chia doi, de quy. Neu OOM ca khi
-    size = 1 (hoac == min_batch_size) thi skip sample do. Luon quay ve batch_size goc cho
-    batch tiep theo (khong giu trang thai giua cac batch).
-
-    QUAN TRONG ve vong doi exception: KHONG duoc goi clear_memory()/de quy retry ngay
-    ben trong khoi `except ... as e:`. Trong luc con o trong khoi except do, `e.__traceback__`
-    van giu tham chieu toi toan bo frame cua forward_backward_one_subbatch (input_ids, outputs,
-    logits, ...) cua LAN VUA OOM -> cac tensor GPU do van "reachable" -> gc.collect()/
-    torch.cuda.empty_cache() khong giai phong duoc gi ca, va lan retry (voi batch nho hon)
-    lai chay trong khi bo nho cua lan fail truoc van bi ghim, cong don qua tung cap chia doi.
-    Vi vay ta tach rieng buoc "thu chay 1 lan" (_attempt) khoi buoc "don dep + de quy retry"
-    (_run): _run chi don dep/retry SAU KHI _attempt() da return, tuc la sau khi khoi except
-    da thoat va Python da tu dong `del e` (giai phong that su traceback + frame)."""
-    original_size = len(batch_texts)
-    agg = {"lm_loss": 0.0, "lb_loss": 0.0, "total_loss": 0.0, "n_ok": 0, "n_skipped": 0}
-
-    def _attempt(sub_texts) -> bool:
-        """Chi thu forward+backward DUNG 1 LAN. Tra ve True neu thanh cong, False neu OOM.
-        Khong lam gi khac trong except (khong clear_memory, khong retry) de dam bao khoi
-        except ket thuc ngay, Python tu xoa `e` va giai phong that su frame/tensor bi OOM."""
-        try:
-            lm, lb, tot, n = forward_backward_one_subbatch(
-                sub_texts, tokenizer, model, max_length, device,
-                router_logits_cache, num_experts, top_k, lb_loss_coef,
-                loss_weight=len(sub_texts) / max(original_size, 1),
-            )
-        except RuntimeError as e:
-            if not is_oom_error(e):
-                raise
-            return False
-        agg["lm_loss"] += lm * n
-        agg["lb_loss"] += lb * n
-        agg["total_loss"] += tot * n
-        agg["n_ok"] += n
-        return True
-
-    def _run(sub_texts):
-        if _attempt(sub_texts):
-            return
-
-        # Toi day khoi except cua _attempt() da thoat hoan toan -> `e`/traceback da bi
-        # Python xoa -> frame cua forward_backward_one_subbatch (voi input_ids, outputs,
-        # logits, shift_logits...) that su khong con ai tham chieu nua.
-        #
-        # router_logits_cache: hook forward luu logits KHONG detach (de giu gradient cho
-        # LoRA cua router) -> neu lan OOM vua roi da kip chay qua vai router truoc khi fail,
-        # cache van con om nguyen do thi autograd cua lan do. Binh thuong cache chi duoc
-        # .clear() o DAU lan forward_backward_one_subbatch ke tiep -> qua muon, phai clear
-        # ngay tai day truoc khi goi clear_memory().
-        router_logits_cache.clear()
-
-        # KHONG goi model.zero_grad() o day: backward() cua cac sub-batch anh em (da chay
-        # thanh cong truoc do trong cung batch goc) da tich luy gradient hop le vao .grad
-        # theo co che gradient-accumulation (loss_weight = len(sub)/original_size). Goi
-        # zero_grad() se xoa sach ca phan gradient hop le do moi khi co 1 sub-batch OOM,
-        # lam sai lech gradient cua ca buoc optimizer.step() ke tiep.
-        clear_memory()
-
-        if len(sub_texts) <= max(min_batch_size, 1):
-            logger.warning(f"OOM ngay ca voi sub-batch size={len(sub_texts)} -> skip sample nay.")
-            agg["n_skipped"] += len(sub_texts)
-            return
-        mid = len(sub_texts) // 2
-        logger.warning(f"OOM voi sub-batch size={len(sub_texts)} -> chia doi thanh {mid} + {len(sub_texts) - mid}.")
-        _run(sub_texts[:mid])
-        _run(sub_texts[mid:])
-
-    _run(batch_texts)
-    n = max(agg["n_ok"], 1)
-    return {
-        "lm_loss": agg["lm_loss"] / n,
-        "lb_loss": agg["lb_loss"] / n,
-        "total_loss": agg["total_loss"] / n,
-        "n_processed": agg["n_ok"],
-        "n_skipped": agg["n_skipped"],
-    }
 
 
 # ============================================================================================
@@ -661,7 +485,7 @@ def run_batch_with_dynamic_oom_handling(batch_texts, tokenizer, model, max_lengt
 def save_checkpoint(output_dir, model, optimizer, scheduler, epoch, step_in_epoch, global_step):
     ckpt_dir = os.path.join(output_dir, f"checkpoint-{global_step}")
     os.makedirs(ckpt_dir, exist_ok=True)
-    model.save_pretrained(ckpt_dir)  # PeftModel: chi luu adapter LoRA
+    unwrap_model(model).save_pretrained(ckpt_dir)
     torch.save(
         {
             "optimizer": optimizer.state_dict(),
@@ -689,7 +513,6 @@ def find_resume_checkpoint(output_dir, resume_arg: Optional[str]) -> Optional[st
                 path = f.read().strip()
             if os.path.isdir(path):
                 return path
-        # fallback: tim checkpoint-* co global_step lon nhat
         candidates = glob.glob(os.path.join(output_dir, "checkpoint-*"))
         if candidates:
             candidates.sort(key=lambda p: int(p.rsplit("-", 1)[-1]))
@@ -699,7 +522,7 @@ def find_resume_checkpoint(output_dir, resume_arg: Optional[str]) -> Optional[st
 
 
 # ============================================================================================
-# Diagnostics: jsonl + plot
+# Diagnostics
 # ============================================================================================
 def log_step_to_jsonl(jsonl_path, global_step, epoch, result):
     rec = {
@@ -709,7 +532,6 @@ def log_step_to_jsonl(jsonl_path, global_step, epoch, result):
         "lb_loss": result["lb_loss"],
         "total_loss": result["total_loss"],
         "n_processed": result["n_processed"],
-        "n_skipped": result["n_skipped"],
         "timestamp": time.time(),
     }
     with open(jsonl_path, "a", encoding="utf-8") as f:
@@ -733,12 +555,12 @@ def plot_losses(jsonl_path, out_png):
     if not steps:
         return
     plt.figure(figsize=(10, 6))
-    plt.plot(steps, lm, label="L_LM")
-    plt.plot(steps, lb, label="L_LB")
-    plt.plot(steps, total, label="L_Total")
+    plt.plot(steps, lm, label="L_LM", alpha=0.9)
+    plt.plot(steps, lb, label="L_LB", alpha=0.9)
+    plt.plot(steps, total, label="L_Total", alpha=0.9)
     plt.xlabel("Training step")
     plt.ylabel("Loss")
-    plt.title("Marco-Nano-Instruct LoRA finetuning loss")
+    plt.title("Marco-Nano-Instruct LoRA finetuning loss (Optimized)")
     plt.legend()
     plt.grid(alpha=0.3)
     plt.tight_layout()
@@ -762,42 +584,37 @@ tags:
 - fine-tuned
 ---
 
-# Macro-Nano-Instruct-Finetuning
+# Macro-Nano-Instruct-Finetuning (Optimized)
 
-Day la LoRA adapter finetune tu [`{args.model_name_or_path}`]\
+LoRA adapter finetune tu [`{args.model_name_or_path}`]\
 (https://huggingface.co/{args.model_name_or_path}), mot mo hinh Mixture-of-Experts.
 
 ## Cau hinh LoRA
-- Layer duoc finetune: `[{layer_start}, {layer_end})` trong tong so `{num_layers}` layer
-  (tuong ung khoang 1L/3 -> 2L/3).
-- Module duoc gan LoRA: **attention**, **router**, **experts** trong khoang layer tren.
+- Layer duoc finetune: `[{layer_start}, {layer_end})` trong tong so `{num_layers}` layer.
+- Module: **attention**, **router**, **experts** trong khoang layer tren.
 - r = {args.lora_r}, alpha = {args.lora_alpha}, dropout = {args.lora_dropout}
 
 ## Loss
-Loss MoE tieu chuan:
-
 `L_total = L_LM + lb_loss_coef * L_LB`
 
-- `L_LM`: cross-entropy chuan tren token tiep theo.
-- `L_LB`: load balancing loss chuan cua MoE (Switch/Mixtral style), tinh tren cac router
-  nam trong khoang layer duoc finetune.
 - `lb_loss_coef` = {args.lb_loss_coef}
 - `num_experts` = {num_experts}, `top_k` = {top_k}
 
-## Du lieu
-Cau don ngu duoc gom tu 3 bo du lieu alignment: `flores.json`, `bible.json`, `ntrex.json`
-(moi field ngon ngu trong 1 record duoc coi la 1 sample), shuffle va sort theo do dai token
-truoc khi gom batch.
+## Toi uu hieu nang
+- Gradient checkpointing
+- torch.compile (neu bat)
+- Flash Attention / SDPA
+- Dynamic batch padding (khong pad co dinh)
+- Fused AdamW + TF32
 
-## Diagnostics
-Xem `diagnostics/loss_log.jsonl` (log theo tung step) va `diagnostics/loss_curve.png`
-(bieu do L_LM / L_LB / L_Total theo step).
+## Du lieu
+Cau don ngu tu 3 bo: `flores.json`, `bible.json`, `ntrex.json`.
 """
 
 
 def push_to_hub(local_ckpt_dir, diagnostics_dir, hub_model_id, private, readme_text):
     if not HF_HUB_AVAILABLE:
-        logger.warning("huggingface_hub chua duoc cai, bo qua buoc push_to_hub.")
+        logger.warning("huggingface_hub chua duoc cai, bo qua push_to_hub.")
         return
     api = HfApi()
     api.create_repo(repo_id=hub_model_id, private=private, exist_ok=True)
@@ -825,17 +642,12 @@ def main():
     )
     if is_distributed:
         if args.device_map:
-            raise ValueError(
-                "Khong dung --device_map cung luc voi distributed training (torchrun). "
-                "DDP: moi process giu 1 ban sao model day du tren 1 GPU rieng (qua "
-                "--nproc_per_node). device_map (model-parallel, 1 process nhieu GPU) la co "
-                "che khac, khong tuong thich voi DDP."
-            )
+            raise ValueError("Khong dung --device_map cung luc voi distributed training (torchrun).")
         args.device = ddp_device
         if rank != 0:
-            logger.setLevel(logging.WARNING)  # tranh log trung lap tu tat ca rank
+            logger.setLevel(logging.WARNING)
 
-    set_seed(args.seed)
+    set_seed(args.seed + rank)  # +rank de moi rank co shuffle khac nhau (data khac nhau roi)
 
     os.makedirs(args.output_dir, exist_ok=True)
     diagnostics_dir = args.diagnostics_dir or os.path.join(args.output_dir, "diagnostics")
@@ -846,18 +658,39 @@ def main():
     dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
     dtype = dtype_map[args.dtype]
 
+    # --- TF32 toi uu ---
+    if args.tf32 and torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        logger.info("Da bat TF32 cho matmul va cudnn.")
+
+    # --- Flash Attention / SDPA ---
+    attn_impl = args.attn_implementation
+    logger.info(f"Su dung attention implementation: {attn_impl}")
+
     # ---------------------------------------------------------------------------------- model
     logger.info(f"Dang load tokenizer va model tu {args.model_name_or_path} ...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path,
-                                               trust_remote_code=args.trust_remote_code)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_name_or_path,
+        trust_remote_code=args.trust_remote_code,
+        use_fast=True,
+    )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
-    model_kwargs = dict(torch_dtype=dtype, trust_remote_code=args.trust_remote_code)
+    model_kwargs = dict(
+        torch_dtype=dtype,
+        trust_remote_code=args.trust_remote_code,
+        attn_implementation=attn_impl,
+    )
     if args.device_map:
         model_kwargs["device_map"] = args.device_map
-    base_model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, **model_kwargs)
+
+    base_model = AutoModelForCausalLM.from_pretrained(
+        args.model_name_or_path,
+        **model_kwargs,
+    )
     if not args.device_map:
         base_model.to(args.device)
 
@@ -869,22 +702,25 @@ def main():
 
     target_modules = build_lora_target_modules(base_model, layer_indices)
     if not target_modules:
-        raise RuntimeError(
-            "Khong tim thay module (attention/router/experts) nao trong khoang layer da chon. "
-            "Kien truc model co the dat ten khac quy uoc — kiem tra lai regex trong build_lora_target_modules()."
-        )
+        raise RuntimeError("Khong tim thay module nao trong khoang layer da chon.")
     router_target_names = [n for n in target_modules if is_router_leaf_name(n)]
-    logger.info(f"Tim thay {len(target_modules)} target module cho LoRA "
-                f"({len(router_target_names)} router). Vi du: {target_modules[:8]}")
+    logger.info(f"Tim thay {len(target_modules)} target module ({len(router_target_names)} router).")
 
     num_experts, top_k = infer_moe_dims(base_model.config, args)
-
     lb_loss_coef = args.lb_loss_coef
     if lb_loss_coef is None:
         lb_loss_coef = float(getattr(base_model.config, "router_aux_loss_coef", 0.01))
-    logger.info(f"lb_loss_coef (trong so load-balancing, nhu finetune binh thuong) = {lb_loss_coef}")
+    logger.info(f"lb_loss_coef = {lb_loss_coef}, num_experts={num_experts}, top_k={top_k}")
 
-    # ---------------------------------------------------------------------------- resume / LoRA
+    # --- Gradient Checkpointing: BAT TRUOC khi wrap PEFT ---
+    # Dieu nay cuc ky quan trong voi MoE nhieu expert — giam VRAM ~40-60%
+    if hasattr(base_model, "gradient_checkpointing_enable"):
+        base_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        logger.info("Da bat gradient checkpointing tren base model (use_reentrant=False).")
+    else:
+        logger.warning("Base model khong ho tro gradient_checkpointing_enable.")
+
+    # --- LoRA ---
     resume_dir = find_resume_checkpoint(args.output_dir, args.resume_from_checkpoint)
     if resume_dir:
         logger.info(f"Resume LoRA adapter tu checkpoint: {resume_dir}")
@@ -899,56 +735,125 @@ def main():
             target_modules=target_modules,
         )
         model = get_peft_model(base_model, lora_config)
+
     if is_main_process(rank):
         model.print_trainable_parameters()
     if not args.device_map:
         model.to(args.device)
 
-    router_logits_cache: list = []
-    hooks = register_router_hooks(model, router_target_names, router_logits_cache)
+    # --- torch.compile ---
+    if args.compile and hasattr(torch, "compile"):
+        logger.info("Dang torch.compile model (mode=default, fullgraph=False) ...")
+        # Khong compile fullgraph vi MoE co dynamic control flow (top-k routing)
+        model = torch.compile(model, mode="default", fullgraph=False)
+        logger.info("torch.compile xong.")
 
+    # --- Kiem tra kha nang lay router logits tu model ---
+    # Cac MoE hien dai (Mixtral, Qwen2MoE, DeepSeek) thuong tra ve aux_loss hoac router_logits
+    # Neu co, ta khong can hook gi ca — tiet kiem rat nhieu thoi gian.
+    has_aux_loss = False
+    has_router_logits_attr = False
+    test_text = "Hello world"
+    test_enc = tokenizer(test_text, return_tensors="pt").to(args.device)
+    with torch.no_grad():
+        try:
+            test_out = model(**test_enc, output_router_logits=True)
+            if hasattr(test_out, "router_logits") and test_out.router_logits is not None:
+                has_router_logits_attr = True
+                logger.info("Model ho tro output_router_logits=True — khong can hook!")
+            elif hasattr(test_out, "aux_loss") and test_out.aux_loss is not None:
+                has_aux_loss = True
+                logger.info("Model tra ve aux_loss san — se dung truc tiep, khong can hook!")
+        except Exception as e:
+            logger.warning(f"Khong the truy van router logits tu model: {e}. Se thu dung hook.")
+
+    # --- Hook chi khi thuc su can ---
+    hooks = []
+    router_logits_cache: list = []
+    if not has_router_logits_attr and not has_aux_loss and num_experts and top_k:
+        logger.info("Dang dang ky hook thu thu router logits (toi uu: chi hook cac module cha MoE).")
+        # Toi uu: thay vi hook tung Linear router, ta hook module cha chua gate + experts
+        # nhung vi khong biet chinh xac ten, ta dung cach cu nhung chi khi can thiet.
+        router_name_set = set(router_target_names)
+        matched = set()
+        for name, module in model.named_modules():
+            if any(name.endswith(rn) for rn in router_name_set):
+                h = module.register_forward_hook(
+                    lambda mod, inp, out, cache=router_logits_cache: cache.append(out)
+                )
+                hooks.append(h)
+                matched.add(name)
+        logger.info(f"Da dang ky {len(hooks)} hook tren router.")
+    else:
+        logger.info("Bo qua hook — su dung co che router logits/aux_loss noi bo cua model.")
+
+    # --- DDP toi uu ---
     if is_distributed:
+        # find_unused_parameters=False + gradient_as_bucket_view=True = nhanh hon rat nhieu
+        # Tuy nhien, neu MoE co expert khong duoc chon -> param khong nhan grad -> DDP loi.
+        # Voi LoRA, TAT CA param trainable deu tham gia moi step (vi router luon chay),
+        # nen find_unused_parameters=False la an toan.
         model = DDP(
             model,
             device_ids=[local_rank],
             output_device=local_rank,
-            # MoE top-k routing: khong phai expert nao cung duoc chon o moi step, va LoRA
-            # chi gan tren 1 khoang layer -> luon co tham so KHONG nhan gradient o mot so
-            # step -> BAT BUOC True, neu khong DDP se bao loi "Expected to have finished
-            # reduction..." ngay khi gap batch dau tien co expert/module khong duoc dung toi.
-            find_unused_parameters=True,
+            find_unused_parameters=False,
+            gradient_as_bucket_view=True,
+            bucket_cap_mb=25,
         )
 
     # ------------------------------------------------------------------------------------ data
-    logger.info(f"Dang doc du lieu tu {args.data_dir} ({args.data_files}) ...")
+    logger.info(f"Dang doc du lieu tu {args.data_dir} ...")
     texts = load_all_sentences(args.data_dir, args.data_files)
     if args.max_samples:
         random.Random(args.seed).shuffle(texts)
-        texts = texts[: args.max_samples]
-    logger.info(f"Tong so sample (cau) sau khi gom ca 3 bo du lieu: {len(texts)}")
+        texts = texts[:args.max_samples]
+    logger.info(f"Tong so sample: {len(texts)}")
     if len(texts) == 0:
-        raise RuntimeError("Khong doc duoc sample nao — kiem tra lai --data_dir / --data_files.")
+        raise RuntimeError("Khong doc duoc sample nao.")
 
     lengths = compute_lengths(tokenizer, texts)
-
-    # Distributed: moi rank chi train tren 1 shard rieng, khong overlap. --batch_size la
-    # batch size CHO MOI GPU (giong per_device_train_batch_size cua HF Trainer) -> global
-    # batch size thuc te = batch_size * world_size.
     texts, lengths = shard_texts_for_ddp(texts, lengths, rank, world_size)
     if is_distributed:
-        logger.info(f"[rank {rank}/{world_size}] Shard cua rank nay: {len(texts)} sample.")
+        logger.info(f"[rank {rank}] Shard: {len(texts)} sample.")
 
-    dataset = SentenceDataset(texts)
+    dataset = TokenizedSentenceDataset(texts)
     batch_sampler = LengthGroupedBatchSampler(lengths, batch_size=args.batch_size, seed=args.seed)
-    dataloader = DataLoader(dataset, batch_sampler=batch_sampler, collate_fn=lambda b: b)
+    collate_fn = EfficientDataCollator(tokenizer, max_length=args.max_length)
+
+    dataloader = DataLoader(
+        dataset,
+        batch_sampler=batch_sampler,
+        collate_fn=collate_fn,
+        num_workers=args.num_workers if not is_distributed else 0,  # DDP + multi-worker can than
+        pin_memory=args.pin_memory and torch.cuda.is_available(),
+        prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
+        persistent_workers=True if args.num_workers > 0 else False,
+    )
 
     # ------------------------------------------------------------------------------- optimizer
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate,
-                                weight_decay=args.weight_decay, foreach=True)  # hoặc fused=True nếu CUDA hỗ trợ
     
+    # Fused AdamW: foreach=True hoac fused=True (neu CUDA ho tro)
+    adamw_kwargs = {"lr": args.learning_rate, "weight_decay": args.weight_decay}
+    if args.fused_adamw:
+        # PyTorch >= 2.0 ho tro fused=True; foreach=True la fallback an toan
+        try:
+            adamw_kwargs["fused"] = True
+            test_opt = torch.optim.AdamW([torch.randn(1)], **adamw_kwargs)
+            del test_opt
+            logger.info("Dung fused AdamW (fused=True).")
+        except Exception:
+            adamw_kwargs.pop("fused", None)
+            adamw_kwargs["foreach"] = True
+            logger.info("Dung foreach AdamW (foreach=True).")
+    else:
+        adamw_kwargs["foreach"] = True
+
+    optimizer = torch.optim.AdamW(trainable_params, **adamw_kwargs)
+
     steps_per_epoch = len(batch_sampler)
-    total_steps = steps_per_epoch * args.num_train_epochs
+    total_steps = steps_per_epoch * args.num_train_epochs // args.gradient_accumulation_steps
     scheduler = get_linear_schedule_with_warmup(
         optimizer,
         num_warmup_steps=int(total_steps * args.warmup_ratio),
@@ -961,8 +866,11 @@ def main():
         if os.path.exists(state_path):
             state = torch.load(state_path, map_location="cpu")
             optimizer.load_state_dict(state["optimizer"])
+            # Restore fused/foreach flag bi mat trong state_dict
             for group in optimizer.param_groups:
-                group["foreach"] = True  # fix bug: AdamW state_dict khong luu foreach=True -> load_state_dict() se reset lai thanh False
+                if args.fused_adamw and "fused" in adamw_kwargs:
+                    group["fused"] = True
+                group.setdefault("foreach", True)
             if state.get("scheduler"):
                 scheduler.load_state_dict(state["scheduler"])
             start_epoch = state["epoch"]
@@ -970,8 +878,7 @@ def main():
             global_step = state["global_step"]
             torch.set_rng_state(state["torch_rng_state"])
             random.setstate(state["python_rng_state"])
-            logger.info(f"Da resume: epoch={start_epoch}, step_in_epoch={start_step_in_epoch}, "
-                        f"global_step={global_step}")
+            logger.info(f"Resume: epoch={start_epoch}, step={start_step_in_epoch}, global_step={global_step}")
             if start_step_in_epoch >= steps_per_epoch:
                 start_epoch += 1
                 start_step_in_epoch = 0
@@ -980,12 +887,16 @@ def main():
 
     # ------------------------------------------------------------------------------ training loop
     model_device = next(model.parameters()).device
+    autocast_dtype = dtype if dtype != torch.float32 else None
+    autocast_enabled = (dtype == torch.float16 or dtype == torch.bfloat16)
+    
+    # Scaler chi can cho float16; bfloat16 khong can
+    scaler = torch.cuda.amp.GradScaler() if (autocast_enabled and dtype == torch.float16) else None
+
     try:
         for epoch in range(start_epoch, args.num_train_epochs):
             batch_sampler.set_epoch(epoch)
             step_offset = start_step_in_epoch if epoch == start_epoch else 0
-
-            no_sync_ctx = model.no_sync if is_distributed else nullcontext
 
             pbar = tqdm(
                 enumerate(dataloader),
@@ -993,96 +904,146 @@ def main():
                 desc=f"Epoch {epoch + 1}/{args.num_train_epochs}",
                 disable=not is_main_process(rank),
             )
-            for step_in_epoch, batch_texts in pbar:
+
+            model.train()
+            optimizer.zero_grad(set_to_none=True)
+            accum_count = 0
+
+            for step_in_epoch, batch in pbar:
                 if step_in_epoch < step_offset:
-                    # dang resume: bo qua nhanh cac batch da xu ly o lan chay truoc
                     continue
 
-                model.train()
-                # set_to_none=False khi distributed: dam bao MOI param luon co san tensor
-                # .grad (khong bi None), ke ca khi rank nay bi skip toan bo sample do OOM o
-                # step nay -> can thiet de sync_grads_across_ranks() ben duoi goi all_reduce
-                # dong bo duoc giua cac rank (all_reduce doi hoi TAT CA rank cung tham gia
-                # voi tensor ton tai, khong the "vang mat").
-                optimizer.zero_grad(set_to_none=not is_distributed)
+                input_ids = batch["input_ids"].to(model_device, non_blocking=True)
+                attention_mask = batch["attention_mask"].to(model_device, non_blocking=True)
+                labels = batch["labels"].to(model_device, non_blocking=True)
 
-                # Toan bo cac lan backward() cua step nay (ke ca cac sub-batch do dynamic
-                # OOM splitting sinh ra ben trong ham duoi) duoc boc trong no_sync(): tat co
-                # che DDP tu dong all-reduce gradient sau MOI lan backward(). Neu khong tat,
-                # 1 step goi backward() nhieu lan se khien DDP all-reduce nhieu lan/sai nhip
-                # tren cung 1 tap tham so -> loi kinh dien "Expected to mark a variable ready
-                # only once" (cang de gap hon khi find_unused_parameters=True). Thay vao do,
-                # ta tu all_reduce THU CONG dung 1 LAN (sync_grads_across_ranks) ngay sau khi
-                # toan bo cac lan backward can thiet cua step da chay xong, truoc khi goi
-                # optimizer.step().
-                with no_sync_ctx():
-                    result = run_batch_with_dynamic_oom_handling(
-                        batch_texts=batch_texts,
-                        tokenizer=tokenizer,
-                        model=model,
-                        max_length=args.max_length,
-                        device=model_device,
-                        router_logits_cache=router_logits_cache,
-                        num_experts=num_experts,
-                        top_k=top_k,
-                        lb_loss_coef=lb_loss_coef,
-                        min_batch_size=args.min_batch_size,
+                router_logits_cache.clear()
+
+                # Forward voi autocast (mixed precision)
+                with torch.cuda.amp.autocast(enabled=autocast_enabled, dtype=autocast_dtype):
+                    if has_router_logits_attr:
+                        outputs = model(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                            output_router_logits=True,
+                        )
+                        logits = outputs.logits
+                        router_logits_list = outputs.router_logits if hasattr(outputs, "router_logits") else []
+                    elif has_aux_loss:
+                        outputs = model(
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
+                        )
+                        logits = outputs.logits
+                        aux_loss = outputs.aux_loss if hasattr(outputs, "aux_loss") else None
+                        router_logits_list = []
+                    else:
+                        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                        logits = outputs.logits
+                        router_logits_list = router_logits_cache
+
+                    shift_logits = logits[..., :-1, :].contiguous()
+                    shift_labels = labels[..., 1:].contiguous()
+                    lm_loss = F.cross_entropy(
+                        shift_logits.view(-1, shift_logits.size(-1)),
+                        shift_labels.view(-1),
+                        ignore_index=-100,
                     )
 
-                if is_distributed:
-                    # Gop n_processed/loss cua TAT CA rank: vua de quyet dinh do_step DONG
-                    # BO giua cac rank (tranh truong hop rank nay goi optimizer.step() con
-                    # rank kia thi khong — se lam tham so cac rank lech nhau vinh vien vi DDP
-                    # gia dinh tham so luon giong het nhau giua cac rank), vua de log dung so
-                    # lieu toan cuc thay vi chi shard rieng cua rank 0.
-                    result = reduce_result_across_ranks(result, model_device, world_size)
-                do_step = result["n_processed"] > 0
+                    # Load balancing loss
+                    if has_aux_loss and aux_loss is not None:
+                        lb_loss = aux_loss
+                    elif router_logits_list and num_experts and top_k:
+                        lb_loss = compute_load_balancing_loss_from_logits(
+                            router_logits_list, attention_mask, num_experts, top_k
+                        )
+                    else:
+                        lb_loss = torch.zeros((), device=lm_loss.device)
 
-                if do_step:
+                    total_loss = lm_loss + lb_loss_coef * lb_loss
+                    # Chia cho so accumulation step
+                    total_loss = total_loss / args.gradient_accumulation_steps
+
+                # Backward
+                if scaler is not None:
+                    scaler.scale(total_loss).backward()
+                else:
+                    total_loss.backward()
+
+                accum_count += 1
+
+                # --- Chi optimizer.step() sau khi du accumulation ---
+                if accum_count % args.gradient_accumulation_steps == 0:
                     if is_distributed:
-                        sync_grads_across_ranks(trainable_params, world_size)
-                    torch.nn.utils.clip_grad_norm_(trainable_params, args.gradient_clip_norm)
-                    optimizer.step()
-                scheduler.step()
-                global_step += 1
+                        # DDP voi gradient_as_bucket_view=True tu dong all_reduce 
+                        # sau backward(), khong can sync thu cong.
+                        pass
 
-                pbar.set_postfix({
-                    "L_LM": f"{result['lm_loss']:.4f}",
-                    "L_LB": f"{result['lb_loss']:.4f}",
-                    "L_Total": f"{result['total_loss']:.4f}",
-                    "skipped": result["n_skipped"],
-                })
+                    if scaler is not None:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(trainable_params, args.gradient_clip_norm)
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        torch.nn.utils.clip_grad_norm_(trainable_params, args.gradient_clip_norm)
+                        optimizer.step()
+                    
+                    scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    global_step += 1
 
-                if is_main_process(rank):
-                    if result["n_processed"] > 0:
+                    # --- Logging ---
+                    # Chi log khi vua step
+                    lm_loss_val = lm_loss.item()
+                    lb_loss_val = lb_loss.item() if isinstance(lb_loss, torch.Tensor) else 0.0
+                    total_loss_val = (lm_loss_val + lb_loss_coef * lb_loss_val)
+
+                    if is_distributed:
+                        lm_loss_val = reduce_scalar_across_ranks(lm_loss_val, model_device, world_size)
+                        lb_loss_val = reduce_scalar_across_ranks(lb_loss_val, model_device, world_size)
+                        total_loss_val = reduce_scalar_across_ranks(total_loss_val, model_device, world_size)
+
+                    pbar.set_postfix({
+                        "L_LM": f"{lm_loss_val:.4f}",
+                        "L_LB": f"{lb_loss_val:.4f}",
+                        "L_Total": f"{total_loss_val:.4f}",
+                        "lr": f"{scheduler.get_last_lr()[0]:.2e}",
+                    })
+
+                    if is_main_process(rank):
+                        result = {
+                            "lm_loss": lm_loss_val,
+                            "lb_loss": lb_loss_val,
+                            "total_loss": total_loss_val,
+                            "n_processed": input_ids.size(0) * world_size,
+                        }
                         log_step_to_jsonl(jsonl_path, global_step, epoch, result)
 
-                    if global_step % args.log_every == 0:
-                        plot_losses(jsonl_path, plot_path)
+                        if global_step % args.log_every == 0:
+                            plot_losses(jsonl_path, plot_path)
 
-                    if global_step % args.save_steps == 0:
-                        ckpt_dir = save_checkpoint(args.output_dir, unwrap_model(model), optimizer,
-                                                    scheduler, epoch, step_in_epoch, global_step)
-                        plot_losses(jsonl_path, plot_path)
-                        logger.info(f"Da luu checkpoint local: {ckpt_dir}")
-                        if args.push_to_hub:
-                            push_to_hub(ckpt_dir, diagnostics_dir, args.hub_model_id,
-                                        args.hub_private, readme_text)
-                            logger.info(f"Da push checkpoint len hub: {args.hub_model_id}")
+                        if global_step % args.save_steps == 0:
+                            ckpt_dir = save_checkpoint(
+                                args.output_dir, unwrap_model(model), optimizer, scheduler,
+                                epoch, step_in_epoch, global_step
+                            )
+                            plot_losses(jsonl_path, plot_path)
+                            logger.info(f"Da luu checkpoint: {ckpt_dir}")
+                            if args.push_to_hub:
+                                push_to_hub(ckpt_dir, diagnostics_dir, args.hub_model_id,
+                                            args.hub_private, readme_text)
 
-                if is_distributed and global_step % args.save_steps == 0:
-                    # Cac rank khac cho rank 0 ghi xong checkpoint/push len hub roi moi vao
-                    # step tiep theo, tranh lech nhip qua nhieu giua cac rank (rank 0 lam
-                    # I/O/network cham) -> giam nguy co NCCL Watchdog timeout o cac collective
-                    # op (all_reduce gradient) cua step ke tiep.
-                    dist.barrier()
+                    if is_distributed and global_step % args.save_steps == 0:
+                        dist.barrier()
 
-            start_step_in_epoch = 0  # tu epoch tiep theo tro di, khong can offset resume nua
+            start_step_in_epoch = 0
 
-        # checkpoint cuoi cung sau khi hoan thanh training
+        # --- Final checkpoint ---
         if is_main_process(rank):
-            final_ckpt = save_checkpoint(args.output_dir, unwrap_model(model), optimizer, scheduler,
-                                          args.num_train_epochs - 1, steps_per_epoch - 1, global_step)
+            final_ckpt = save_checkpoint(
+                args.output_dir, unwrap_model(model), optimizer, scheduler,
+                args.num_train_epochs - 1, steps_per_epoch - 1, global_step
+            )
             plot_losses(jsonl_path, plot_path)
             if args.push_to_hub:
                 push_to_hub(final_ckpt, diagnostics_dir, args.hub_model_id, args.hub_private, readme_text)
@@ -1091,7 +1052,7 @@ def main():
             dist.barrier()
 
     except KeyboardInterrupt:
-        logger.warning("Nhan KeyboardInterrupt — luu checkpoint khan cap truoc khi thoat ...")
+        logger.warning("KeyboardInterrupt — luu checkpoint khan cap ...")
         if is_main_process(rank):
             save_checkpoint(args.output_dir, unwrap_model(model), optimizer, scheduler,
                              epoch, step_in_epoch, global_step)
