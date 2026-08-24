@@ -33,6 +33,7 @@ Resume:
 """
 
 import argparse
+import datetime
 import gc
 import glob
 import json
@@ -42,10 +43,13 @@ import os
 import random
 import re
 import time
+from contextlib import nullcontext
 from typing import List, Optional, Sequence
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader, Sampler
 from tqdm.auto import tqdm
 
@@ -178,6 +182,14 @@ def build_argparser() -> argparse.ArgumentParser:
                     help="None = <output_dir>/diagnostics")
     p.add_argument("--log_every", type=int, default=10, help="Cap nhat plot loss moi N step")
 
+    # Distributed (DDP qua torchrun: doc RANK / LOCAL_RANK / WORLD_SIZE tu bien moi truong,
+    # khong can truyen tay). Chay 1 GPU binh thuong neu khong launch qua torchrun.
+    p.add_argument("--nccl_timeout_minutes", type=int, default=30,
+                    help="Timeout cho moi collective op cua NCCL. Mac dinh cua PyTorch la "
+                         "10 phut, rat de bi NCCL Watchdog kill oan khi co buoc cham (load "
+                         "checkpoint lon luc resume, push_to_hub tren rank 0, tokenize du "
+                         "lieu lon, mang cham giua cac node...) -> tang len 30 phut.")
+
     return p
 
 
@@ -201,6 +213,120 @@ def clear_memory():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+
+
+# ============================================================================================
+# Distributed (DDP qua torchrun)
+# ============================================================================================
+def setup_distributed(nccl_timeout_minutes: int):
+    """torchrun tu dong set san RANK / LOCAL_RANK / WORLD_SIZE trong bien moi truong. Neu
+    chay bang `python script.py` binh thuong (khong qua torchrun) thi WORLD_SIZE khong ton
+    tai hoac = 1 -> coi nhu single-process, KHONG init distributed, code chay y het ban goc
+    (backward-compatible). device tra ve = None khi khong distributed, de main() giu nguyen
+    --device / --device_map nguoi dung tu chon thay vi bi ghi de."""
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    is_distributed = world_size > 1
+
+    if not is_distributed:
+        return rank, local_rank, world_size, is_distributed, None
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("Distributed training (DDP) yeu cau CUDA (backend nccl).")
+
+    # NCCL Watchdog mac dinh timeout sau 10 phut khong nhan duoc collective op tiep theo tu
+    # 1 rank -> crash toan bo job. Cac buoc cham (tokenize du lieu lon, luu/push checkpoint
+    # tren rank 0, load model lon luc resume, straggler GPU...) rat de vuot qua 10 phut o
+    # cluster/mang cham -> tang len 30 phut de chiu duoc ma khong bi kill oan.
+    os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
+    os.environ.setdefault("NCCL_TIMEOUT", str(nccl_timeout_minutes * 60))
+
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(
+        backend="nccl",
+        init_method="env://",
+        world_size=world_size,
+        rank=rank,
+        timeout=datetime.timedelta(minutes=nccl_timeout_minutes),
+    )
+    device = torch.device(f"cuda:{local_rank}")
+    logger.info(f"[rank {rank}/{world_size}] Da init NCCL process group "
+                f"(timeout={nccl_timeout_minutes} phut, local_rank={local_rank}).")
+    return rank, local_rank, world_size, is_distributed, device
+
+
+def cleanup_distributed(is_distributed: bool):
+    if is_distributed and dist.is_available() and dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
+
+
+def is_main_process(rank: int) -> bool:
+    return rank == 0
+
+
+def unwrap_model(model):
+    """PeftModel.save_pretrained() khong ton tai tren DistributedDataParallel -> phai lay
+    .module (peft model that su ben trong) ra truoc khi save/push checkpoint."""
+    return model.module if hasattr(model, "module") else model
+
+
+def shard_texts_for_ddp(texts: List[str], lengths: List[int], rank: int, world_size: int):
+    """Chia du lieu deu cho cac rank, moi rank 1 shard rieng khong overlap. Cat bot vai
+    sample le cuoi cung de tong so sample chia het cho world_size -> MOI RANK CO CUNG SO
+    STEP/EPOCH. Bat buoc phai vay: neu cac rank co so step khac nhau, rank it step hon se
+    ra khoi vong lap som va ngung goi collective op (backward/all_reduce) trong khi cac
+    rank khac van dang cho -> treo (hang) roi NCCL Watchdog timeout, sap ca job."""
+    if world_size <= 1:
+        return texts, lengths
+    n = len(texts)
+    n_trunc = (n // world_size) * world_size
+    if n_trunc == 0:
+        raise RuntimeError(
+            f"Chi co {n} sample, khong du de chia deu cho {world_size} GPU "
+            f"(can it nhat {world_size} sample)."
+        )
+    if n_trunc < n and rank == 0:
+        logger.warning(f"Bo {n - n_trunc} sample cuoi (trong tong {n}) de chia deu cho "
+                        f"{world_size} rank.")
+    shard_idx = list(range(n_trunc))[rank::world_size]
+    return [texts[i] for i in shard_idx], [lengths[i] for i in shard_idx]
+
+
+def sync_grads_across_ranks(trainable_params, world_size: int):
+    """All-reduce (trung binh) gradient THU CONG, goi DUNG 1 LAN sau khi toan bo cac lan
+    backward() cua 1 step (ke ca cac sub-batch sinh ra do dynamic OOM splitting) da chay
+    xong. Xem giai thich chi tiet tai noi goi model.no_sync() trong training loop ve ly do
+    khong the de DDP tu dong sync nhu binh thuong."""
+    for p in trainable_params:
+        if p.grad is not None:
+            dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+            p.grad.div_(world_size)
+
+
+def reduce_result_across_ranks(result: dict, device, world_size: int) -> dict:
+    """Gop loss / so sample cua tat ca rank lai de log/plot phan anh dung so lieu TOAN CUC,
+    thay vi chi so lieu cua rieng shard tren rank 0. Cung dung de dong bo quyet dinh
+    do_step giua cac rank (xem training loop)."""
+    loss_t = torch.tensor(
+        [result["lm_loss"], result["lb_loss"], result["total_loss"]],
+        device=device, dtype=torch.float32,
+    )
+    count_t = torch.tensor(
+        [float(result["n_processed"]), float(result["n_skipped"])],
+        device=device, dtype=torch.float32,
+    )
+    dist.all_reduce(loss_t, op=dist.ReduceOp.SUM)
+    dist.all_reduce(count_t, op=dist.ReduceOp.SUM)
+    loss_t /= world_size
+    return {
+        "lm_loss": loss_t[0].item(),
+        "lb_loss": loss_t[1].item(),
+        "total_loss": loss_t[2].item(),
+        "n_processed": int(count_t[0].item()),
+        "n_skipped": int(count_t[1].item()),
+    }
 
 
 # ============================================================================================
@@ -696,6 +822,22 @@ def push_to_hub(local_ckpt_dir, diagnostics_dir, hub_model_id, private, readme_t
 # ============================================================================================
 def main():
     args = build_argparser().parse_args()
+
+    rank, local_rank, world_size, is_distributed, ddp_device = setup_distributed(
+        args.nccl_timeout_minutes
+    )
+    if is_distributed:
+        if args.device_map:
+            raise ValueError(
+                "Khong dung --device_map cung luc voi distributed training (torchrun). "
+                "DDP: moi process giu 1 ban sao model day du tren 1 GPU rieng (qua "
+                "--nproc_per_node). device_map (model-parallel, 1 process nhieu GPU) la co "
+                "che khac, khong tuong thich voi DDP."
+            )
+        args.device = ddp_device
+        if rank != 0:
+            logger.setLevel(logging.WARNING)  # tranh log trung lap tu tat ca rank
+
     set_seed(args.seed)
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -760,12 +902,25 @@ def main():
             target_modules=target_modules,
         )
         model = get_peft_model(base_model, lora_config)
-    model.print_trainable_parameters()
+    if is_main_process(rank):
+        model.print_trainable_parameters()
     if not args.device_map:
         model.to(args.device)
 
     router_logits_cache: list = []
     hooks = register_router_hooks(model, router_target_names, router_logits_cache)
+
+    if is_distributed:
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            # MoE top-k routing: khong phai expert nao cung duoc chon o moi step, va LoRA
+            # chi gan tren 1 khoang layer -> luon co tham so KHONG nhan gradient o mot so
+            # step -> BAT BUOC True, neu khong DDP se bao loi "Expected to have finished
+            # reduction..." ngay khi gap batch dau tien co expert/module khong duoc dung toi.
+            find_unused_parameters=True,
+        )
 
     # ------------------------------------------------------------------------------------ data
     logger.info(f"Dang doc du lieu tu {args.data_dir} ({args.data_files}) ...")
@@ -778,6 +933,14 @@ def main():
         raise RuntimeError("Khong doc duoc sample nao — kiem tra lai --data_dir / --data_files.")
 
     lengths = compute_lengths(tokenizer, texts)
+
+    # Distributed: moi rank chi train tren 1 shard rieng, khong overlap. --batch_size la
+    # batch size CHO MOI GPU (giong per_device_train_batch_size cua HF Trainer) -> global
+    # batch size thuc te = batch_size * world_size.
+    texts, lengths = shard_texts_for_ddp(texts, lengths, rank, world_size)
+    if is_distributed:
+        logger.info(f"[rank {rank}/{world_size}] Shard cua rank nay: {len(texts)} sample.")
+
     dataset = SentenceDataset(texts)
     batch_sampler = LengthGroupedBatchSampler(lengths, batch_size=args.batch_size, seed=args.seed)
     dataloader = DataLoader(dataset, batch_sampler=batch_sampler, collate_fn=lambda b: b)
@@ -825,10 +988,13 @@ def main():
             batch_sampler.set_epoch(epoch)
             step_offset = start_step_in_epoch if epoch == start_epoch else 0
 
+            no_sync_ctx = model.no_sync if is_distributed else nullcontext
+
             pbar = tqdm(
                 enumerate(dataloader),
                 total=steps_per_epoch,
                 desc=f"Epoch {epoch + 1}/{args.num_train_epochs}",
+                disable=not is_main_process(rank),
             )
             for step_in_epoch, batch_texts in pbar:
                 if step_in_epoch < step_offset:
@@ -836,22 +1002,48 @@ def main():
                     continue
 
                 model.train()
-                optimizer.zero_grad(set_to_none=True)
+                # set_to_none=False khi distributed: dam bao MOI param luon co san tensor
+                # .grad (khong bi None), ke ca khi rank nay bi skip toan bo sample do OOM o
+                # step nay -> can thiet de sync_grads_across_ranks() ben duoi goi all_reduce
+                # dong bo duoc giua cac rank (all_reduce doi hoi TAT CA rank cung tham gia
+                # voi tensor ton tai, khong the "vang mat").
+                optimizer.zero_grad(set_to_none=not is_distributed)
 
-                result = run_batch_with_dynamic_oom_handling(
-                    batch_texts=batch_texts,
-                    tokenizer=tokenizer,
-                    model=model,
-                    max_length=args.max_length,
-                    device=model_device,
-                    router_logits_cache=router_logits_cache,
-                    num_experts=num_experts,
-                    top_k=top_k,
-                    lb_loss_coef=lb_loss_coef,
-                    min_batch_size=args.min_batch_size,
-                )
+                # Toan bo cac lan backward() cua step nay (ke ca cac sub-batch do dynamic
+                # OOM splitting sinh ra ben trong ham duoi) duoc boc trong no_sync(): tat co
+                # che DDP tu dong all-reduce gradient sau MOI lan backward(). Neu khong tat,
+                # 1 step goi backward() nhieu lan se khien DDP all-reduce nhieu lan/sai nhip
+                # tren cung 1 tap tham so -> loi kinh dien "Expected to mark a variable ready
+                # only once" (cang de gap hon khi find_unused_parameters=True). Thay vao do,
+                # ta tu all_reduce THU CONG dung 1 LAN (sync_grads_across_ranks) ngay sau khi
+                # toan bo cac lan backward can thiet cua step da chay xong, truoc khi goi
+                # optimizer.step().
+                with no_sync_ctx():
+                    result = run_batch_with_dynamic_oom_handling(
+                        batch_texts=batch_texts,
+                        tokenizer=tokenizer,
+                        model=model,
+                        max_length=args.max_length,
+                        device=model_device,
+                        router_logits_cache=router_logits_cache,
+                        num_experts=num_experts,
+                        top_k=top_k,
+                        lb_loss_coef=lb_loss_coef,
+                        min_batch_size=args.min_batch_size,
+                    )
 
-                if result["n_processed"] > 0:
+                if is_distributed:
+                    # Gop n_processed/loss cua TAT CA rank: vua de quyet dinh do_step DONG
+                    # BO giua cac rank (tranh truong hop rank nay goi optimizer.step() con
+                    # rank kia thi khong — se lam tham so cac rank lech nhau vinh vien vi DDP
+                    # gia dinh tham so luon giong het nhau giua cac rank), vua de log dung so
+                    # lieu toan cuc thay vi chi shard rieng cua rank 0.
+                    result = reduce_result_across_ranks(result, model_device, world_size)
+                do_step = result["n_processed"] > 0
+
+                if do_step:
+                    if is_distributed:
+                        sync_grads_across_ranks(trainable_params, world_size)
                     torch.nn.utils.clip_grad_norm_(trainable_params, args.gradient_clip_norm)
                     optimizer.step()
                 scheduler.step()
@@ -864,40 +1056,54 @@ def main():
                     "skipped": result["n_skipped"],
                 })
 
-                if result["n_processed"] > 0:
-                    log_step_to_jsonl(jsonl_path, global_step, epoch, result)
+                if is_main_process(rank):
+                    if result["n_processed"] > 0:
+                        log_step_to_jsonl(jsonl_path, global_step, epoch, result)
 
-                if global_step % args.log_every == 0:
-                    plot_losses(jsonl_path, plot_path)
+                    if global_step % args.log_every == 0:
+                        plot_losses(jsonl_path, plot_path)
 
-                if global_step % args.save_steps == 0:
-                    ckpt_dir = save_checkpoint(args.output_dir, model, optimizer, scheduler,
-                                                epoch, step_in_epoch, global_step)
-                    plot_losses(jsonl_path, plot_path)
-                    logger.info(f"Da luu checkpoint local: {ckpt_dir}")
-                    if args.push_to_hub:
-                        push_to_hub(ckpt_dir, diagnostics_dir, args.hub_model_id,
-                                    args.hub_private, readme_text)
-                        logger.info(f"Da push checkpoint len hub: {args.hub_model_id}")
+                    if global_step % args.save_steps == 0:
+                        ckpt_dir = save_checkpoint(args.output_dir, unwrap_model(model), optimizer,
+                                                    scheduler, epoch, step_in_epoch, global_step)
+                        plot_losses(jsonl_path, plot_path)
+                        logger.info(f"Da luu checkpoint local: {ckpt_dir}")
+                        if args.push_to_hub:
+                            push_to_hub(ckpt_dir, diagnostics_dir, args.hub_model_id,
+                                        args.hub_private, readme_text)
+                            logger.info(f"Da push checkpoint len hub: {args.hub_model_id}")
+
+                if is_distributed and global_step % args.save_steps == 0:
+                    # Cac rank khac cho rank 0 ghi xong checkpoint/push len hub roi moi vao
+                    # step tiep theo, tranh lech nhip qua nhieu giua cac rank (rank 0 lam
+                    # I/O/network cham) -> giam nguy co NCCL Watchdog timeout o cac collective
+                    # op (all_reduce gradient) cua step ke tiep.
+                    dist.barrier()
 
             start_step_in_epoch = 0  # tu epoch tiep theo tro di, khong can offset resume nua
 
         # checkpoint cuoi cung sau khi hoan thanh training
-        final_ckpt = save_checkpoint(args.output_dir, model, optimizer, scheduler,
-                                      args.num_train_epochs - 1, steps_per_epoch - 1, global_step)
-        plot_losses(jsonl_path, plot_path)
-        if args.push_to_hub:
-            push_to_hub(final_ckpt, diagnostics_dir, args.hub_model_id, args.hub_private, readme_text)
-        logger.info("Training hoan tat.")
+        if is_main_process(rank):
+            final_ckpt = save_checkpoint(args.output_dir, unwrap_model(model), optimizer, scheduler,
+                                          args.num_train_epochs - 1, steps_per_epoch - 1, global_step)
+            plot_losses(jsonl_path, plot_path)
+            if args.push_to_hub:
+                push_to_hub(final_ckpt, diagnostics_dir, args.hub_model_id, args.hub_private, readme_text)
+            logger.info("Training hoan tat.")
+        if is_distributed:
+            dist.barrier()
 
     except KeyboardInterrupt:
         logger.warning("Nhan KeyboardInterrupt — luu checkpoint khan cap truoc khi thoat ...")
-        save_checkpoint(args.output_dir, model, optimizer, scheduler, epoch, step_in_epoch, global_step)
-        plot_losses(jsonl_path, plot_path)
+        if is_main_process(rank):
+            save_checkpoint(args.output_dir, unwrap_model(model), optimizer, scheduler,
+                             epoch, step_in_epoch, global_step)
+            plot_losses(jsonl_path, plot_path)
         raise
     finally:
         for h in hooks:
             h.remove()
+        cleanup_distributed(is_distributed)
 
 
 if __name__ == "__main__":
