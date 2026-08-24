@@ -295,11 +295,38 @@ def sync_grads_across_ranks(trainable_params, world_size: int):
     """All-reduce (trung binh) gradient THU CONG, goi DUNG 1 LAN sau khi toan bo cac lan
     backward() cua 1 step (ke ca cac sub-batch sinh ra do dynamic OOM splitting) da chay
     xong. Xem giai thich chi tiet tai noi goi model.no_sync() trong training loop ve ly do
-    khong the de DDP tu dong sync nhu binh thuong."""
+    khong the de DDP tu dong sync nhu binh thuong.
+
+    [FIX CHAM NANG VOI MoE NHIEU EXPERTS]
+    Ban cu goi dist.all_reduce() RIENG LE cho TUNG tham so (for p in trainable_params:
+    dist.all_reduce(p.grad)). LoRA o day gan tren attention + router + TAT CA experts
+    trong 1/3 so layer giua -> voi backbone co nhieu expert, so luong tensor gradient
+    (LoRA A/B x moi expert x moi layer x moi projection) co the len toi hang nghin. Moi
+    dist.all_reduce() la 1 NCCL kernel + 1 lan dong bo (fixed overhead) RIENG, chay TUAN
+    TU trong vong lap Python (khong gop, khong overlap voi tinh toan) -> tong thoi gian
+    sync tang gan nhu TUYEN TINH theo so luong expert, dung trieu chung "cang nhieu
+    expert cang cham".
+
+    Fix: GOM (flatten) toan bo gradient thanh 1 buffer lien tuc DUY NHAT cho moi dtype
+    (thuong LoRA chi co 1 dtype nen thuc te la 1 buffer), goi dist.all_reduce() DUNG 1
+    LAN tren buffer do, roi tach (unflatten) gia tri da all-reduce nguoc lai vao .grad
+    cua tung tham so. Ket qua toan hoc giong het ban cu (van la trung binh cong gradient
+    qua cac rank cho tung tham so, khong doi logic), chi giam SO LUONG NCCL CALL tu
+    O(so luong tensor) xuong O(so luong dtype) (~1). Chi phi bo sung (copy vao/ra buffer)
+    ret nho vi day chi la gradient cua LoRA, khong phai toan bo base model."""
+    from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+
+    grads_by_dtype = {}
     for p in trainable_params:
         if p.grad is not None:
-            dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
-            p.grad.div_(world_size)
+            grads_by_dtype.setdefault(p.grad.dtype, []).append(p.grad)
+
+    for dtype, grads in grads_by_dtype.items():
+        flat = _flatten_dense_tensors(grads)
+        dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+        flat.div_(world_size)
+        for g, synced in zip(grads, _unflatten_dense_tensors(flat, grads)):
+            g.copy_(synced)
 
 
 def reduce_result_across_ranks(result: dict, device, world_size: int) -> dict:
