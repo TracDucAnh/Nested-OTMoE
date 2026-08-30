@@ -16,12 +16,15 @@ xen ke theo global_step (chan = task step, le = align step).
               bang --lb_loss_coef 0 neu chi muon L_task = L_LM thuan tuy.
   - Align step: L_align = contrastive loss (in-batch negatives, symmetric
         InfoNCE, tuong duong Eq.1 trong paper) giua mean-pooled hidden state
-        cua cau tieng Anh va cau target, trich xuat tai DUNG layer 12
-        (--align_layer, mac dinh 12 — middle layer thuc su, tinh tu
-        num_hidden_layers cua model, thay vi con so 16 lay tu Llama-3-8B/
-        Qwen2.5-7B trong paper goc). Quy uoc chi so: hidden_states[12] tuc
-        la output SAU decoder block co index 0-based = 11 (giong truc "Layer
-        ID" trong Figure 1/4 cua paper, trong do Layer ID 0 = embedding).
+        cua cau tieng Anh va cau target, trich xuat tai DUNG 1 layer duy nhat
+        (--align_layer). Mac dinh (--align_layer khong duoc truyen, = None) la
+        TU DONG suy ra middle layer = num_hidden_layers // 2 CUA CHINH backbone
+        dang load tai runtime (xem infer_middle_layer() va main()) — KHONG con
+        hard-code co dinh = 12 nhu ban truoc (con so do gia dinh backbone
+        ~24 layer va se SAI neu Marco-Nano-Instruct co so layer khac). Quy uoc
+        chi so: hidden_states[align_layer] tuc la output SAU decoder block co
+        index 0-based = align_layer - 1 (giong truc "Layer ID" trong Figure
+        1/4 cua paper, trong do Layer ID 0 = embedding).
 
 Cac dieu kien giu nguyen theo yeu cau:
   1. Alternate training giua task loss va contrastive loss, batch_size mac
@@ -32,8 +35,9 @@ Cac dieu kien giu nguyen theo yeu cau:
      ...) o pipeline khac, nen "task" trong Alternate Training nay DUNG LA
      causal LM, giong dinh nghia trong main method).
   3. Cap ngon ngu la english - other (khong phai cap other-other).
-  4. Alignment loss (contrastive) CHI trich xuat tai dung 1 layer (mac dinh
-     layer 12 — middle layer, tinh tu num_hidden_layers cua model).
+  4. Alignment loss (contrastive) CHI trich xuat tai dung 1 layer (mac dinh:
+     middle layer, TU DONG suy ra tu num_hidden_layers thuc te cua backbone
+     dang load, khong con hard-code = 12).
 
 Cac dieu kien thay doi theo yeu cau:
   1. Dataset/DataLoader: doc bitext english-other duoc SAMPLE tu du lieu goc
@@ -94,12 +98,13 @@ Vi kien truc chi tiet cua Marco-Nano-Instruct khong duoc cung cap truoc,
 script nay TU DONG DO TIM cac module attention / router / experts bang ten
 (regex) thay vi hard-code, va cho phep override qua CLI neu can.
 
-Vi du chay (4 GPU tren 1 node):
+Vi du chay (4 GPU tren 1 node; khong can truyen --align_layer, se tu suy ra
+middle layer tu num_hidden_layers thuc te cua Marco-Nano-Instruct):
     torchrun --standalone --nproc_per_node=4 Macro-Nano-Instruct.py \
         --model_name_or_path ATH-MaaS/Marco-Nano-Instruct \
         --data_dir data/processed_alignment \
-        --align_layer 12 \
         --push_to_hub
+    # (Tuy chon: truyen --align_layer <N> de override thu cong.)
 
 Chay 1 GPU / CPU (khong can torchrun):
     python Macro-Nano-Instruct.py --model_name_or_path ATH-MaaS/Marco-Nano-Instruct
@@ -234,15 +239,17 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--num_workers", type=int, default=2, help="So worker cho DataLoader")
 
     # MidAlign: alignment objective (dieu kien giu nguyen #4)
-    p.add_argument("--align_layer", type=int, default=12,
+    p.add_argument("--align_layer", type=int, default=None,
                     help="Layer dung de trich xuat hidden state cho contrastive loss (KHONG con "
                          "quyet dinh vi tri LoRA — LoRA nay ap dung cho ca range [L/3, 2L/3), "
                          "tinh doc lap tu num_layers, xem build_lora_target_modules trong main()). "
                          "Quy uoc: hidden_states[align_layer], tuc output SAU decoder block co "
                          "index 0-based = align_layer - 1 (giong truc Layer ID trong paper "
-                         "MidAlign, Layer ID 0 = embedding). Mac dinh 12 gia dinh mot backbone "
-                         "~24 layer; DIEU CHINH LAI cho dung so voi num_hidden_layers thuc te cua "
-                         "Marco-Nano-Instruct neu khac.")
+                         "MidAlign, Layer ID 0 = embedding). Mac dinh None: TU DONG suy ra middle "
+                         "layer = num_hidden_layers // 2 cua CHINH backbone Marco-Nano-Instruct "
+                         "dang load (xem infer_middle_layer() va main()), khong con can chinh tay "
+                         "moi khi doi backbone. Truyen gia tri de override thu cong neu muon 1 "
+                         "layer khac middle.")
     p.add_argument("--align_temperature", type=float, default=0.1,
                     help="Nhiet do tau cho contrastive loss (tune tren dev loss, xem App. D.1 "
                          "paper MidAlign: Llama dung 0.1, Qwen dung 1.5)")
@@ -449,6 +456,16 @@ def get_num_layers(config) -> int:
     raise ValueError("Khong tim thay so luong layer trong model.config. Hay kiem tra ten attribute.")
 
 
+def infer_middle_layer(num_layers: int) -> int:
+    """Tu dong suy ra 'middle layer' (1-indexed, dung quy uoc hidden_states[i],
+    Layer ID 0 = embedding giong Figure 1/4 paper MidAlign) TU num_layers THUC TE
+    cua backbone dang load, thay vi hard-code mot con so co dinh (vd 12, chi dung
+    cho backbone 24-layer). Cong thuc: floor(num_layers / 2) — vd 24 layer -> 12,
+    28 layer -> 14, 32 layer -> 16 (Llama-3-8B). Duoc dung lam gia tri mac dinh
+    khi nguoi dung khong tu chi dinh --align_layer; van co the override thu cong."""
+    return num_layers // 2
+
+
 def is_router_leaf_name(name: str) -> bool:
     leaf = name.split(".")[-1]
     return leaf in ("gate", "router", "gating") and ".experts." not in name
@@ -617,7 +634,8 @@ def compute_task_step(other_texts: List[str], tokenizer, model, max_length: int,
 
 
 # ============================================================================================
-# Align step: contrastive loss tai DUNG layer 12, cap english-other (dieu kien giu nguyen #3, #4)
+# Align step: contrastive loss tai DUNG 1 middle layer (tu dong suy tu num_hidden_layers,
+# xem infer_middle_layer()), cap english-other (dieu kien giu nguyen #3, #4)
 # ============================================================================================
 def mean_pool_hidden(hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
     mask = attention_mask.unsqueeze(-1).to(hidden_states.dtype)
@@ -635,7 +653,7 @@ def encode_layer_representation(texts: List[str], tokenizer, model, align_layer:
     router_logits_cache.clear()  # khong dung cho align step, chi de tranh cache tich luy
     outputs = model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
     # Quy uoc: hidden_states[0] = embedding output, hidden_states[i] = output SAU decoder
-    # block index 0-based (i-1). align_layer=12 (mac dinh) -> output sau block thu 12
+    # block index 0-based (i-1). vd align_layer=12 -> output sau block thu 12 (0-based=11)
     # (1-indexed), dung "Layer ID" nhu truc x trong Figure 1/4 cua paper MidAlign.
     hidden = outputs.hidden_states[align_layer]
     pooled = mean_pool_hidden(hidden, attention_mask)
@@ -889,6 +907,14 @@ def main():
     base_model.to(device)
 
     num_layers = get_num_layers(base_model.config)
+    if args.align_layer is None:
+        # KHONG con hard-code = 12: suy ra middle layer tu num_layers THUC TE cua
+        # backbone dang load (vd 24 layer -> 12, 28 -> 14, 32 -> 16), xem infer_middle_layer().
+        args.align_layer = infer_middle_layer(num_layers)
+        if is_main_process:
+            logger.info(f"--align_layer khong duoc chi dinh -> tu dong suy ra middle layer = "
+                        f"{args.align_layer} (num_hidden_layers={num_layers} cua "
+                        f"{args.model_name_or_path}, cong thuc num_layers // 2).")
     if not (1 <= args.align_layer <= num_layers):
         raise ValueError(f"--align_layer={args.align_layer} phai nam trong [1, {num_layers}] "
                           f"(model co {num_layers} layer).")
