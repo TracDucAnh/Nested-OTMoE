@@ -5,13 +5,16 @@ Loss = L_LM (cross-entropy chuan) + lb_loss_coef * L_LB (load balancing loss chu
 tinh tren cac router nam trong khoang layer duoc gan LoRA).
 
 Cac tinh nang chinh:
-  1. LoRA chi ap dung tren middle layers [L/3, 2L/3), chi len attention / router / experts.
+  1. LoRA chi ap dung tren middle layers [L/3, 2L/3), chi len attention / router / experts,
+     moi thanh phan mot rank rieng (mac dinh: router r=4, attention r=16, experts r=16).
   2. Checkpointing + resume tai bat ky epoch/step nao, luu moi 1000 step.
   3. Luu LoRA weight tai training/finetuning/checkpoints/Macro-Nano-Instruct/.
   4. Dynamic batching: batch_size mac dinh 512, khi OOM thi chia doi de tri (dequy),
      clear memory sau moi lan chia, skip sample neu OOM ca khi batch_size = 1,
      tra ve batch_size goc ngay cho batch tiep theo.
-  5. Dataset/DataLoader gom sample tu ca 3 file flores/bible/ntrex, shuffle roi sort theo do dai.
+  5. Dataset/DataLoader gom sample tu cac bo du lieu alignment duoc CHON qua --alignment_data
+     (flores / ntrex / bible, co the ket hop nhieu bo, vi du --alignment_data flores ntrex),
+     shuffle roi sort theo do dai.
   6. 3 epoch, tqdm day du.
   7. argparse day du de tuy bien.
 
@@ -76,6 +79,14 @@ logger = logging.getLogger("marco_nano_finetune")
 # Cac ten bien moi truong pho bien cho HF token, thu theo thu tu nay
 _HF_TOKEN_ENV_VARS = ("HF_TOKEN", "HUGGINGFACE_HUB_TOKEN", "HUGGING_FACE_HUB_TOKEN")
 
+# Anh xa ten alignment dataset (dung trong --alignment_data) -> ten file JSON tuong ung
+# trong --data_dir. Them entry moi vao day neu sau nay co them bo du lieu alignment khac.
+ALIGNMENT_DATA_FILENAMES = {
+    "flores": "flores.json",
+    "ntrex": "ntrex.json",
+    "bible": "bible.json",
+}
+
 
 def load_hf_token(env_file: Optional[str], cli_token: Optional[str]) -> Optional[str]:
     """Uu tien: --hf_token (CLI) > bien moi truong da set san > file .env (qua dotenv)."""
@@ -119,8 +130,13 @@ def build_argparser() -> argparse.ArgumentParser:
     # Model / data / output
     p.add_argument("--model_name_or_path", type=str, default="ATH-MaaS/Marco-Nano-Instruct")
     p.add_argument("--data_dir", type=str, default="data/processed_alignment")
-    p.add_argument("--data_files", type=str, nargs="+",
-                    default=["flores.json", "bible.json", "ntrex.json"])
+    p.add_argument("--alignment_data", type=str, nargs="+",
+                    default=["flores", "ntrex", "bible"],
+                    choices=sorted(ALIGNMENT_DATA_FILENAMES.keys()),
+                    help="Chon 1 hoac nhieu bo du lieu alignment de finetune: flores, ntrex, "
+                         "bible. Co the ket hop nhieu bo, vi du: --alignment_data flores ntrex "
+                         "se chi dung flores + ntrex. Moi ten duoc anh xa toi 1 file JSON "
+                         f"trong --data_dir: {ALIGNMENT_DATA_FILENAMES}.")
     p.add_argument("--output_dir", type=str,
                     default="training/finetuning/checkpoints/Macro-Nano-Instruct")
     p.add_argument("--max_samples", type=int, default=None,
@@ -155,8 +171,13 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--num_experts_per_tok", type=int, default=None,
                     help="Override top-k router, None = tu doc trong config model")
 
-    # LoRA
-    p.add_argument("--lora_r", type=int, default=16)
+    # LoRA - rank rieng cho tung thanh phan kien truc (goi bang PEFT rank_pattern)
+    p.add_argument("--lora_r_router", type=int, default=4,
+                    help="Rank LoRA rieng cho router/gating (mac dinh 4).")
+    p.add_argument("--lora_r_attention", type=int, default=16,
+                    help="Rank LoRA rieng cho attention Q/K/V/O (mac dinh 16).")
+    p.add_argument("--lora_r_experts", type=int, default=16,
+                    help="Rank LoRA rieng cho cac expert FFN (mac dinh 16).")
     p.add_argument("--lora_alpha", type=int, default=32)
     p.add_argument("--lora_dropout", type=float, default=0.05)
     p.add_argument("--lora_layer_start_ratio", type=float, default=1.0 / 3.0)
@@ -451,8 +472,13 @@ def is_router_leaf_name(name: str) -> bool:
     return leaf in ("gate", "router", "gating") and ".experts." not in name
 
 
-def build_lora_target_modules(model, layer_indices: set) -> List[str]:
+def build_lora_target_modules(model, layer_indices: set):
+    """Tra ve (targets, kinds): targets la list ten module Linear duoc chon lam LoRA
+    target trong khoang layer_indices, kinds la dict ten module -> "router" / "attention" /
+    "expert", dung de gan rank rieng cho tung thanh phan (--lora_r_router / 
+    --lora_r_attention / --lora_r_experts) qua rank_pattern cua PEFT."""
     targets = []
+    kinds = {}
     for name, module in model.named_modules():
         if not isinstance(module, torch.nn.Linear):
             continue
@@ -467,7 +493,8 @@ def build_lora_target_modules(model, layer_indices: set) -> List[str]:
         is_router = is_router_leaf_name(name)
         if is_attn or is_expert or is_router:
             targets.append(name)
-    return targets
+            kinds[name] = "router" if is_router else ("expert" if is_expert else "attention")
+    return targets, kinds
 
 
 def register_router_hooks(peft_model, router_names: List[str], cache_list: list):
@@ -776,7 +803,7 @@ def plot_losses(jsonl_path, out_png):
 # ============================================================================================
 # Hugging Face Hub push
 # ============================================================================================
-def build_model_card(args, num_experts, top_k, layer_start, layer_end, num_layers) -> str:
+def build_model_card(args, num_experts, top_k, layer_start, layer_end, num_layers, data_files) -> str:
     return f"""---
 license: apache-2.0
 base_model: {args.model_name_or_path}
@@ -797,8 +824,12 @@ Day la LoRA adapter finetune tu [`{args.model_name_or_path}`]\
 ## Cau hinh LoRA
 - Layer duoc finetune: `[{layer_start}, {layer_end})` trong tong so `{num_layers}` layer
   (tuong ung khoang 1L/3 -> 2L/3).
-- Module duoc gan LoRA: **attention**, **router**, **experts** trong khoang layer tren.
-- r = {args.lora_r}, alpha = {args.lora_alpha}, dropout = {args.lora_dropout}
+- Module duoc gan LoRA: **attention**, **router**, **experts** trong khoang layer tren, moi
+  thanh phan mot rank rieng qua `rank_pattern` cua PEFT:
+  - attention: r = {args.lora_r_attention}
+  - router: r = {args.lora_r_router}
+  - experts: r = {args.lora_r_experts}
+- alpha = {args.lora_alpha}, dropout = {args.lora_dropout}
 
 ## Loss
 Loss MoE tieu chuan:
@@ -812,9 +843,9 @@ Loss MoE tieu chuan:
 - `num_experts` = {num_experts}, `top_k` = {top_k}
 
 ## Du lieu
-Cau don ngu duoc gom tu 3 bo du lieu alignment: `flores.json`, `bible.json`, `ntrex.json`
-(moi field ngon ngu trong 1 record duoc coi la 1 sample), shuffle va sort theo do dai token
-truoc khi gom batch.
+Alignment data duoc chon qua `--alignment_data` (`{" ".join(args.alignment_data)}`), gom sample
+tu cac file: `{"`, `".join(data_files)}` (moi field ngon ngu trong 1 record duoc coi la 1
+sample), shuffle va sort theo do dai token truoc khi gom batch.
 
 ## Diagnostics
 Xem `diagnostics/loss_log.jsonl` (log theo tung step) va `diagnostics/loss_curve.png`
@@ -894,15 +925,20 @@ def main():
     layer_indices = set(range(layer_start, layer_end))
     logger.info(f"Tong so layer = {num_layers}. Ap dung LoRA cho layer [{layer_start}, {layer_end}).")
 
-    target_modules = build_lora_target_modules(base_model, layer_indices)
+    target_modules, module_kinds = build_lora_target_modules(base_model, layer_indices)
     if not target_modules:
         raise RuntimeError(
             "Khong tim thay module (attention/router/experts) nao trong khoang layer da chon. "
             "Kien truc model co the dat ten khac quy uoc — kiem tra lai regex trong build_lora_target_modules()."
         )
-    router_target_names = [n for n in target_modules if is_router_leaf_name(n)]
-    logger.info(f"Tim thay {len(target_modules)} target module cho LoRA "
-                f"({len(router_target_names)} router). Vi du: {target_modules[:8]}")
+    router_target_names = [n for n in target_modules if module_kinds[n] == "router"]
+    attn_target_names = [n for n in target_modules if module_kinds[n] == "attention"]
+    expert_target_names = [n for n in target_modules if module_kinds[n] == "expert"]
+    logger.info(f"Tim thay {len(target_modules)} target module cho LoRA: "
+                f"{len(attn_target_names)} attention (r={args.lora_r_attention}), "
+                f"{len(router_target_names)} router (r={args.lora_r_router}), "
+                f"{len(expert_target_names)} experts (r={args.lora_r_experts}). "
+                f"Vi du: {target_modules[:8]}")
 
     num_experts, top_k = infer_moe_dims(base_model.config, args)
 
@@ -917,13 +953,22 @@ def main():
         logger.info(f"Resume LoRA adapter tu checkpoint: {resume_dir}")
         model = PeftModel.from_pretrained(base_model, resume_dir, is_trainable=True)
     else:
+        # rank_pattern cua PEFT: dict {regex ten module -> rank rieng}, khac voi rank
+        # mac dinh `r`. Matching duoc peft thuc hien dang "(.*\\.)?(<key>)$" (khop HAU TO
+        # cua ten module day du) -> escape ten module bang re.escape() de chi khop CHINH
+        # XAC module do (tranh dau "." trong ten bi hieu nham thanh wildcard cua regex).
+        # attention KHONG can dua vao rank_pattern vi da dung r mac dinh (lora_r_attention).
+        rank_pattern = {}
+        rank_pattern.update({re.escape(n): args.lora_r_router for n in router_target_names})
+        rank_pattern.update({re.escape(n): args.lora_r_experts for n in expert_target_names})
         lora_config = LoraConfig(
-            r=args.lora_r,
+            r=args.lora_r_attention,
             lora_alpha=args.lora_alpha,
             lora_dropout=args.lora_dropout,
             bias="none",
             task_type="CAUSAL_LM",
             target_modules=target_modules,
+            rank_pattern=rank_pattern,
         )
         model = get_peft_model(base_model, lora_config)
     if is_main_process(rank):
@@ -947,14 +992,18 @@ def main():
         )
 
     # ------------------------------------------------------------------------------------ data
-    logger.info(f"Dang doc du lieu tu {args.data_dir} ({args.data_files}) ...")
-    texts = load_all_sentences(args.data_dir, args.data_files)
+    # --alignment_data (flores/ntrex/bible, co the ket hop) -> danh sach file JSON thuc te.
+    # dict.fromkeys(...) de loai trung neu nguoi dung lo nhap trung ten (van giu thu tu).
+    data_files = [ALIGNMENT_DATA_FILENAMES[name] for name in dict.fromkeys(args.alignment_data)]
+    logger.info(f"Dang doc du lieu tu {args.data_dir}, alignment_data={args.alignment_data} "
+                f"(file tuong ung: {data_files}) ...")
+    texts = load_all_sentences(args.data_dir, data_files)
     if args.max_samples:
         random.Random(args.seed).shuffle(texts)
         texts = texts[: args.max_samples]
-    logger.info(f"Tong so sample (cau) sau khi gom ca 3 bo du lieu: {len(texts)}")
+    logger.info(f"Tong so sample (cau) sau khi gom {len(data_files)} bo du lieu da chon: {len(texts)}")
     if len(texts) == 0:
-        raise RuntimeError("Khong doc duoc sample nao — kiem tra lai --data_dir / --data_files.")
+        raise RuntimeError("Khong doc duoc sample nao — kiem tra lai --data_dir / --alignment_data.")
 
     lengths = compute_lengths(tokenizer, texts)
 
@@ -1003,7 +1052,7 @@ def main():
                 start_epoch += 1
                 start_step_in_epoch = 0
 
-    readme_text = build_model_card(args, num_experts, top_k, layer_start, layer_end, num_layers)
+    readme_text = build_model_card(args, num_experts, top_k, layer_start, layer_end, num_layers, data_files)
 
     # ------------------------------------------------------------------------------ training loop
     model_device = next(model.parameters()).device
