@@ -194,6 +194,30 @@ def load_hf_token(env_file: Optional[str], cli_token: Optional[str]) -> Optional
     return None
 
 
+# Anh xa tu ten nguon du lieu alignment (--alignment_data) sang ten file JSON tuong ung trong
+# --data_dir. Them nguon moi bang cach them 1 dong vao dict nay.
+ALIGNMENT_DATASET_FILES = {
+    "flores": "flores.json",
+    "ntrex": "ntrex.json",
+    "bible": "bible.json",
+}
+
+
+def resolve_data_files(alignment_data: Sequence[str], data_files: Optional[Sequence[str]]) -> List[str]:
+    """--data_files (neu duoc truyen thu cong) luon THANG the va duoc dung nguyen ven.
+    Nguoc lai, suy ra danh sach file JSON tu --alignment_data qua ALIGNMENT_DATASET_FILES,
+    giu thu tu xuat hien dau tien va loai trung (vd --alignment_data flores flores ntrex ->
+    chi doc flores.json + ntrex.json 1 lan)."""
+    if data_files:
+        return list(data_files)
+    resolved: List[str] = []
+    for name in alignment_data:
+        fname = ALIGNMENT_DATASET_FILES[name]
+        if fname not in resolved:
+            resolved.append(fname)
+    return resolved
+
+
 # ============================================================================================
 # Argparse
 # ============================================================================================
@@ -203,8 +227,19 @@ def build_argparser() -> argparse.ArgumentParser:
     # Model / data / output
     p.add_argument("--model_name_or_path", type=str, default="ATH-MaaS/Marco-Nano-Instruct")
     p.add_argument("--data_dir", type=str, default="data/processed_alignment")
-    p.add_argument("--data_files", type=str, nargs="+",
-                    default=["flores.json", "bible.json", "ntrex.json"])
+    p.add_argument("--alignment_data", type=str, nargs="+",
+                    choices=sorted(ALIGNMENT_DATASET_FILES.keys()),
+                    default=["flores", "ntrex", "bible"],
+                    help="Chon 1 hoac nhieu nguon du lieu alignment de finetune, cach nhau boi "
+                         "dau cach: flores | ntrex | bible. Vd --alignment_data flores ntrex se "
+                         "gop ca FLORES va NTREX de finetune. Duoc anh xa sang ten file JSON "
+                         "tuong ung trong --data_dir (xem dict ALIGNMENT_DATASET_FILES). Bi "
+                         "--data_files ghi de neu --data_files duoc truyen thu cong.")
+    p.add_argument("--data_files", type=str, nargs="+", default=None,
+                    help="[Nang cao] Chi dinh truc tiep danh sach ten file JSON trong --data_dir, "
+                         "GHI DE hoan toan --alignment_data neu duoc truyen (vd de dung file "
+                         "khong nam trong ALIGNMENT_DATASET_FILES). Mac dinh None -> tu suy ra "
+                         "tu --alignment_data.")
     p.add_argument("--output_dir", type=str,
                     default="training/MidAlign/checkpoints/Macro-Nano-Instruct")
     p.add_argument("--max_samples", type=int, default=None,
@@ -263,9 +298,25 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--num_experts_per_tok", type=int, default=None,
                     help="Override top-k router, None = tu doc trong config model")
 
-    # LoRA
-    p.add_argument("--lora_r", type=int, default=16)
-    p.add_argument("--lora_alpha", type=int, default=32)
+    # LoRA — rank rieng cho tung thanh phan (dieu kien thay doi #2). Module duoc gan LoRA
+    # (attention / router / experts, xem build_lora_target_modules) deu nam trong 1 trong 3
+    # nhom nay nen --lora_r chi con dong vai tro fallback (khong bao gio thuc su duoc dung
+    # trong dieu kien binh thuong, xem rank_pattern trong main()).
+    p.add_argument("--lora_r", type=int, default=16,
+                    help="Rank fallback/mac dinh, dung neu co module LoRA nao khong roi vao dung "
+                         "1 trong 3 nhom router/attention/experts (khong nen xay ra trong dieu "
+                         "kien binh thuong). Uu tien dung 3 co --lora_r_router/--lora_r_attn/"
+                         "--lora_r_expert ben duoi de chinh rank theo tung thanh phan.")
+    p.add_argument("--lora_r_router", type=int, default=4,
+                    help="Rank LoRA rieng cho cac module router (gate/router/gating).")
+    p.add_argument("--lora_r_attn", type=int, default=16,
+                    help="Rank LoRA rieng cho cac module attention (self_attn/attention/attn).")
+    p.add_argument("--lora_r_expert", type=int, default=16,
+                    help="Rank LoRA rieng cho cac module experts (mlp.experts.*).")
+    p.add_argument("--lora_alpha", type=int, default=32,
+                    help="lora_alpha ap dung DONG NHAT cho ca 3 nhom (chi rank la khac nhau); "
+                         "scaling thuc te = lora_alpha / r nen se khac nhau theo tung nhom vi r "
+                         "khac nhau (peft tinh scaling per-module dua tren rank_pattern).")
     p.add_argument("--lora_dropout", type=float, default=0.05)
 
     # Checkpoint / resume
@@ -488,6 +539,22 @@ def build_lora_target_modules(model, layer_indices: set) -> List[str]:
         if is_attn or is_expert or is_router:
             targets.append(name)
     return targets
+
+
+def categorize_lora_targets(target_modules: Sequence[str]) -> Tuple[List[str], List[str], List[str]]:
+    """Chia danh sach target_modules (da duoc build_lora_target_modules loc) thanh 3 nhom rieng
+    biet — attention / experts / router — dung LAI CHINH XAC cung dieu kien nhu trong
+    build_lora_target_modules(), de dam bao khop 1-1 voi target_modules truyen vao LoraConfig.
+    Dung cho rank_pattern (dieu kien thay doi #2: moi nhom co the mang 1 rank LoRA rieng)."""
+    attn_names, expert_names, router_names = [], [], []
+    for name in target_modules:
+        if is_router_leaf_name(name):
+            router_names.append(name)
+        elif ".experts." in name or ".expert." in name:
+            expert_names.append(name)
+        elif re.search(r"(self_attn|attention|attn)\.", name):
+            attn_names.append(name)
+    return attn_names, expert_names, router_names
 
 
 def register_router_hooks(peft_model, router_names: List[str], cache_list: list):
@@ -821,7 +888,8 @@ Training giua task objective (causal LM tren target language) va alignment objec
 - LoRA ap dung cho RANGE layer `[{lora_layer_start}, {lora_layer_end})` 0-indexed
   ({lora_layer_end - lora_layer_start} layer) — tach bach voi layer dung de tinh alignment loss.
 - Module duoc gan LoRA: **attention**, **router**, **experts** trong range layer tren.
-- r = {args.lora_r}, alpha = {args.lora_alpha}, dropout = {args.lora_dropout}
+- rank rieng theo tung nhom (rank_pattern): attention r = {args.lora_r_attn}, router r = {args.lora_r_router}, experts r = {args.lora_r_expert}
+- alpha = {args.lora_alpha} (dong nhat ca 3 nhom), dropout = {args.lora_dropout}
 - Nhiet do contrastive tau = {args.align_temperature}
 
 ## Loss (Alternate Training — moi step chi 1 trong 2)
@@ -835,7 +903,8 @@ Training giua task objective (causal LM tren target language) va alignment objec
   mean-pooled hidden state cua cau tieng Anh va cau target tai layer {args.align_layer}.
 
 ## Du lieu
-Cap bitext english-other duoc sample tu cac bo du lieu multiway-parallel: `{", ".join(args.data_files)}`.
+Nguon alignment (--alignment_data): `{", ".join(args.alignment_data)}` -> file: `{", ".join(args.data_files)}`.
+Cap bitext english-other duoc sample tu cac bo du lieu multiway-parallel tren.
 Voi moi record, cau `{args.eng_key}` duoc ghep voi tung ngon ngu khac trong cung record de tao
 1 cap bitext rieng.
 
@@ -880,6 +949,12 @@ def main():
 
     is_distributed, local_rank, global_rank, world_size, device = setup_distributed(args)
     is_main_process = (global_rank == 0)
+
+    # --data_files (neu duoc truyen thu cong) ghi de --alignment_data; nguoc lai suy ra tu
+    # --alignment_data qua ALIGNMENT_DATASET_FILES (dieu kien thay doi #1).
+    args.data_files = resolve_data_files(args.alignment_data, args.data_files)
+    if is_main_process:
+        logger.info(f"--alignment_data={args.alignment_data} -> data_files={args.data_files}")
 
     if is_main_process:
         os.makedirs(args.output_dir, exist_ok=True)
@@ -948,10 +1023,21 @@ def main():
             "Khong tim thay module (attention/router/experts) nao tai layer da chon. "
             "Kien truc model co the dat ten khac quy uoc — kiem tra lai regex trong build_lora_target_modules()."
         )
-    router_target_names = [n for n in target_modules if is_router_leaf_name(n)]
+    attn_target_names, expert_target_names, router_target_names = categorize_lora_targets(target_modules)
+    # rank_pattern (dieu kien thay doi #2): moi nhom module mang 1 rank LoRA rieng — router
+    # r={args.lora_r_router}, attention r={args.lora_r_attn}, experts r={args.lora_r_expert}.
+    # Cac key trong rank_pattern la ten module DAY DU (khop chinh xac target_modules) nen khong
+    # co rui ro trung khop nham voi module khac ngoai y muon.
+    lora_rank_pattern = {}
+    lora_rank_pattern.update({n: args.lora_r_router for n in router_target_names})
+    lora_rank_pattern.update({n: args.lora_r_attn for n in attn_target_names})
+    lora_rank_pattern.update({n: args.lora_r_expert for n in expert_target_names})
     if is_main_process:
         logger.info(f"Tim thay {len(target_modules)} target module cho LoRA "
-                    f"({len(router_target_names)} router). Vi du: {target_modules[:8]}")
+                    f"({len(attn_target_names)} attention r={args.lora_r_attn}, "
+                    f"{len(expert_target_names)} experts r={args.lora_r_expert}, "
+                    f"{len(router_target_names)} router r={args.lora_r_router}). "
+                    f"Vi du: {target_modules[:8]}")
 
     num_experts, top_k = infer_moe_dims(base_model.config, args)
 
@@ -969,12 +1055,13 @@ def main():
         model = PeftModel.from_pretrained(base_model, resume_dir, is_trainable=True)
     else:
         lora_config = LoraConfig(
-            r=args.lora_r,
+            r=args.lora_r,  # fallback, khong nen thuc su duoc dung — xem rank_pattern
             lora_alpha=args.lora_alpha,
             lora_dropout=args.lora_dropout,
             bias="none",
             task_type="CAUSAL_LM",
             target_modules=target_modules,
+            rank_pattern=lora_rank_pattern,
         )
         model = get_peft_model(base_model, lora_config)
     if is_main_process:
