@@ -17,17 +17,24 @@ paper): moi step CHI toi uu MOT trong hai objective, xen ke theo global_step
               bang --lb_loss_coef 0 neu chi muon L_task = L_LM thuan tuy.
   - Align step: L_align = contrastive loss (in-batch negatives, symmetric
         InfoNCE, tuong duong Eq.1 trong paper) giua mean-pooled hidden state
-        cua cau tieng Anh va cau target, trich xuat tai DUNG layer 16
-        (--align_layer, mac dinh 16). Quy uoc chi so: hidden_states[16] tuc
-        la output SAU decoder block co index 0-based = 15 (giong truc "Layer
+        cua cau tieng Anh va cau target, trich xuat tai DUNG layer 12
+        (--align_layer, mac dinh 12 — day moi la middle layer thuc su cua
+        backbone 24-layer nay, thay vi 16 lay tu Llama-3-8B/Qwen2.5-7B
+        32/28-layer trong paper goc). Quy uoc chi so: hidden_states[12] tuc
+        la output SAU decoder block co index 0-based = 11 (giong truc "Layer
         ID" trong Figure 1/4 cua paper, trong do Layer ID 0 = embedding).
 
 Cac dieu kien giu nguyen theo yeu cau:
   1. Alternate training giua task loss va contrastive loss, batch_size mac
      dinh = 128 (per-process, xem phan Distributed ben duoi).
-  2. Task loss la causal LM tren TARGET LANGUAGE.
+  2. Task loss la causal LM tren TARGET LANGUAGE (khong tach prefix/output
+     rieng — day la lua chon CO CHU DICH: phase alignment o day chi dung du
+     lieu da ngu thuan tuy, tach bach voi phase zero-shot-task (xnli, xquad,
+     ...) o pipeline khac, nen "task" trong Alternate Training nay DUNG LA
+     causal LM, giong dinh nghia trong main method).
   3. Cap ngon ngu la english - other (khong phai cap other-other).
-  4. Alignment (va LoRA) CHI ap dung tren dung 1 layer (mac dinh layer 16).
+  4. Alignment loss (contrastive) CHI trich xuat tai dung 1 layer (mac dinh
+     layer 12 — middle layer thuc su cua backbone 24-layer nay).
 
 Cac dieu kien thay doi theo yeu cau:
   1. Dataset/DataLoader: doc bitext english-other duoc SAMPLE tu du lieu goc
@@ -35,8 +42,13 @@ Cac dieu kien thay doi theo yeu cau:
      vd "eng_Latn", "ace_Arab", "bam_Latn", ...). Voi moi record, cau
      eng_Latn duoc ghep voi TUNG ngon ngu khac trong record de tao thanh 1
      cap bitext rieng.
-  2. LoRA chi ap dung tren dung middle layer 16 (khong con la range
-     [L/3, 2L/3) nhu ban plain-LoRA goc Qwen1.5-MoE-A2.7B.py).
+  2. LoRA ap dung cho MOT RANGE layer [L/3, 2L/3) (nua-mo, floor-division
+     tren tong so layer L), TACH BACH voi layer dung de tinh alignment loss
+     (chi 1 layer duy nhat, dieu kien #4 o tren). Ly do dung range nay thay
+     vi toan bo mang: fair ve compute budget so voi main method (main method
+     chi dung range [L/2, 2L/3)), dong thoi van toi da hoa tinh than cua
+     MidAlign — LoRA phu ca mot vung middle-layer (khong phai toan mang, va
+     cung khong chi 1 diem duy nhat).
 
 Ghi chu kien truc: Qwen1.5-MoE-A2.7B (Qwen2MoeForCausalLM) dat ten
 router/experts theo quy uoc chuan cua HF transformers (vd:
@@ -60,8 +72,8 @@ plain-LoRA goc):
     (shutil.rmtree) ngay lap tuc.
 
 Fix NCCL Watchdog Timeout / SIGABRT (c10d::ProcessGroupNCCL::ncclCommWatchdog()):
-  - Nguyen nhan cot loi: voi backbone MoE + LoRA CHI tren 1 layer, router chi
-    chon top_k << num_experts cho moi token, nen rat de co (cac) expert LoRA
+  - Nguyen nhan cot loi: voi backbone MoE + LoRA tren 1 range layer [L/3, 2L/3),
+    router chi chon top_k << num_experts cho moi token, nen rat de co (cac) expert LoRA
     khong nhan token nao tren mot GPU o mot step nao do -> khong co gradient.
     Voi find_unused_parameters=False (mac dinh cu cua PyTorch), DDP Reducer
     cho vo han gradient con thieu do trong backward(), dan den NCCL Watchdog
@@ -92,7 +104,7 @@ Vi du chay (4 GPU tren 1 node):
     torchrun --standalone --nproc_per_node=4 Qwen1.5-MoE-A2.7B-MidAlign.py \
         --model_name_or_path Qwen/Qwen1.5-MoE-A2.7B \
         --data_dir data/processed_alignment \
-        --align_layer 16 \
+        --align_layer 12 \
         --push_to_hub
 
 Chay 1 GPU / CPU (khong can torchrun):
@@ -230,11 +242,14 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--num_workers", type=int, default=2, help="So worker cho DataLoader")
 
     # MidAlign: alignment objective (dieu kien giu nguyen #4)
-    p.add_argument("--align_layer", type=int, default=16,
-                    help="Layer dung de trich xuat hidden state cho contrastive loss VA gan "
-                         "LoRA. Quy uoc: hidden_states[align_layer], tuc output SAU decoder "
-                         "block co index 0-based = align_layer - 1 (giong truc Layer ID trong "
-                         "paper MidAlign, Layer ID 0 = embedding).")
+    p.add_argument("--align_layer", type=int, default=12,
+                    help="Layer dung de trich xuat hidden state cho contrastive loss (KHONG con "
+                         "quyet dinh vi tri LoRA — LoRA nay ap dung cho ca range [L/3, 2L/3), "
+                         "tinh doc lap tu num_layers, xem build_lora_target_modules trong main()). "
+                         "Quy uoc: hidden_states[align_layer], tuc output SAU decoder block co "
+                         "index 0-based = align_layer - 1 (giong truc Layer ID trong paper "
+                         "MidAlign, Layer ID 0 = embedding). Mac dinh 12 = middle layer thuc su "
+                         "cua Qwen1.5-MoE-A2.7B (num_hidden_layers=24).")
     p.add_argument("--align_temperature", type=float, default=1.5,
                     help="Nhiet do tau cho contrastive loss (tune tren dev loss, xem App. D.1 "
                          "paper MidAlign: Llama dung 0.1, Qwen dung 1.5 -> mac dinh 1.5 vi "
@@ -427,8 +442,10 @@ def collate_bitext(batch: List[Tuple[str, str, str]]):
 
 
 # ============================================================================================
-# Tu dong tim target module cho LoRA: attention / router / experts trong DUNG 1 layer
-# (dieu kien thay doi #2 — khong con la range [L/3, 2L/3) nhu ban plain-LoRA goc).
+# Tu dong tim target module cho LoRA: attention / router / experts trong MOT RANGE layer
+# (dieu kien thay doi #2 — range [L/3, 2L/3), TACH BACH voi layer dung de tinh alignment loss).
+# `layer_indices` la mot SET cac chi so layer (0-based) tuy y, ham nay khong quan tam no la
+# 1 layer hay nhieu layer.
 # ============================================================================================
 LAYER_IDX_PATTERN = re.compile(r"\.(?:layers|h|blocks|block)\.(\d+)\.")
 
@@ -638,7 +655,7 @@ def compute_task_step(other_texts: List[str], tokenizer, model, max_length: int,
 
 
 # ============================================================================================
-# Align step: contrastive loss tai DUNG layer 16, cap english-other (dieu kien giu nguyen #3, #4)
+# Align step: contrastive loss tai DUNG layer 12, cap english-other (dieu kien giu nguyen #3, #4)
 # ============================================================================================
 def mean_pool_hidden(hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
     mask = attention_mask.unsqueeze(-1).to(hidden_states.dtype)
@@ -656,8 +673,8 @@ def encode_layer_representation(texts: List[str], tokenizer, model, align_layer:
     router_logits_cache.clear()  # khong dung cho align step, chi de tranh cache tich luy
     outputs = model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
     # Quy uoc: hidden_states[0] = embedding output, hidden_states[i] = output SAU decoder
-    # block index 0-based (i-1). align_layer=16 -> output sau block thu 16 (1-indexed),
-    # dung "Layer ID" nhu truc x trong Figure 1/4 cua paper MidAlign.
+    # block index 0-based (i-1). align_layer=12 (mac dinh) -> output sau block thu 12
+    # (1-indexed), dung "Layer ID" nhu truc x trong Figure 1/4 cua paper MidAlign.
     hidden = outputs.hidden_states[align_layer]
     pooled = mean_pool_hidden(hidden, attention_mask)
     return pooled
@@ -796,7 +813,8 @@ def plot_losses(jsonl_path, out_png, align_layer):
 # ============================================================================================
 # Hugging Face Hub push
 # ============================================================================================
-def build_model_card(args, num_experts, top_k, align_layer_0based, num_layers) -> str:
+def build_model_card(args, num_experts, top_k, align_layer_0based, num_layers,
+                      lora_layer_start, lora_layer_end) -> str:
     return f"""---
 license: apache-2.0
 base_model: {args.model_name_or_path}
@@ -820,16 +838,20 @@ Liu & Niehues 2025) — Alternate Training giua task objective (causal LM tren t
 va alignment objective (contrastive loss tai 1 middle layer) — adapt sang backbone MoE.
 
 ## Cau hinh LoRA / Alignment
-- LoRA + trich xuat hidden state cho contrastive loss CHI ap dung tai layer thu
+- Alignment loss (contrastive) trich xuat hidden state tai DUNG layer thu
   `{args.align_layer}` (0-indexed block = {align_layer_0based}) trong tong so `{num_layers}` layer.
-- Module duoc gan LoRA: **attention**, **router**, **experts** tai layer tren.
+- LoRA ap dung cho RANGE layer `[{lora_layer_start}, {lora_layer_end})` 0-indexed
+  ({lora_layer_end - lora_layer_start} layer) — tach bach voi layer dung de tinh alignment loss.
+- Module duoc gan LoRA: **attention**, **router**, **experts** trong range layer tren.
 - r = {args.lora_r}, alpha = {args.lora_alpha}, dropout = {args.lora_dropout}
 - Nhiet do contrastive tau = {args.align_temperature}
 
 ## Loss (Alternate Training — moi step chi 1 trong 2)
 - **Task step**: `L_task = L_LM + lb_loss_coef * L_LB`
   - `L_LM`: causal LM loss tren cau TARGET LANGUAGE (phia "other" trong cap english-other).
-  - `L_LB`: load balancing loss chuan cua MoE tai router trong layer duoc finetune.
+    Day la causal LM THUAN TUY (khong prefix/output rieng), vi phase alignment nay chi dung
+    du lieu da ngu, tach bach voi phase zero-shot-task (xnli, xquad, ...) xuat hien o buoc sau.
+  - `L_LB`: load balancing loss chuan cua MoE tai router trong range layer duoc finetune.
   - `lb_loss_coef` = {args.lb_loss_coef}, `num_experts` = {num_experts}, `top_k` = {top_k}
 - **Align step**: `L_align` = symmetric InfoNCE / contrastive loss (in-batch negatives) giua
   mean-pooled hidden state cua cau tieng Anh va cau target tai layer {args.align_layer}.
@@ -910,12 +932,29 @@ def main():
     if not (1 <= args.align_layer <= num_layers):
         raise ValueError(f"--align_layer={args.align_layer} phai nam trong [1, {num_layers}] "
                           f"(model co {num_layers} layer).")
-    align_layer_0based = args.align_layer - 1  # dung de match ten module trong named_modules()
-    layer_indices = {align_layer_0based}
+    align_layer_0based = args.align_layer - 1  # dung de tra hidden_states[align_layer] (mean-pool)
+
+    # LoRA ap dung cho MOT RANGE layer [L/3, 2L/3) (nua-mo, floor-division tren num_layers),
+    # TACH BACH voi layer dung de tinh alignment loss (align_layer_0based, chi 1 layer duy
+    # nhat, xem compute_alignment_step). Ly do dung range nay (thay vi toan bo mang, hay
+    # chi 1 layer nhu ban truoc): fair ve compute budget so voi main method (main method chi
+    # dung range [L/2, 2L/3)), dong thoi toi da hoa tinh than cua MidAlign — LoRA phu ca mot
+    # vung middle-layer chu khong phai 1 diem.
+    lora_layer_start = num_layers // 3
+    lora_layer_end = (2 * num_layers) // 3  # exclusive (nua-mo, giong quy uoc [L/3, 2L/3))
+    layer_indices = set(range(lora_layer_start, lora_layer_end))
     if is_main_process:
-        logger.info(f"Tong so layer = {num_layers}. LoRA + alignment CHI ap dung tai layer "
+        logger.info(f"Tong so layer = {num_layers}. Alignment loss trich xuat tai DUNG layer "
                     f"{args.align_layer} (block 0-indexed = {align_layer_0based}, "
-                    f"hidden_states[{args.align_layer}]).")
+                    f"hidden_states[{args.align_layer}]). LoRA ap dung cho range layer "
+                    f"[{lora_layer_start}, {lora_layer_end}) 0-indexed ({len(layer_indices)} layer).")
+        if align_layer_0based not in layer_indices:
+            logger.warning(
+                f"[canh bao] --align_layer={args.align_layer} (block 0-indexed="
+                f"{align_layer_0based}) nam NGOAI range LoRA [{lora_layer_start}, "
+                f"{lora_layer_end}) -> gradient tu contrastive loss se khong lan truyen qua "
+                f"bat ky tham so LoRA nao. Kiem tra lai --align_layer neu day khong phai chu y."
+            )
 
     target_modules = build_lora_target_modules(base_model, layer_indices)
     if not target_modules:
@@ -970,8 +1009,9 @@ def main():
         # find_unused_parameters=True bat DDP tu duyet lai autograd graph SAU MOI forward de
         # xac dinh chinh xac tham so nao THAT SU tham gia tinh loss cua step do, roi danh dau
         # ngay cac tham so khong duoc dung la "da san sang" (grad = None/khong cho) thay vi
-        # cho toi vo han -> het treo. Chap nhan chi phi duyet graph them moi forward (nho vi
-        # chi co LoRA tren 1 layer duy nhat) de doi lay su on dinh bat buoc voi kien truc MoE
+        # cho toi vo han -> het treo. Chap nhan chi phi duyet graph them moi forward (LoRA chi
+        # phu 1 range layer hep quanh middle, khong phai toan mang) de doi lay su on dinh bat
+        # buoc voi kien truc MoE
         # + routing dong (khac nhau moi batch, moi GPU, moi step task/align).
         model = DDP(model, find_unused_parameters=args.find_unused_parameters, **ddp_kwargs)
         # [FIX RuntimeError "Expected to mark a variable ready only once"] — xem giai thich
@@ -1068,7 +1108,8 @@ def main():
                 start_epoch += 1
                 start_step_in_epoch = 0
 
-    readme_text = build_model_card(args, num_experts, top_k, align_layer_0based, num_layers)
+    readme_text = build_model_card(args, num_experts, top_k, align_layer_0based, num_layers,
+                                    lora_layer_start, lora_layer_end)
 
     # ------------------------------------------------------------------------------ training loop
     try:
