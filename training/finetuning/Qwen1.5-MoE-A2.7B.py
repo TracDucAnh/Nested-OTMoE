@@ -168,7 +168,9 @@ def build_argparser() -> argparse.ArgumentParser:
     # MoE loss
     p.add_argument("--lb_loss_coef", type=float, default=None,
                     help="He so cho load-balancing loss. None = lay tu config.router_aux_loss_coef, "
-                         "fallback 0.01 (trong so nhu finetune binh thuong)")
+                         "fallback 0.001 (dung mac dinh cua Qwen2MoeConfig/Qwen1.5-MoE, KHONG phai "
+                         "0.01 nhu ban truoc — 0.01 se lam L_LB lan at L_LM neu model checkpoint "
+                         "lai khong co san attribute nay trong config)")
     p.add_argument("--num_local_experts", type=int, default=None,
                     help="Override so luong experts, None = tu doc trong config model")
     p.add_argument("--num_experts_per_tok", type=int, default=None,
@@ -202,6 +204,10 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--diagnostics_dir", type=str, default=None,
                     help="None = <output_dir>/diagnostics")
     p.add_argument("--log_every", type=int, default=10, help="Cap nhat plot loss moi N step")
+    p.add_argument("--smooth_window", type=int, default=50,
+                    help="So step lien tiep duoc gom lai (tinh trung binh cong) cho moi diem "
+                         "tren loss_curve_smoothed.png, giup duong cong de doc hon so voi ve "
+                         "tho tung step (rat messy do nhieu step-to-step, dac biet la L_LB).")
 
     # Distributed (DDP qua torchrun: doc RANK / LOCAL_RANK / WORLD_SIZE tu bien moi truong,
     # khong can truyen tay). Chay 1 GPU binh thuong neu khong launch qua torchrun.
@@ -536,7 +542,19 @@ def compute_load_balancing_loss(router_logits_list: List[torch.Tensor], attentio
     truoc do khong nhan attention_mask nen khong loc duoc."""
     mask_flat = attention_mask.reshape(-1).bool()  # [tokens], cung thu tu voi logits.reshape(-1, ...)
 
-    losses = []
+    # QUAN TRONG: HF (load_balancing_loss_func trong modeling_mixtral.py / modeling_qwen2_moe.py,
+    # dung chung cho ca Qwen1.5-MoE) NOI (torch.cat, dim=0) token cua TAT CA cac router layer lai
+    # thanh MOT tap thong ke duy nhat, roi MOI tinh f_i (ti le token/expert) va P_i (xac suat
+    # trung binh/expert) tren tap da noi do -> chi 1 loss tong the cho toan bo cac layer.
+    # Bان dau code o day tinh rieng tung layer (f_i, P_i, loss theo layer) roi lay .mean() cac
+    # loss lai -> VE TOAN HOC KHONG TUONG DUONG voi cach cua HF, vi:
+    #   mean_layer( sum_i f_i^(layer) * P_i^(layer) )  !=  sum_i mean_layer(f_i^(layer)) * mean_layer(P_i^(layer))
+    # (hai ve chi bang nhau neu khong co hiep phuong sai giua cac layer, noi chung la sai).
+    # -> sua lai: concat truoc, tinh thong ke + loss SAU, dung 1 lan cho toan bo cac router
+    # trong router_logits_list (van chi gom cac layer da duoc hook, tuc la cac layer nam trong
+    # khoang layer duoc gan LoRA — day la lua chon co chu dich cua script, khac voi mac dinh cua
+    # Qwen la tinh tren TOAN BO router layer cua model).
+    valid_logits = []
     for logits in router_logits_list:
         logits = logits.reshape(-1, logits.shape[-1])  # [tokens, num_experts]
         if logits.shape[0] == mask_flat.shape[0]:
@@ -551,21 +569,22 @@ def compute_load_balancing_loss(router_logits_list: List[torch.Tensor], attentio
                 "bo qua loc padding cho lan tinh nay, kiem tra lai thu tu flatten token cua "
                 "kien truc MoE nay neu thay canh bao lap lai nhieu lan."
             )
-        if logits.shape[0] == 0:
-            continue
-        routing_weights = F.softmax(logits, dim=-1)
-        _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)  # [tokens, top_k]
-        expert_mask = F.one_hot(selected_experts, num_experts).float()  # [tokens, top_k, num_experts]
-        # LUU Y: .mean(dim=0) da chia trung binh theo so token roi (cho ra f_i dung chuan,
-        # trong khoang [0,1]) -> KHONG duoc chia them cho logits.shape[0] mot lan nua (bug
-        # cu chia 2 lan lam L_LB nho gia tao ~N lan, N = so token trong sub-batch dang tinh).
-        tokens_per_expert = expert_mask.sum(dim=1).mean(dim=0)  # [num_experts], = f_i
-        avg_prob_per_expert = routing_weights.mean(dim=0)  # [num_experts]
-        loss = num_experts * torch.sum(tokens_per_expert * avg_prob_per_expert)
-        losses.append(loss)
-    if not losses:
+        if logits.shape[0] > 0:
+            valid_logits.append(logits)
+
+    if not valid_logits:
         return torch.tensor(0.0, device=attention_mask.device)
-    return torch.stack(losses).mean()
+
+    concatenated_logits = torch.cat(valid_logits, dim=0)  # [tong_token_qua_cac_layer, num_experts]
+    routing_weights = F.softmax(concatenated_logits, dim=-1)
+    _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)  # [tokens, top_k]
+    expert_mask = F.one_hot(selected_experts, num_experts).float()  # [tokens, top_k, num_experts]
+    # LUU Y: .mean(dim=0) da chia trung binh theo so token roi (cho ra f_i dung chuan,
+    # trong khoang [0,1]) -> KHONG duoc chia them cho logits.shape[0] mot lan nua (bug
+    # cu chia 2 lan lam L_LB nho gia tao ~N lan, N = so token trong sub-batch dang tinh).
+    tokens_per_expert = expert_mask.sum(dim=1).mean(dim=0)  # [num_experts], = f_i
+    avg_prob_per_expert = routing_weights.mean(dim=0)  # [num_experts]
+    return num_experts * torch.sum(tokens_per_expert * avg_prob_per_expert)
 
 
 def forward_backward_one_subbatch(sub_texts, tokenizer, model, max_length, device,
@@ -768,12 +787,73 @@ def plot_losses(jsonl_path, out_png):
     plt.plot(steps, total, label="L_Total")
     plt.xlabel("Training step")
     plt.ylabel("Loss")
-    plt.title("Qwen1.5-MoE-A2.7B LoRA finetuning loss")
+    plt.title("Qwen1.5-MoE-A2.7B LoRA finetuning loss (tho, tung step)")
     plt.legend()
     plt.grid(alpha=0.3)
     plt.tight_layout()
     plt.savefig(out_png, dpi=150)
     plt.close()
+
+
+def plot_losses_smoothed(jsonl_path, out_png, window: int):
+    """Ve duong loss da lam min: gom `window` step LIEN TIEP (theo thu tu ghi log, tuc la
+    theo global_step tang dan) thanh 1 "bin", lay TRUNG BINH CONG lm/lb/total trong bin do
+    lam 1 diem tren do thi. Khac voi plot_losses() (ve tho tung step, rat messy vi L_LB/L_LM
+    dao qua lai theo tung batch nho), o day so diem giam di ~window lan nen xu huong tang/giam
+    that su cua loss de nhin hon nhieu."""
+    if not os.path.exists(jsonl_path) or window <= 1:
+        return
+    steps, lm, lb, total = [], [], [], []
+    with open(jsonl_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            steps.append(rec["step"])
+            lm.append(rec["lm_loss"])
+            lb.append(rec["lb_loss"])
+            total.append(rec["total_loss"])
+    if not steps:
+        return
+
+    def bin_mean(values):
+        # Diem cuoi cung cua moi bin (step lon nhat trong bin) duoc dung lam nhan truc x, de
+        # truc x van la "global_step" chu khong phai "thu tu bin" (de so sanh voi save_steps,
+        # log_every de dang hon).
+        xs, ys = [], []
+        for i in range(0, len(values), window):
+            chunk = values[i:i + window]
+            xs.append(steps[i + len(chunk) - 1])
+            ys.append(sum(chunk) / len(chunk))
+        return xs, ys
+
+    x_lm, y_lm = bin_mean(lm)
+    x_lb, y_lb = bin_mean(lb)
+    x_tot, y_tot = bin_mean(total)
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(x_lm, y_lm, label="L_LM (mean)", marker="o", markersize=3)
+    plt.plot(x_lb, y_lb, label="L_LB (mean)", marker="o", markersize=3)
+    plt.plot(x_tot, y_tot, label="L_Total (mean)", marker="o", markersize=3)
+    plt.xlabel(f"Training step (moi diem = trung binh cong cua {window} step lien tiep)")
+    plt.ylabel("Loss (trung binh)")
+    plt.title(f"Qwen1.5-MoE-A2.7B LoRA finetuning loss - trung binh moi {window} step")
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=150)
+    plt.close()
+
+
+def plot_all(jsonl_path, plot_path, plot_path_smoothed, smooth_window):
+    """Goi ca 2 ham ve: loss_curve.png (tho, tung step) va loss_curve_smoothed.png (trung
+    binh cong moi smooth_window step) trong 1 lan, dung o moi diem trong training loop can
+    cap nhat plot (log_every, save_steps, cuoi training, KeyboardInterrupt) — ca 2 file nam
+    chung trong diagnostics_dir nen push_to_hub() (upload_folder toan bo thu muc) se tu dong
+    day len hub cung voi checkpoint, khong can sua push_to_hub."""
+    plot_losses(jsonl_path, plot_path)
+    plot_losses_smoothed(jsonl_path, plot_path_smoothed, smooth_window)
 
 
 # ============================================================================================
@@ -824,8 +904,10 @@ tu cac file: `{"`, `".join(data_files)}` (moi field ngon ngu trong 1 record duoc
 sample), shuffle va sort theo do dai token truoc khi gom batch.
 
 ## Diagnostics
-Xem `diagnostics/loss_log.jsonl` (log theo tung step) va `diagnostics/loss_curve.png`
-(bieu do L_LM / L_LB / L_Total theo step).
+Xem `diagnostics/loss_log.jsonl` (log theo tung step), `diagnostics/loss_curve.png` (bieu do
+tho L_LM / L_LB / L_Total theo tung step) va `diagnostics/loss_curve_smoothed.png` (cung 3
+duong loss nhung da lay trung binh cong moi `{args.smooth_window}` step lien tiep — de doc
+xu huong hon vi bieu do tho rat messy o cap do tung step).
 """
 
 
@@ -876,6 +958,7 @@ def main():
     os.makedirs(diagnostics_dir, exist_ok=True)
     jsonl_path = os.path.join(diagnostics_dir, "loss_log.jsonl")
     plot_path = os.path.join(diagnostics_dir, "loss_curve.png")
+    plot_path_smoothed = os.path.join(diagnostics_dir, "loss_curve_smoothed.png")
 
     dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
     dtype = dtype_map[args.dtype]
@@ -920,7 +1003,7 @@ def main():
 
     lb_loss_coef = args.lb_loss_coef
     if lb_loss_coef is None:
-        lb_loss_coef = float(getattr(base_model.config, "router_aux_loss_coef", 0.01))
+        lb_loss_coef = float(getattr(base_model.config, "router_aux_loss_coef", 0.001))
     logger.info(f"lb_loss_coef (trong so load-balancing, nhu finetune binh thuong) = {lb_loss_coef}")
 
     # ---------------------------------------------------------------------------- resume / LoRA
@@ -1110,12 +1193,12 @@ def main():
                         log_step_to_jsonl(jsonl_path, global_step, epoch, result)
 
                     if global_step % args.log_every == 0:
-                        plot_losses(jsonl_path, plot_path)
+                        plot_all(jsonl_path, plot_path, plot_path_smoothed, args.smooth_window)
 
                     if global_step % args.save_steps == 0:
                         ckpt_dir = save_checkpoint(args.output_dir, unwrap_model(model), optimizer,
                                                     scheduler, epoch, step_in_epoch, global_step)
-                        plot_losses(jsonl_path, plot_path)
+                        plot_all(jsonl_path, plot_path, plot_path_smoothed, args.smooth_window)
                         logger.info(f"Da luu checkpoint local: {ckpt_dir}")
                         if args.push_to_hub:
                             push_to_hub(ckpt_dir, diagnostics_dir, args.hub_model_id,
@@ -1135,7 +1218,7 @@ def main():
         if is_main_process(rank):
             final_ckpt = save_checkpoint(args.output_dir, unwrap_model(model), optimizer, scheduler,
                                           args.num_train_epochs - 1, steps_per_epoch - 1, global_step)
-            plot_losses(jsonl_path, plot_path)
+            plot_all(jsonl_path, plot_path, plot_path_smoothed, args.smooth_window)
             if args.push_to_hub:
                 push_to_hub(final_ckpt, diagnostics_dir, args.hub_model_id, args.hub_private, readme_text)
             logger.info("Training hoan tat.")
@@ -1147,7 +1230,7 @@ def main():
         if is_main_process(rank):
             save_checkpoint(args.output_dir, unwrap_model(model), optimizer, scheduler,
                              epoch, step_in_epoch, global_step)
-            plot_losses(jsonl_path, plot_path)
+            plot_all(jsonl_path, plot_path, plot_path_smoothed, args.smooth_window)
         raise
     finally:
         for h in hooks:
