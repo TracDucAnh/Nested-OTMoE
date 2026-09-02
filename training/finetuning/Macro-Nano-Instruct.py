@@ -38,7 +38,6 @@ import gc
 import glob
 import json
 import logging
-import math
 import os
 import random
 import re
@@ -300,28 +299,6 @@ def unwrap_model(model):
     return model.module if hasattr(model, "module") else model
 
 
-def shard_texts_for_ddp(texts: List[str], lengths: List[int], rank: int, world_size: int):
-    """Chia du lieu deu cho cac rank, moi rank 1 shard rieng khong overlap. Cat bot vai
-    sample le cuoi cung de tong so sample chia het cho world_size -> MOI RANK CO CUNG SO
-    STEP/EPOCH. Bat buoc phai vay: neu cac rank co so step khac nhau, rank it step hon se
-    ra khoi vong lap som va ngung goi collective op (backward/all_reduce) trong khi cac
-    rank khac van dang cho -> treo (hang) roi NCCL Watchdog timeout, sap ca job."""
-    if world_size <= 1:
-        return texts, lengths
-    n = len(texts)
-    n_trunc = (n // world_size) * world_size
-    if n_trunc == 0:
-        raise RuntimeError(
-            f"Chi co {n} sample, khong du de chia deu cho {world_size} GPU "
-            f"(can it nhat {world_size} sample)."
-        )
-    if n_trunc < n and rank == 0:
-        logger.warning(f"Bo {n - n_trunc} sample cuoi (trong tong {n}) de chia deu cho "
-                        f"{world_size} rank.")
-    shard_idx = list(range(n_trunc))[rank::world_size]
-    return [texts[i] for i in shard_idx], [lengths[i] for i in shard_idx]
-
-
 def sync_grads_across_ranks(trainable_params, world_size: int):
     """All-reduce (trung binh) gradient THU CONG, goi DUNG 1 LAN sau khi toan bo cac lan
     backward() cua 1 step (ke ca cac sub-batch sinh ra do dynamic OOM splitting) da chay
@@ -434,34 +411,73 @@ class SentenceDataset(Dataset):
 
 
 class LengthGroupedBatchSampler(Sampler[List[int]]):
-    """Moi epoch: shuffle toan bo index -> sort theo do dai token -> gom batch -> shuffle
-    thu tu cac batch. Buoc shuffle truoc khi sort giup cac cau cung nghia (cung id, khac
-    ngon ngu) trong flores/ted/ntrex khong bi dinh lien tuc voi nhau trong 1 batch."""
+    """Moi epoch: shuffle toan bo index (TREN TOAN BO DATASET, CHUA chia rank) -> sort theo
+    do dai token -> gom thanh cac "mega-batch" kich thuoc batch_size * world_size -> shuffle
+    thu tu cac mega-batch -> MOI mega-batch duoc chia deu thanh world_size phan LIEN TIEP
+    (moi phan dai batch_size, da nam gan nhau ve do dai vi vua duoc sort), rank r nhan phan
+    thu r. Buoc shuffle truoc khi sort giup cac cau cung nghia (cung id, khac ngon ngu)
+    trong flores/ted/ntrex khong bi dinh lien tuc voi nhau trong 1 batch.
 
-    def __init__(self, lengths: List[int], batch_size: int, seed: int = 42):
+    [FIX STRAGGLER GIUA CAC RANK KHI CHAY DDP NHIEU GPU]
+    Ban cu: shard_texts_for_ddp() chia du lieu cho tung rank TRUOC (round-robin theo thu tu
+    file goc), roi MOI rank tu shuffle + sort + gom batch TREN SHARD RIENG cua minh. Du
+    dung chung 1 seed, permutation do duoc ap dung tren 2 danh sach KHAC NHAU ve noi dung
+    (2 shard khac nhau) -> do dai cau trong batch #k cua rank nay co the rat khac batch #k
+    cua rank kia (vd rank 0 dang xu ly toan cau ngan trong khi rank 2 dang xu ly toan cau
+    dai gan --max_length, hoac te hon la dinh OOM phai chia doi de quy -> rat cham). Vi 1
+    step trong DDP luon co it nhat 2 diem dong bo BAT BUOC moi rank cho nhau
+    (reduce_result_across_ranks, sync_grads_across_ranks), rank nhanh phai NGOI CHO rank
+    cham nhat xong moi duoc di tiep -> ca job bi keo cham theo GPU cham nhat (straggler
+    effect), gay ra hien tuong thoi gian moi step khong on dinh (step nay nhanh, step ke
+    dot ngot cham hon han).
+
+    Fix: KHONG chia rank truoc nua. Sort do dai tren TOAN BO dataset — moi rank tu tinh lai
+    y het nhau (cung seed + cung du lieu goc + cung logic, hoan toan deterministic) nen
+    KHONG can giao tiep gi de dong bo buoc nay. Moi mega-batch (gom batch_size * world_size
+    sample GAN NHAU ve do dai sau khi sort) roi moi duoc chia deu cho cac rank -> o CUNG 1
+    step, moi rank luon nhan cac cau co do dai XAP XI NHAU, giam han straggler va giup thoi
+    gian moi step on dinh hon giua cac GPU.
+
+    Luu y ve phan du: neu tong so sample khong chia het cho (batch_size * world_size), phan
+    du cuoi epoch se bi bo — GIONG HET NHAU tren moi rank (deterministic) nen khong lam
+    lech so step giua cac rank (bat buoc phai vay, xem canh bao trong main() ve NCCL
+    Watchdog neu cac rank co so step khac nhau)."""
+
+    def __init__(self, lengths: List[int], batch_size: int, world_size: int = 1,
+                 rank: int = 0, seed: int = 42):
         self.lengths = lengths
         self.batch_size = batch_size
+        self.world_size = max(world_size, 1)
+        self.rank = rank
         self.seed = seed
         self.epoch = 0
 
     def set_epoch(self, epoch: int):
         self.epoch = epoch
 
-    def _build_batches(self) -> List[List[int]]:
+    def _build_rank_batches(self) -> List[List[int]]:
         g = random.Random(self.seed + self.epoch)
         indices = list(range(len(self.lengths)))
         g.shuffle(indices)
         indices.sort(key=lambda i: self.lengths[i])
-        batches = [indices[i:i + self.batch_size] for i in range(0, len(indices), self.batch_size)]
-        g.shuffle(batches)
-        return batches
+
+        mega_size = self.batch_size * self.world_size
+        n_mega = len(indices) // mega_size
+        indices = indices[: n_mega * mega_size]  # bo phan du, giong het tren moi rank
+        mega_batches = [indices[i:i + mega_size] for i in range(0, len(indices), mega_size)]
+        g.shuffle(mega_batches)  # shuffle thu tu cac mega-batch (van giu cau gan nhau/do dai trong tung mega-batch)
+
+        start = self.rank * self.batch_size
+        end = start + self.batch_size
+        return [mb[start:end] for mb in mega_batches]
 
     def __iter__(self):
-        for b in self._build_batches():
+        for b in self._build_rank_batches():
             yield b
 
     def __len__(self):
-        return math.ceil(len(self.lengths) / self.batch_size)
+        mega_size = self.batch_size * self.world_size
+        return len(self.lengths) // mega_size
 
 
 # ============================================================================================
@@ -1102,15 +1118,27 @@ def main():
 
     lengths = compute_lengths(tokenizer, texts)
 
-    # Distributed: moi rank chi train tren 1 shard rieng, khong overlap. --batch_size la
-    # batch size CHO MOI GPU (giong per_device_train_batch_size cua HF Trainer) -> global
-    # batch size thuc te = batch_size * world_size.
-    texts, lengths = shard_texts_for_ddp(texts, lengths, rank, world_size)
-    if is_distributed:
-        logger.info(f"[rank {rank}/{world_size}] Shard cua rank nay: {len(texts)} sample.")
+    # --batch_size la batch size CHO MOI GPU (giong per_device_train_batch_size cua HF
+    # Trainer) -> global batch size thuc te = batch_size * world_size. KHONG shard texts
+    # thu cong nua — dataset giu nguyen TOAN BO du lieu, viec chia GPU nao xu ly sample nao
+    # duoc LengthGroupedBatchSampler dam nhiem (sort do dai TOAN CUC roi moi chia deu cho
+    # cac rank theo tung mega-batch, xem docstring cua class do de biet ly do: giam
+    # straggler giua cac GPU so voi cach shard-truoc-roi-sort-rieng ban cu).
+    mega_size = args.batch_size * world_size
+    if len(texts) < mega_size:
+        raise RuntimeError(
+            f"Chi co {len(texts)} sample, khong du de tao 1 step voi batch_size="
+            f"{args.batch_size} x world_size={world_size} (can it nhat {mega_size} sample)."
+        )
+    n_dropped = len(texts) % mega_size
+    if n_dropped and is_main_process(rank):
+        logger.info(f"Moi epoch se bo {n_dropped} sample cuoi (trong tong {len(texts)}) de "
+                    f"chia deu {args.batch_size} sample/rank x {world_size} rank cho MOI "
+                    f"step (giup moi rank luon nhan cau co do dai xap xi nhau).")
 
     dataset = SentenceDataset(texts)
-    batch_sampler = LengthGroupedBatchSampler(lengths, batch_size=args.batch_size, seed=args.seed)
+    batch_sampler = LengthGroupedBatchSampler(lengths, batch_size=args.batch_size,
+                                               world_size=world_size, rank=rank, seed=args.seed)
     dataloader = DataLoader(dataset, batch_sampler=batch_sampler, collate_fn=lambda b: b)
 
     # ------------------------------------------------------------------------------- optimizer
