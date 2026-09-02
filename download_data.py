@@ -7,9 +7,14 @@ Tải các bộ dữ liệu cho OT-MOE và lưu ra JSON, tổ chức theo cấu 
       alignment/
         flores-200/    <- facebook/flores  (config "all")
         ntrex-128/     <- mteb/NTREX
-        bible/         <- Helsinki-NLP/bible_para (corpus "bible-uedin" trên OPUS)
-                          TOÀN BỘ ngôn ngữ có trong corpus, tự động lấy qua OPUS-API
-                          (không hardcode danh sách cặp)
+        ted-2025/      <- Tải TRỰC TIẾP file .zip từ Google Drive (bằng gdown),
+                          KHÔNG qua Hugging Face. File .zip được tải tạm vào
+                          alignment/ (ngang hàng ted-2025/), sau đó NỘI DUNG bên
+                          trong zip được giải nén thẳng vào alignment/ted-2025/
+                          (nếu zip có 1 thư mục gốc chung, thư mục đó bị bỏ đi
+                          để tránh lồng thêm 1 cấp, ví dụ tránh
+                          alignment/ted-2025/ted-2025/...). File .zip tạm bị
+                          xoá sau khi giải nén xong.
       downstream/
         mmmlu/
         xnli/
@@ -32,7 +37,7 @@ LƯU Ý LỖI XQuAD ("Feature type 'List' not found"):
     Gần đây Hugging Face đã cập nhật metadata (README/dataset_info.json) của
     google/xquad sang kiểu feature mới "List" — kiểu này CHỈ được thư viện
     `datasets` bản >=4.0.0 hiểu. Nhưng project này lại cần ghim
-    `datasets<4.0.0` vì FLORES-200/Bible cần trust_remote_code=True (đã bị
+    `datasets<4.0.0` vì FLORES-200 cần trust_remote_code=True (đã bị
     GỠ BỎ ở datasets 4.0). Kẹt giữa 2 yêu cầu trái ngược này, nên với XQuAD,
     script KHÔNG gọi load_dataset("google/xquad", ...) như bình thường (sẽ
     lỗi "Feature type 'List' not found"), mà đọc THẲNG các file .parquet đã
@@ -48,36 +53,38 @@ OT-MOE/download_data.py), đúng như cấu trúc project hiện tại của b�
 Cài đặt:
     pip install -r requirements.txt
 
-    LƯU Ý: FLORES-200 (facebook/flores) và Bible (Helsinki-NLP/bible_para)
-    là dataset kiểu "loading script" cũ, cần trust_remote_code=True. Từ
-    `datasets` bản 4.0 trở lên, cơ chế này đã bị GỠ BỎ hoàn toàn (sẽ báo lỗi
-    "trust_remote_code is not supported anymore"). Vì vậy requirements.txt
-    ghim `datasets<4.0.0` — đừng tự ý nâng cấp `datasets` lên bản mới hơn
-    nếu vẫn muốn tải 2 bộ này. Tatoeba (mteb/tatoeba-bitext-mining) là
-    parquet chuẩn nên không bị ảnh hưởng bởi giới hạn này. XQuAD cũng không
-    bị ảnh hưởng nữa vì đã chuyển sang đọc parquet trực tiếp (xem ghi chú ở
-    trên).
+    LƯU Ý: FLORES-200 (facebook/flores) là dataset kiểu "loading script" cũ,
+    cần trust_remote_code=True. Từ `datasets` bản 4.0 trở lên, cơ chế này đã
+    bị GỠ BỎ hoàn toàn (sẽ báo lỗi "trust_remote_code is not supported
+    anymore"). Vì vậy requirements.txt ghim `datasets<4.0.0` — đừng tự ý
+    nâng cấp `datasets` lên bản mới hơn nếu vẫn muốn tải bộ này. Tatoeba
+    (mteb/tatoeba-bitext-mining) là parquet chuẩn nên không bị ảnh hưởng bởi
+    giới hạn này. XQuAD cũng không bị ảnh hưởng nữa vì đã chuyển sang đọc
+    parquet trực tiếp (xem ghi chú ở trên).
 
-    Bộ Bible cần thêm gói `requests` (dùng để gọi OPUS-API lấy danh sách
-    ngôn ngữ động, xem hàm get_bible_uedin_languages() bên dưới). XQuAD cũng
-    dùng `requests` (tải file parquet) và `pyarrow` (đọc parquet) — cả hai
-    đều đã có sẵn vì là dependency của `datasets`, chỉ `requests` cần cài
-    thêm nếu chưa có:
-        pip install requests
+    XQuAD dùng `requests` (tải file parquet) và `pyarrow` (đọc parquet) —
+    cả hai đều đã có sẵn vì là dependency của `datasets`.
+
+    Bộ TED-2025 cần thêm gói `gdown` (dùng để tải file .zip công khai từ
+    Google Drive theo link chia sẻ, xem hàm download_ted2025() bên dưới):
+        pip install gdown
 
 Chạy:
     python download_data.py                       # tải tất cả (tự skip phần đã có)
-    python download_data.py --only flores ntrex bible tatoeba
+    python download_data.py --only flores ntrex ted2025
     python download_data.py --only xquad            # chỉ tải XQuAD
+    python download_data.py --only ted2025          # chỉ tải TED-2025 (từ Google Drive)
     python download_data.py --list                 # xem danh sách các bộ hỗ trợ
     python download_data.py --force                # tải lại toàn bộ, ghi đè dữ liệu cũ
 """
 
 import io
 import os
+import re
 import json
+import shutil
+import zipfile
 import argparse
-import itertools
 from pathlib import Path
 
 import requests
@@ -86,6 +93,14 @@ from tqdm import tqdm
 from datasets import load_dataset, get_dataset_config_names
 from huggingface_hub import login, list_repo_files
 from dotenv import load_dotenv
+
+try:
+    import gdown
+except ImportError:
+    # gdown chỉ cần thiết cho download_ted2025(); nếu chưa cài, các dataset
+    # khác vẫn chạy bình thường -- download_ted2025() sẽ tự báo lỗi rõ ràng
+    # và hướng dẫn `pip install gdown` khi được gọi tới.
+    gdown = None
 
 # --------------------------------------------------------------------------
 # 1. HUGGING FACE TOKEN
@@ -118,28 +133,6 @@ ALIGNMENT_DIR = SCRIPT_DIR / "data" / "alignment"    # OT-MOE/data/alignment
 
 # NTREX-128: dataset chỉ có 1 config "default" -> không cần list ngôn ngữ.
 
-# Bible / bible-uedin (Helsinki-NLP/bible_para): KHÔNG hardcode danh sách cặp
-# ngôn ngữ nữa. Mặc định script sẽ tự gọi OPUS-API để lấy TOÀN BỘ mã ngôn ngữ
-# có trong corpus bible-uedin (xem get_bible_uedin_languages() bên dưới), rồi
-# sinh tất cả cặp (C(n,2)) và thử tải từng cặp — cặp nào OPUS không có dữ
-# liệu song song thì bỏ qua.
-#
-# Nếu bạn muốn GIỚI HẠN lại (ví dụ chỉ quan tâm một số ngôn ngữ cụ thể, để đỡ
-# tốn thời gian/dung lượng) thì điền danh sách MÃ NGÔN NGỮ (không phải cặp)
-# vào đây, ví dụ: ["en", "vi", "fr", "de", "es", "zh"]. Để None nếu muốn lấy
-# toàn bộ ngôn ngữ có sẵn.
-BIBLE_LANGUAGES_OVERRIDE = None  # ví dụ: ["en", "vi", "fr", "de", "es", "zh"]
-
-# PIVOT: thay vì thử TOÀN BỘ C(n,2) ~ 5000 cặp (rất chậm và phần lớn sẽ bị
-# bỏ qua vì OPUS không có đủ mọi cặp chéo), mặc định chỉ tải các cặp
-# (pivot, X) cho mọi ngôn ngữ X còn lại — tức lấy 1 ngôn ngữ làm gốc/anchor,
-# giống cách NTREX-128 lấy English làm nguồn. Số request giảm từ ~5000
-# xuống còn ~n-1 (n = số ngôn ngữ trong bible-uedin, khoảng 101 request).
-#
-# Đặt BIBLE_PIVOT_LANGUAGE = None nếu vẫn muốn tải TOÀN BỘ mọi cặp chéo
-# (n-way đầy đủ, không qua pivot) như trước.
-BIBLE_PIVOT_LANGUAGE = "en"  # None để tải full C(n,2) cặp
-
 # MMMLU: 14 locale được OpenAI dịch (xem README của openai/MMMLU)
 MMMLU_LOCALES = [
     "AR_XY", "BN_BD", "DE_DE", "ES_LA", "FR_FR", "HI_IN", "ID_ID",
@@ -166,6 +159,13 @@ XQUAD_LANGUAGES = [
 # Hữu ích khi chỉ muốn test nhanh trước khi tải full (Tatoeba/XNLI rất lớn).
 MAX_EXAMPLES_PER_SPLIT = None  # ví dụ: 5000
 
+# TED-2025: link chia sẻ Google Drive của file .zip (dataset không nằm trên
+# Hugging Face, tải trực tiếp bằng gdown). Link phải ở chế độ chia sẻ công
+# khai ("Anyone with the link") thì gdown mới tải được mà không cần đăng nhập.
+TED2025_GDRIVE_URL = (
+    "https://drive.google.com/file/d/1bSr5bDC7kvl2oMx7-65vku3O_ziIjqZr/view?usp=sharing"
+)
+
 
 # --------------------------------------------------------------------------
 # 4. HÀM TIỆN ÍCH
@@ -187,6 +187,17 @@ def output_already_exists(out_dir: Path) -> bool:
     if not out_dir.exists():
         return False
     return any(out_dir.glob("*.json"))
+
+
+def output_dir_has_any_files(out_dir: Path) -> bool:
+    """Giống output_already_exists(), nhưng kiểm tra BẤT KỲ file nào (không
+    riêng .json) đã tồn tại trong thư mục hay chưa -- dùng cho các dataset
+    không được lưu ra JSON mà chỉ giải nén thô (ví dụ TED-2025), vì nội dung
+    giải nén có thể là .txt/.xml/... tuỳ theo dataset gốc, không riêng .json.
+    """
+    if not out_dir.exists():
+        return False
+    return any(p.is_file() for p in out_dir.rglob("*"))
 
 
 def save_split_as_json(dataset_split, out_path: Path, desc: str):
@@ -235,7 +246,7 @@ def load_dataset_via_parquet(repo_id: str, config_name: str) -> dict:
 
     Dùng cho XQuAD vì metadata của google/xquad hiện dùng kiểu feature mới
     "List" (chỉ datasets>=4.0.0 hiểu được), trong khi project cần ghim
-    datasets<4.0.0 cho FLORES-200/Bible -> load_dataset() thông thường sẽ
+    datasets<4.0.0 cho FLORES-200 -> load_dataset() thông thường sẽ
     lỗi "Feature type 'List' not found" dù dữ liệu vẫn tải được bình thường.
     Đọc thẳng parquet bằng pyarrow tránh được lỗi này hoàn toàn.
 
@@ -296,49 +307,48 @@ def save_records_as_json(records: list, out_path: Path, desc: str):
     print(f"    -> đã lưu {len(records)} dòng vào {out_path}")
 
 
-def get_bible_uedin_languages():
-    """Lấy TOÀN BỘ mã ngôn ngữ có trong corpus bible-uedin trên OPUS, thông
-    qua OPUS-API (https://opus.nlpl.eu/opusapi), thay vì hardcode sẵn danh
-    sách. Trả về list rỗng nếu gọi API thất bại (mất mạng, đổi API, ...).
+def is_macos_zip_junk(member_path: str) -> bool:
+    """Kiểm tra 1 entry trong file zip có phải rác do macOS tự sinh khi nén
+    (qua Finder/Archive Utility) hay không, để loại bỏ khi giải nén:
+        - Thư mục "__MACOSX/" (và mọi thứ nằm bên trong nó)
+        - File resource-fork ẩn, tên bắt đầu bằng "._" (ví dụ "._en.txt")
+        - File ".DS_Store" (metadata thư mục của Finder)
     """
-    api_url = "https://opus.nlpl.eu/opusapi"
-    try:
-        resp = requests.get(
-            api_url,
-            params={"languages": "True", "corpus": "bible-uedin"},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as e:
-        print(f"[LỖI] Không gọi được OPUS-API để lấy danh sách ngôn ngữ "
-              f"bible-uedin: {e}")
-        return []
+    parts = [p for p in member_path.split("/") if p]
+    if not parts:
+        return False
+    if parts[0] == "__MACOSX":
+        return True
+    basename = parts[-1]
+    if basename.startswith("._") or basename == ".DS_Store":
+        return True
+    return False
 
-    # Cấu trúc JSON trả về của OPUS-API có thể thay đổi theo phiên bản, nên
-    # xử lý vài trường hợp phổ biến: {"languages": [...]}, hoặc list thẳng.
-    if isinstance(data, dict):
-        langs = data.get("languages") or data.get("language") or []
-    elif isinstance(data, list):
-        langs = data
-    else:
-        langs = []
 
-    # Mỗi phần tử có thể là string mã ngôn ngữ, hoặc dict {"language": "en"}
-    cleaned = []
-    for item in langs:
-        if isinstance(item, str):
-            cleaned.append(item)
-        elif isinstance(item, dict):
-            code = item.get("language") or item.get("code") or item.get("name")
-            if code:
-                cleaned.append(code)
+def extract_gdrive_file_id(url_or_id: str) -> str:
+    """Tách file ID từ 1 link chia sẻ Google Drive. Hỗ trợ các dạng phổ biến:
+        https://drive.google.com/file/d/<ID>/view?usp=sharing
+        https://drive.google.com/open?id=<ID>
+        https://drive.google.com/uc?id=<ID>
+    Nếu không khớp dạng nào ở trên, coi như chuỗi truyền vào đã là ID trần
+    và trả về nguyên văn (fallback).
 
-    return sorted(set(cleaned))
+    Cố tình tự tách ID thay vì dùng gdown.download(url=..., fuzzy=True), vì
+    tham số "fuzzy" chỉ xuất hiện ở các bản gdown khá mới (>=4.4) -- dùng
+    gdown.download(id=<ID>, ...) hoạt động ổn định với MỌI bản gdown, kể cả
+    bản cũ không có "fuzzy".
+    """
+    match = re.search(r"/d/([a-zA-Z0-9_-]+)", url_or_id)
+    if match:
+        return match.group(1)
+    match = re.search(r"[?&]id=([a-zA-Z0-9_-]+)", url_or_id)
+    if match:
+        return match.group(1)
+    return url_or_id.strip()
 
 
 # --------------------------------------------------------------------------
-# 5. ALIGNMENT: FLORES-200, NTREX-128, Bible (bible-uedin)
+# 5. ALIGNMENT: FLORES-200, NTREX-128, TED-2025
 # --------------------------------------------------------------------------
 def download_flores200():
     print("\n=== FLORES-200 -> alignment/flores-200/ ===")
@@ -401,72 +411,117 @@ def download_ntrex128():
         )
 
 
-def download_bible():
-    print("\n=== Bible / bible-uedin -> alignment/bible/ ===")
-    out_root = ALIGNMENT_DIR / "bible"
+def download_ted2025():
+    """Tải bộ TED-2025 từ 1 file .zip công khai trên Google Drive (không
+    nằm trên Hugging Face) bằng gdown, rồi giải nén.
 
-    languages = BIBLE_LANGUAGES_OVERRIDE or get_bible_uedin_languages()
-    if not languages:
-        print("[!] Không lấy được danh sách ngôn ngữ bible-uedin -> bỏ qua bible.")
-        print("    -> Kiểm tra kết nối mạng tới opus.nlpl.eu, hoặc set thủ công")
-        print("       biến BIBLE_LANGUAGES_OVERRIDE ở đầu file để bỏ qua bước gọi API.")
+    Quy trình:
+      1. Tự tách file ID từ link chia sẻ (dạng ".../file/d/<ID>/view?...")
+         bằng regex, rồi gọi gdown.download(id=<ID>, ...) để tải file .zip
+         về alignment/ted-2025.zip. Cố tình KHÔNG dùng tham số
+         gdown.download(url=..., fuzzy=True) vì "fuzzy" chỉ có ở các bản
+         gdown khá mới (>=4.4) -- tự tách ID rồi dùng id=... hoạt động ổn
+         định với mọi bản gdown, kể cả bản cũ.
+      2. Giải nén PHẲNG (KHÔNG giữ cấu trúc thư mục con trong zip): mọi file
+         thật trong zip (bất kể đang nằm ở thư mục con nào) đều được đặt
+         TRỰC TIẾP vào alignment/ted-2025/, chỉ giữ lại tên file -- tránh
+         hoàn toàn tình trạng lồng thêm thư mục con thừa. Các entry rác do
+         macOS tự sinh khi nén (thư mục "__MACOSX/", file resource-fork
+         "._xxx", file ".DS_Store") bị loại bỏ, không giải nén. Nếu 2 file
+         trong zip trùng tên (do trước đó nằm ở 2 thư mục con khác nhau),
+         script tự thêm hậu tố số vào tên để không bị ghi đè mất dữ liệu,
+         kèm cảnh báo.
+      3. Xoá file .zip tạm sau khi giải nén xong.
+    """
+    print("\n=== TED-2025 (Google Drive) -> alignment/ted-2025/ ===")
+
+    if gdown is None:
+        print("[LỖI] Chưa cài gói 'gdown'. Cài bằng: pip install gdown")
         return
 
-    if BIBLE_PIVOT_LANGUAGE:
-        if BIBLE_PIVOT_LANGUAGE not in languages:
-            print(f"[!] Pivot '{BIBLE_PIVOT_LANGUAGE}' không có trong danh sách "
-                  f"ngôn ngữ bible-uedin lấy được -> vẫn thử tải (OPUS có thể "
-                  f"vẫn hỗ trợ), nhưng kiểm tra lại mã ngôn ngữ nếu lỗi hết.")
-        # Chỉ lấy các cặp (pivot, X) -> n-1 cặp thay vì C(n,2), nhanh hơn
-        # nhiều và vẫn đủ dùng cho mục đích alignment qua 1 ngôn ngữ gốc.
-        pairs = [
-            (BIBLE_PIVOT_LANGUAGE, lang)
-            for lang in languages
-            if lang != BIBLE_PIVOT_LANGUAGE
-        ]
-        print(f"  bible-uedin có {len(languages)} ngôn ngữ -> dùng pivot "
-              f"'{BIBLE_PIVOT_LANGUAGE}', sẽ thử {len(pairs)} cặp "
-              f"({BIBLE_PIVOT_LANGUAGE}-X). Đặt BIBLE_PIVOT_LANGUAGE = None "
-              f"ở đầu file nếu muốn tải TOÀN BỘ C(n,2) cặp chéo thay vì qua pivot.")
-    else:
-        pairs = list(itertools.combinations(languages, 2))
-        print(f"  bible-uedin có {len(languages)} ngôn ngữ -> sẽ thử toàn bộ "
-              f"{len(pairs)} cặp (một số cặp có thể không có dữ liệu song song, "
-              f"script sẽ tự bỏ qua các cặp đó). Việc này sẽ khá lâu — đặt "
-              f"BIBLE_PIVOT_LANGUAGE = 'en' (hoặc mã khác) nếu muốn tải nhanh "
-              f"hơn qua 1 ngôn ngữ pivot.")
+    out_dir = ALIGNMENT_DIR / "ted-2025"
+    zip_path = ALIGNMENT_DIR / "ted-2025.zip"
 
-    ok, skipped, already = 0, 0, 0
-    for lang1, lang2 in tqdm(pairs, desc="Bible language pairs"):
-        pair_name = f"{lang1}-{lang2}"
+    if not FORCE_REDOWNLOAD and output_dir_has_any_files(out_dir):
+        print(f"  [skip] ted-2025 đã có dữ liệu tại {out_dir} -> bỏ qua toàn bộ "
+              f"(dùng --force để tải lại).")
+        return
 
-        if not FORCE_REDOWNLOAD and output_already_exists(out_root / pair_name):
-            already += 1
-            continue
+    ALIGNMENT_DIR.mkdir(parents=True, exist_ok=True)
 
-        try:
-            ds = load_dataset(
-                "Helsinki-NLP/bible_para",
-                lang1=lang1,
-                lang2=lang2,
-                trust_remote_code=True,
-            )
-        except Exception:
-            # Không phải cặp nào trong C(n,2) cũng thực sự có bitext trên
-            # OPUS -> bỏ qua lặng lẽ để không spam log cho hàng nghìn cặp.
-            skipped += 1
-            continue
+    file_id = extract_gdrive_file_id(TED2025_GDRIVE_URL)
+    print(f"  Đang tải file .zip từ Google Drive (id={file_id}) về {zip_path} ...")
+    try:
+        gdown.download(id=file_id, output=str(zip_path), quiet=False)
+    except Exception as e:
+        print(f"[LỖI] Không tải được file TED-2025 từ Google Drive: {e}")
+        print("    -> Nếu lỗi liên quan tới gdown quá cũ, thử nâng cấp: "
+              "pip install -U gdown")
+        return
 
-        ok += 1
-        for split in ds.keys():
-            save_split_as_json(
-                ds[split],
-                out_root / pair_name / f"{split}.json",
-                desc=f"  bible/{pair_name}/{split}",
-            )
+    if not zip_path.exists():
+        print(f"[LỖI] gdown chạy xong nhưng không thấy file {zip_path} -> có thể "
+              f"link đã hết hạn/hết quyền chia sẻ công khai.")
+        return
 
-    print(f"  -> Hoàn tất bible: {ok} cặp tải mới, {already} cặp đã có sẵn (skip), "
-          f"{skipped} cặp bỏ qua (không tồn tại trên OPUS).")
+    print(f"  Đang giải nén (phẳng, bỏ rác __MACOSX) {zip_path} vào {out_dir} ...")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            names = [n for n in zf.namelist() if n.strip("/")]
+
+            # Bỏ qua entry thư mục và toàn bộ rác do macOS tự sinh khi nén:
+            # thư mục "__MACOSX/", file resource-fork "._xxx", ".DS_Store".
+            real_files = [
+                n for n in names
+                if not n.endswith("/") and not is_macos_zip_junk(n)
+            ]
+
+            extracted = 0
+            used_names = set()
+            for member in tqdm(real_files, desc="  Giải nén ted-2025"):
+                # Giải nén PHẲNG: chỉ lấy tên file (Path(...).name), bỏ toàn
+                # bộ đường dẫn thư mục con trong zip -- đúng yêu cầu "không
+                # phải folder", mọi file nằm thẳng trong alignment/ted-2025/.
+                base_name = Path(member).name
+                if not base_name:
+                    continue
+                target_name = base_name
+                if target_name in used_names:
+                    # Trùng tên (2 thư mục con trong zip cùng có file tên
+                    # giống nhau) -> thêm hậu tố số để không ghi đè mất dữ
+                    # liệu, đồng thời cảnh báo cho người dùng biết.
+                    stem = Path(base_name).stem
+                    suffix = Path(base_name).suffix
+                    i = 1
+                    while target_name in used_names:
+                        target_name = f"{stem}__{i}{suffix}"
+                        i += 1
+                    print(f"    [!] Trùng tên file '{base_name}' (nguồn: {member}) "
+                          f"-> đổi thành '{target_name}' để tránh ghi đè.")
+                used_names.add(target_name)
+
+                target_path = out_dir / target_name
+                with zf.open(member) as src, open(target_path, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+                extracted += 1
+    except zipfile.BadZipFile:
+        print(f"[LỖI] {zip_path} không phải file zip hợp lệ -- có thể Google "
+              f"Drive trả về trang lỗi/trang cảnh báo quét virus thay vì file "
+              f"thật (thường gặp với file rất lớn). Thử tải thủ công bằng "
+              f"trình duyệt để kiểm tra link.")
+        return
+    except Exception as e:
+        print(f"[LỖI] Giải nén thất bại: {e}")
+        return
+
+    print(f"  -> Đã giải nén {extracted} file (phẳng, không thư mục con) vào {out_dir}")
+
+    try:
+        zip_path.unlink()
+        print(f"  -> Đã xoá file .zip tạm {zip_path}")
+    except Exception as e:
+        print(f"[!] Không xoá được file .zip tạm {zip_path}: {e}")
 
 
 # --------------------------------------------------------------------------
@@ -515,7 +570,7 @@ def download_xquad():
     # LƯU Ý: KHÔNG dùng safe_load_dataset()/load_dataset() thông thường ở
     # đây vì metadata của google/xquad hiện dùng kiểu feature "List" (chỉ
     # datasets>=4.0.0 hiểu), trong khi project ghim datasets<4.0.0 cho
-    # FLORES-200/Bible -> sẽ lỗi "Feature type 'List' not found". Thay vào
+    # FLORES-200 -> sẽ lỗi "Feature type 'List' not found". Thay vào
     # đó đọc thẳng file parquet qua load_dataset_via_parquet() (xem ghi chú
     # đầu file). google/xquad có ĐÚNG 12 config (11 ngôn ngữ dịch + tiếng
     # Anh gốc) -- XQUAD_LANGUAGES ở trên đã liệt kê đủ.
@@ -577,7 +632,7 @@ def download_tatoeba():
 DATASET_REGISTRY = {
     "flores": download_flores200,
     "ntrex": download_ntrex128,
-    "bible": download_bible,
+    "ted2025": download_ted2025,
     "mmmlu": download_mmmlu,
     "xnli": download_xnli,
     "xquad": download_xquad,

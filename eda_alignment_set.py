@@ -2,7 +2,7 @@
 eda_alignment_set.py
 
 EDA (Exploratory Data Analysis) cơ bản cho 3 tập dữ liệu alignment:
-    data/processed_alignment/bible.json
+    data/processed_alignment/ted.json
     data/processed_alignment/flores.json
     data/processed_alignment/ntrex.json
 
@@ -33,7 +33,7 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data" / "processed_alignment"
 
 DATASET_FILES = {
-    "bible": DATA_DIR / "bible.json",
+    "ted": DATA_DIR / "ted.json",
     "flores": DATA_DIR / "flores.json",
     "ntrex": DATA_DIR / "ntrex.json",
 }
@@ -121,7 +121,7 @@ def analyze_dataset(name: str, records: List[Dict[str, Any]]) -> Dict[str, Any]:
 def print_report(per_dataset_stats: Dict[str, Dict[str, Any]]) -> None:
     sep = "=" * 72
     print(sep)
-    print("EDA - ALIGNMENT DATASETS (bible / flores / ntrex)")
+    print("EDA - ALIGNMENT DATASETS (ted / flores / ntrex)")
     print(sep)
 
     # ---- 1. Tổng ngôn ngữ độc nhất toàn bộ 3 set ----

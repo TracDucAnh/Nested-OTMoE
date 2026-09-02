@@ -1,6 +1,6 @@
 """
 Language coverage analysis for the parallel-text datasets used by OT-MOE:
-`data/processed_alignment/{bible,flores,ntrex}.json`.
+`data/processed_alignment/{ted,flores,ntrex}.json`.
 
 Data format
 -----------
@@ -20,9 +20,9 @@ A language is only counted as "present" in a record if its value is a
 non-empty string (a missing key or an empty string both count as "not
 covered" for that record). Language keys are auto-detected with a regex,
 so the script does not need a hardcoded language list and works even if
-bible.json / flores.json / ntrex.json don't share the exact same set of
-languages or use a handful of non-standard codes (e.g. some Bible-corpus
-codes like "jap_Hira" or "ojb_Cans" that don't match the usual NLLB codes).
+ted.json / flores.json / ntrex.json don't share the exact same set of
+languages or use a handful of non-standard codes (e.g. some TED-2025
+codes that don't match the usual NLLB codes).
 
 What this script does
 ----------------------
@@ -31,9 +31,9 @@ What this script does
 2. Computes the union of those 3 sets -> the total number of distinct
    languages covered across all datasets combined.
 3. Draws exactly ONE chart -- a 3-set Venn diagram -- showing how the
-   language sets of Bible / FLORES / NTREX overlap. Since FLORES has ~200
-   languages and NTREX has ~128 (per their public releases) and Bible-corpus
-   language lists are commonly in the same order of magnitude, listing every
+   language sets of TED-2025 / FLORES / NTREX overlap. Since FLORES has ~200
+   languages and NTREX has ~128 (per their public releases) and TED-2025's
+   language list is commonly in the same order of magnitude, listing every
    language on the chart isn't readable, so instead the chart carries a
    legend of the ~10 most widely-spoken languages (English, Chinese, Hindi,
    Spanish, ...), color-coded to match the Venn region they fall into.
@@ -47,6 +47,8 @@ Usage
     python "[DATA]_language_coverage.py" \
         --data_root data/processed_alignment \
         --output_dir analysis/output
+
+    (expects ted.json / flores.json / ntrex.json inside --data_root)
 
 Optional dependency
 --------------------
@@ -86,25 +88,40 @@ plt.rcParams["font.serif"] = ["Times New Roman", "Liberation Serif", "DejaVu Ser
 # "top languages" legend, so a legend swatch's color always matches the
 # region that language actually falls into.
 REGION_COLORS = {
-    "100": "#4C72B0",  # Bible only
+    "100": "#4C72B0",  # TED-2025 only
     "010": "#DD8452",  # FLORES only
     "001": "#55A868",  # NTREX only
-    "110": "#9878B5",  # Bible & FLORES only
-    "101": "#7F9E76",  # Bible & NTREX only
+    "110": "#9878B5",  # TED-2025 & FLORES only
+    "101": "#7F9E76",  # TED-2025 & NTREX only
     "011": "#C58F6B",  # FLORES & NTREX only
     "111": "#8C8C8C",  # all 3
     "000": "#E0E0E0",  # not found in any of the 3 (edge case)
 }
 
 
-# Matches NLLB-style language codes used in these datasets, e.g.
-# "eng_Latn", "zho_Hani", "ojb_Cans", "jap_Hira". Any dict key that does
-# NOT match this (like "id") is treated as metadata, not a language.
-LANG_CODE_RE = re.compile(r"^[a-z]{2,4}_[A-Z][a-z]{3}$")
+# BUG ĐÃ SỬA: trước đây script dùng 1 regex cứng để QUYẾT ĐỊNH key nào là
+# ngôn ngữ (LANG_CODE_RE match -> tính, không match -> âm thầm loại bỏ như
+# "id"). Nhưng NTREX-128 thực tế có các cột dùng region subtag kiểu
+# "por-BR_Latn", "eng-US_Latn", "eng-GB_Latn", "eng-IN_Latn", "spa-MX_Latn",
+# "fra-CA_Latn" (đã kiểm chứng trực tiếp trên HuggingFace) -- các key này
+# KHÔNG khớp mẫu "^[a-z]{2,4}_[A-Z][a-z]{3}$" (vì có thêm "-XX" trước dấu
+# "_"), nên bị loại nhầm khỏi kết quả đếm, làm tụt từ 128 xuống còn 122.
+#
+# Cách sửa: phân biệt distinct language key bằng BLOCKLIST tường minh (key
+# nào chắc chắn KHÔNG phải ngôn ngữ) thay vì bắt mọi key phải khớp 1 format
+# cố định -- format ngôn ngữ có thể khác nhau giữa các dataset/phiên bản mà
+# ta không lường trước hết được.
+NON_LANGUAGE_KEYS = {"id"}
+
+# Giữ lại 1 regex "quen mắt" theo mẫu NLLB-style chuẩn CHỈ để CẢNH BÁO (KHÔNG
+# dùng để loại bỏ dữ liệu) khi gặp key lạ, giúp dễ phát hiện các dataset có
+# quy ước đặt tên khác thường (vd nhiều region subtag) mà vẫn không làm mất
+# ngôn ngữ đó khỏi kết quả đếm.
+FAMILIAR_LANG_CODE_RE = re.compile(r"^[a-z]{2,4}(-[A-Za-z0-9]+)?_[A-Z][a-z]{3}$")
 
 DATASETS = OrderedDict(
     [
-        ("Bible", "bible.json"),
+        ("TED", "ted.json"),
         ("FLORES", "flores.json"),
         ("NTREX", "ntrex.json"),
     ]
@@ -158,14 +175,28 @@ def analyze_dataset(path: Path):
     """
     records = load_records(path)
     lang_counts = Counter()
+    unfamiliar_keys = set()
     for rec in records:
         if not isinstance(rec, dict):
             continue
         for key, value in rec.items():
-            if not LANG_CODE_RE.match(key):
+            if key in NON_LANGUAGE_KEYS:
                 continue
-            if isinstance(value, str) and value.strip():
-                lang_counts[key] += 1
+            if not (isinstance(value, str) and value.strip()):
+                continue
+            # Mọi key KHÔNG nằm trong NON_LANGUAGE_KEYS đều được TÍNH là 1
+            # ngôn ngữ distinct, bất kể format của nó -- xem ghi chú ở
+            # NON_LANGUAGE_KEYS phía trên về lý do đổi từ regex cứng sang
+            # blocklist.
+            lang_counts[key] += 1
+            if not FAMILIAR_LANG_CODE_RE.match(key):
+                unfamiliar_keys.add(key)
+
+    if unfamiliar_keys:
+        print(f"  [i] {path.name}: {len(unfamiliar_keys)} mã ngôn ngữ không khớp mẫu "
+              f"NLLB-style quen thuộc (vẫn được TÍNH đầy đủ, không bị loại): "
+              f"{sorted(unfamiliar_keys)}")
+
     return set(lang_counts.keys()), lang_counts, len(records)
 
 
@@ -293,11 +324,11 @@ def plot_venn(lang_sets, names, popular_rows, union_all, output_dir: Path):
     # ---- legend: top popular languages, colored by which Venn region
     # (i.e. which combination of datasets) each one falls into ----
     if popular_rows:
-        priority = ["FLORES", "NTREX", "Bible"]  # prefer the more standardized code for the label
+        priority = ["FLORES", "NTREX", "TED"]  # prefer the more standardized code for the label
         legend_handles = []
         for row in popular_rows:
             present = {name: (row[name] != "-") for name in names}
-            bits = "".join("1" if present[n] else "0" for n in names)  # order matches names = [Bible, FLORES, NTREX]
+            bits = "".join("1" if present[n] else "0" for n in names)  # order matches names = [TED, FLORES, NTREX]
             color = REGION_COLORS.get(bits, REGION_COLORS["000"])
             code = next((row[n] for n in priority if row[n] != "-"), "not found")
             legend_handles.append(mpatches.Patch(facecolor=color, edgecolor="gray", label=f"{row['language']} ({code})"))
@@ -337,13 +368,13 @@ def plot_venn(lang_sets, names, popular_rows, union_all, output_dir: Path):
     ax_pos = ax.get_position()  # axes rectangle, in figure-fraction coords
     title_axes_frac = (page_center_fig_frac - ax_pos.x0) / ax_pos.width
 
-    ax.set_title(
-        "Language Coverage Across Bible / FLORES / NTREX Datasets\n"
-        f"Total unique languages across all 3 datasets (union of language sets): {len(union_all)}",
-        fontsize=22,
-        fontweight="bold",
-        pad=24,
-    )
+    # ax.set_title(
+    #     "Language Coverage Across TED-2025 / FLORES / NTREX Datasets\n"
+    #     f"Total unique languages across all 3 datasets (union of language sets): {len(union_all)}",
+    #     fontsize=22,
+    #     fontweight="bold",
+    #     pad=24,
+    # )
     ax.title.set_x(title_axes_frac)
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -398,7 +429,7 @@ def main():
         "--data_root",
         type=Path,
         default=script_dir.parent / "data" / "processed_alignment",
-        help="Folder containing bible.json / flores.json / ntrex.json (default: ../data/processed_alignment)",
+        help="Folder containing ted.json / flores.json / ntrex.json (default: ../data/processed_alignment)",
     )
     parser.add_argument(
         "--output_dir",
@@ -420,7 +451,7 @@ def main():
         if not path.exists():
             raise FileNotFoundError(
                 f"Could not find {path}. Pass --data_root to point at the folder "
-                f"containing bible.json / flores.json / ntrex.json."
+                f"containing ted.json / flores.json / ntrex.json."
             )
         lang_set, lang_counts, n_records = analyze_dataset(path)
         lang_sets[name] = lang_set
@@ -434,9 +465,9 @@ def main():
         )
 
     names = list(DATASETS.keys())
-    set_bible, set_flores, set_ntrex = (lang_sets[n] for n in names)
-    union_all = set_bible | set_flores | set_ntrex
-    inter_all = set_bible & set_flores & set_ntrex
+    set_ted, set_flores, set_ntrex = (lang_sets[n] for n in names)
+    union_all = set_ted | set_flores | set_ntrex
+    inter_all = set_ted & set_flores & set_ntrex
 
     print("=" * 60)
     print(f"TOTAL UNIQUE LANGUAGES ACROSS ALL 3 DATASETS (union): {len(union_all)}")

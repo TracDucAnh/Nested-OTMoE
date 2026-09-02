@@ -6,3 +6,7 @@ __pycache__/
 venv/
 *.png
 *.csv
+*.zip
+*.jsonl
+data/
+*.pdf

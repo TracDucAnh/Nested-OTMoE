@@ -13,7 +13,7 @@ Cac tinh nang chinh:
      clear memory sau moi lan chia, skip sample neu OOM ca khi batch_size = 1,
      tra ve batch_size goc ngay cho batch tiep theo.
   5. Dataset/DataLoader gom sample tu cac bo du lieu alignment duoc CHON qua --alignment_data
-     (flores / ntrex / bible, co the ket hop nhieu bo, vi du --alignment_data flores ntrex),
+     (flores / ntrex / ted, co the ket hop nhieu bo, vi du --alignment_data flores ntrex),
      shuffle roi sort theo do dai.
   6. 3 epoch, tqdm day du.
   7. argparse day du de tuy bien.
@@ -87,7 +87,7 @@ _HF_TOKEN_ENV_VARS = ("HF_TOKEN", "HUGGINGFACE_HUB_TOKEN", "HUGGING_FACE_HUB_TOK
 ALIGNMENT_DATA_FILENAMES = {
     "flores": "flores.json",
     "ntrex": "ntrex.json",
-    "bible": "bible.json",
+    "ted": "ted.json",
 }
 
 
@@ -134,10 +134,10 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--model_name_or_path", type=str, default="Qwen/Qwen1.5-MoE-A2.7B")
     p.add_argument("--data_dir", type=str, default="data/processed_alignment")
     p.add_argument("--alignment_data", type=str, nargs="+",
-                    default=["flores", "ntrex", "bible"],
+                    default=["flores", "ntrex", "ted"],
                     choices=sorted(ALIGNMENT_DATA_FILENAMES.keys()),
                     help="Chon 1 hoac nhieu bo du lieu alignment de finetune: flores, ntrex, "
-                         "bible. Co the ket hop nhieu bo, vi du: --alignment_data flores ntrex "
+                         "ted. Co the ket hop nhieu bo, vi du: --alignment_data flores ntrex "
                          "se chi dung flores + ntrex. Moi ten duoc anh xa toi 1 file JSON "
                          f"trong --data_dir: {ALIGNMENT_DATA_FILENAMES}.")
     p.add_argument("--output_dir", type=str,
@@ -357,7 +357,7 @@ def reduce_result_across_ranks(result: dict, device, world_size: int) -> dict:
 
 
 # ============================================================================================
-# Du lieu: doc flores/bible/ntrex -> flatten thanh list cau (moi field ngon ngu = 1 sample)
+# Du lieu: doc flores/ted/ntrex -> flatten thanh list cau (moi field ngon ngu = 1 sample)
 # ============================================================================================
 def load_all_sentences(data_dir: str, data_files: Sequence[str]) -> List[str]:
     sentences: List[str] = []
@@ -408,7 +408,7 @@ class SentenceDataset(Dataset):
 class LengthGroupedBatchSampler(Sampler[List[int]]):
     """Moi epoch: shuffle toan bo index -> sort theo do dai token -> gom batch -> shuffle
     thu tu cac batch. Buoc shuffle truoc khi sort giup cac cau cung nghia (cung id, khac
-    ngon ngu) trong flores/bible/ntrex khong bi dinh lien tuc voi nhau trong 1 batch."""
+    ngon ngu) trong flores/ted/ntrex khong bi dinh lien tuc voi nhau trong 1 batch."""
 
     def __init__(self, lengths: List[int], batch_size: int, seed: int = 42):
         self.lengths = lengths
@@ -1051,7 +1051,7 @@ def main():
         )
 
     # ------------------------------------------------------------------------------------ data
-    # --alignment_data (flores/ntrex/bible, co the ket hop) -> danh sach file JSON thuc te.
+    # --alignment_data (flores/ntrex/ted, co the ket hop) -> danh sach file JSON thuc te.
     # dict.fromkeys(...) de loai trung neu nguoi dung lo nhap trung ten (van giu thu tu).
     data_files = [ALIGNMENT_DATA_FILENAMES[name] for name in dict.fromkeys(args.alignment_data)]
     logger.info(f"Dang doc du lieu tu {args.data_dir}, alignment_data={args.alignment_data} "
