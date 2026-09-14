@@ -55,7 +55,7 @@ OUT_DIR = SCRIPT_DIR / "data" / "processed_alignment"
 #
 # Ví dụ: chỉ muốn giữ các record TED-2025 phủ nhiều ngôn ngữ (> 12 ngôn ngữ
 # / record) thì đặt TED2025_MIN_LANGS_PER_SAMPLE = 12.
-TED2025_MIN_LANGS_PER_SAMPLE = 30
+TED2025_MIN_LANGS_PER_SAMPLE = 0
 
 # --------------------------------------------------------------------------
 # BẢNG ÁNH XẠ TÊN SCRIPT UNICODE -> MÃ ISO 15924 (4 ký tự)
