@@ -1,35 +1,66 @@
 """
-Fine-tuning LoRA cho mo hinh Mixture-of-Experts ATH-MaaS/Marco-Nano-Instruct.
 
-Loss = L_LM (cross-entropy chuan) + lb_loss_coef * L_LB (load balancing loss chuan cua MoE,
-tinh tren cac router nam trong khoang layer duoc gan LoRA).
+How to run:
 
-Cac tinh nang chinh:
+torchrun --standalone --nproc_per_node=4 Qwen1.5-MoE-A2.7B-SNLI.py \
+  --model_name_or_path Qwen/Qwen1.5-MoE-A2.7B \
+  --data_file data/english_task/snli/train.json \
+  --batch_size 128 \
+  --save_steps 200 \
+  --push_to_hub 
+
+Fine-tuning LoRA cho mo hinh Mixture-of-Experts Qwen/Qwen1.5-MoE-A2.7B tren task SNLI
+(Natural Language Inference), theo huong "english-task-only" (khong dung du lieu alignment).
+
+Loss = L_LM (cross-entropy chuan, CHI tinh tren token cua nhan/label, prompt bi mask -100)
+       + lb_loss_coef * L_LB (load balancing loss chuan cua MoE, tinh tren cac router nam
+       trong khoang layer duoc gan LoRA).
+
+Cac tinh nang chinh (GIONG HET setting cua code alignment finetuning Qwen1.5-MoE-A2.7B.py):
   1. LoRA chi ap dung tren middle layers [L/3, 2L/3), chi len attention / router / experts,
-     moi thanh phan mot rank rieng (mac dinh: router r=4, attention r=16, experts r=16).
-  2. Checkpointing + resume tai bat ky epoch/step nao, luu moi 1000 step.
-  3. Luu LoRA weight tai training/finetuning/checkpoints/Macro-Nano-Instruct/.
-  4. Dynamic batching: batch_size mac dinh 512, khi OOM thi chia doi de tri (dequy),
+     moi thanh phan mot rank rieng (mac dinh: router r=4, attention r=16, experts r=16),
+     alpha=32, dropout=0.05.
+  2. Checkpointing + resume tai bat ky epoch/step nao, luu moi ~200 step (--save_steps).
+  3. Luu LoRA weight tai training/english-task-only/checkpoints/Qwen1.5-MoE-A2.7B-SNLI-Task-Only/.
+  4. Dynamic batching: batch_size mac dinh 128, khi OOM thi chia doi de tri (dequy),
      clear memory sau moi lan chia, skip sample neu OOM ca khi batch_size = 1,
      tra ve batch_size goc ngay cho batch tiep theo.
-  5. Dataset/DataLoader gom sample tu cac bo du lieu alignment duoc CHON qua --alignment_data
-     (flores / ntrex / ted, co the ket hop nhieu bo, vi du --alignment_data flores ntrex),
-     shuffle roi sort theo do dai.
+  5. Ho tro DDP (torchrun) giong het code alignment.
   6. 3 epoch, tqdm day du.
-  7. argparse day du de tuy bien.
+  7. Sau moi ~200 step (--save_steps) thi luu checkpoint local + push len HuggingFace Hub
+     (--push_to_hub, mac dinh True) voi ten repo la --hub_model_id
+     (mac dinh: Qwen1.5-MoE-A2.7B-SNLI-Task-Only).
+  8. lb_loss_coef (lambda load balancing) = 0.01 theo yeu cau, KHONG fallback ve config nhu
+     code alignment.
 
-Vi kien truc chi tiet cua Marco-Nano-Instruct khong duoc cung cap truoc, script nay
-TU DONG DO TIM cac module attention / router / experts bang ten (regex) thay vi hard-code,
-va cho phep override qua CLI neu can.
+DIEM KHAC BIET DUY NHAT so voi code alignment (do ban chat task khac nhau):
+  - Alignment: moi sample la 1 CAU don, loss LM tinh tren TOAN BO token cua cau do (unsupervised
+    next-token prediction, khong co "prompt" rieng).
+  - SNLI: day la task PHAN LOAI 3 lop (entailment / neutral / contradiction). Moi sample
+    (premise, hypothesis, label) duoc chuyen thanh 1 prompt dang instruction:
+
+        Premise: <premise>
+        Hypothesis: <hypothesis>
+        Question: What is the relationship between the premise and the hypothesis?
+        Choose one: entailment, neutral, or contradiction.
+        Answer: <label_word><eos>
+
+    Loss LM chuan (cross-entropy) van duoc dung, nhung CHI tinh tren phan "<label_word><eos>"
+    (phan prompt bi mask bang -100, giong cach lam SFT/instruction-tuning tieu chuan) — day
+    van la "loss LM tieu chuan", chi khac alignment o cho KHONG tinh tren prompt.
+
+Kien truc Qwen2MoeForCausalLM (router/experts dat ten theo quy uoc chuan cua HF transformers)
+van duoc TU DONG DO TIM module attention / router / experts bang regex (khong hard-code),
+giong het co che cua code alignment.
 
 Vi du chay:
-    python Macro-Nano-Instruct.py \
-        --model_name_or_path ATH-MaaS/Marco-Nano-Instruct \
-        --data_dir data/processed_alignment \
+    python Qwen1.5-MoE-A2.7B-SNLI.py \
+        --model_name_or_path Qwen/Qwen1.5-MoE-A2.7B \
+        --data_file data/english_task/snli/train.json \
         --push_to_hub
 
 Resume:
-    python Macro-Nano-Instruct.py --resume_from_checkpoint auto
+    python Qwen1.5-MoE-A2.7B-SNLI.py --resume_from_checkpoint auto
 """
 
 import argparse
@@ -43,7 +74,7 @@ import random
 import re
 import time
 from contextlib import nullcontext
-from typing import List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.distributed as dist
@@ -72,19 +103,15 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-logger = logging.getLogger("marco_nano_finetune")
+logger = logging.getLogger("qwen15_moe_snli_finetune")
 
 
 # Cac ten bien moi truong pho bien cho HF token, thu theo thu tu nay
 _HF_TOKEN_ENV_VARS = ("HF_TOKEN", "HUGGINGFACE_HUB_TOKEN", "HUGGING_FACE_HUB_TOKEN")
 
-# Anh xa ten alignment dataset (dung trong --alignment_data) -> ten file JSON tuong ung
-# trong --data_dir. Them entry moi vao day neu sau nay co them bo du lieu alignment khac.
-ALIGNMENT_DATA_FILENAMES = {
-    "flores": "flores.json",
-    "ntrex": "ntrex.json",
-    "ted": "ted.json",
-}
+# Nhan SNLI chuan: 0 = entailment, 1 = neutral, 2 = contradiction.
+# SNLI goc con co the co label = -1 (khong dong thuan giua annotator) -> bi loc bo khi doc du lieu.
+LABEL_TO_WORD = {0: "entailment", 1: "neutral", 2: "contradiction"}
 
 
 def load_hf_token(env_file: Optional[str], cli_token: Optional[str]) -> Optional[str]:
@@ -124,59 +151,51 @@ def load_hf_token(env_file: Optional[str], cli_token: Optional[str]) -> Optional
 # Argparse
 # ============================================================================================
 def build_argparser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="LoRA finetuning cho MoE Marco-Nano-Instruct")
+    p = argparse.ArgumentParser(description="LoRA finetuning cho MoE Qwen1.5-MoE-A2.7B tren task SNLI")
 
     # Model / data / output
-    p.add_argument("--model_name_or_path", type=str, default="ATH-MaaS/Marco-Nano-Instruct")
-    p.add_argument("--data_dir", type=str, default="data/processed_alignment")
-    p.add_argument("--alignment_data", type=str, nargs="+",
-                    default=["flores", "ntrex", "ted"],
-                    choices=sorted(ALIGNMENT_DATA_FILENAMES.keys()),
-                    help="Chon 1 hoac nhieu bo du lieu alignment de finetune: flores, ntrex, "
-                         "ted. Co the ket hop nhieu bo, vi du: --alignment_data flores ntrex "
-                         "se chi dung flores + ntrex. Moi ten duoc anh xa toi 1 file JSON "
-                         f"trong --data_dir: {ALIGNMENT_DATA_FILENAMES}.")
+    p.add_argument("--model_name_or_path", type=str, default="Qwen/Qwen1.5-MoE-A2.7B")
+    p.add_argument("--data_file", type=str, default="data/english_task/snli/train.json",
+                    help="Duong dan file JSON SNLI (list cac object {premise, hypothesis, label}).")
     p.add_argument("--output_dir", type=str,
-                    default="training/finetuning/checkpoints/Macro-Nano-Instruct")
+                    default="training/english-task-only/checkpoints/Qwen1.5-MoE-A2.7B-SNLI-Task-Only")
     p.add_argument("--max_samples", type=int, default=None,
                     help="Gioi han so sample (debug/smoke test), None = dung het du lieu")
 
     # Hugging Face Hub
     p.add_argument("--push_to_hub", action="store_true", default=True)
     p.add_argument("--no_push_to_hub", dest="push_to_hub", action="store_false")
-    p.add_argument("--hub_model_id", type=str, default="ducanhdinh/Macro-Nano-Instruct-Finetuning")
+    p.add_argument("--hub_model_id", type=str, default="ducanhdinh/Qwen1.5-MoE-A2.7B-SNLI-Task-Only",
+                    help="Doi lai namespace/username HF cua ban neu khac 'ducanhdinh'.")
     p.add_argument("--hub_private", action="store_true")
     p.add_argument("--env_file", type=str, default=".env",
                     help="Duong dan file .env chua HF_TOKEN, tu dong nap bang python-dotenv")
     p.add_argument("--hf_token", type=str, default=None,
                     help="Override HF token thu cong, uu tien cao hon .env/bien moi truong")
 
-    # Training schedule
+    # Training schedule (giong het code alignment finetuning)
     p.add_argument("--num_train_epochs", type=int, default=3)
     p.add_argument("--batch_size", type=int, default=512)
     p.add_argument("--min_batch_size", type=int, default=1)
-    p.add_argument("--max_length", type=int, default=256)
+    p.add_argument("--max_length", type=int, default=128,
+                    help="Prompt SNLI ngan hon cau alignment nhieu -> mac dinh 128 la du.")
     p.add_argument("--learning_rate", type=float, default=2e-4)
     p.add_argument("--weight_decay", type=float, default=0.0)
     p.add_argument("--warmup_ratio", type=float, default=0.03)
     p.add_argument("--gradient_clip_norm", type=float, default=1.0)
 
     # MoE loss
-    p.add_argument("--lb_loss_coef", type=float, default=None,
-                    help="He so cho load-balancing loss. None = lay tu config.router_aux_loss_coef, "
-                         "fallback 0.001 (dung mac dinh cua Qwen3MoeConfig — kien truc qwen3_moe cua "
-                         "Marco-Nano-Instruct, KHONG phai 0.01 nhu ban truoc). LUU Y: cac checkpoint "
-                         "da POST-TRAIN/INSTRUCT (nhu Marco-Nano-Instruct) doi khi luu san "
-                         "router_aux_loss_coef=0.0 trong config (vi aux loss chi can luc pretrain, "
-                         "khong dung khi inference) -> neu vay script se tu dong TAT L_LB (lb_loss_coef "
-                         "= 0.0) tru khi ban chu dong truyen --lb_loss_coef > 0. Kiem tra log dong "
-                         "'lb_loss_coef (...) = ...' luc khoi dong de chac chan gia tri dang dung.")
+    p.add_argument("--lb_loss_coef", type=float, default=0.01,
+                    help="He so (lambda) cho load-balancing loss. Mac dinh 0.01 theo yeu cau "
+                         "(KHAC voi code alignment, code do fallback ve router_aux_loss_coef "
+                         "cua config neu khong truyen).")
     p.add_argument("--num_local_experts", type=int, default=None,
                     help="Override so luong experts, None = tu doc trong config model")
     p.add_argument("--num_experts_per_tok", type=int, default=None,
                     help="Override top-k router, None = tu doc trong config model")
 
-    # LoRA - rank rieng cho tung thanh phan kien truc (goi bang PEFT rank_pattern)
+    # LoRA - rank rieng cho tung thanh phan kien truc (goi bang PEFT rank_pattern) — GIONG
+    # HET gia tri mac dinh cua code alignment finetuning.
     p.add_argument("--lora_r_router", type=int, default=4,
                     help="Rank LoRA rieng cho router/gating (mac dinh 4).")
     p.add_argument("--lora_r_attention", type=int, default=16,
@@ -189,7 +208,8 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--lora_layer_end_ratio", type=float, default=2.0 / 3.0)
 
     # Checkpoint / resume
-    p.add_argument("--save_steps", type=int, default=200)
+    p.add_argument("--save_steps", type=int, default=200,
+                    help="Luu checkpoint local + push len hub moi N step (mac dinh ~1K step).")
     p.add_argument("--resume_from_checkpoint", type=str, default=None,
                     help="'auto' de tu tim checkpoint moi nhat trong output_dir, hoac duong dan cu the")
 
@@ -206,22 +226,19 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--log_every", type=int, default=10, help="Cap nhat plot loss moi N step")
     p.add_argument("--smooth_window", type=int, default=50,
                     help="So step lien tiep duoc gom lai (tinh trung binh cong) cho moi diem "
-                         "tren loss_curve_smoothed.png, giup duong cong de doc hon so voi ve "
-                         "tho tung step (rat messy do nhieu step-to-step, dac biet la L_LB).")
+                         "tren cac duong *_smoothed.png.")
 
     # Distributed (DDP qua torchrun: doc RANK / LOCAL_RANK / WORLD_SIZE tu bien moi truong,
     # khong can truyen tay). Chay 1 GPU binh thuong neu khong launch qua torchrun.
     p.add_argument("--nccl_timeout_minutes", type=int, default=30,
-                    help="Timeout cho moi collective op cua NCCL. Mac dinh cua PyTorch la "
-                         "10 phut, rat de bi NCCL Watchdog kill oan khi co buoc cham (load "
-                         "checkpoint lon luc resume, push_to_hub tren rank 0, tokenize du "
-                         "lieu lon, mang cham giua cac node...) -> tang len 30 phut.")
+                    help="Timeout cho moi collective op cua NCCL (mac dinh PyTorch la 10 phut, "
+                         "tang len 30 phut de chiu duoc checkpoint/push cham).")
 
     return p
 
 
 # ============================================================================================
-# Utils chung
+# Utils chung (giong het code alignment)
 # ============================================================================================
 def set_seed(seed: int):
     random.seed(seed)
@@ -243,14 +260,9 @@ def clear_memory():
 
 
 # ============================================================================================
-# Distributed (DDP qua torchrun)
+# Distributed (DDP qua torchrun) — giong het code alignment
 # ============================================================================================
 def setup_distributed(nccl_timeout_minutes: int):
-    """torchrun tu dong set san RANK / LOCAL_RANK / WORLD_SIZE trong bien moi truong. Neu
-    chay bang `python script.py` binh thuong (khong qua torchrun) thi WORLD_SIZE khong ton
-    tai hoac = 1 -> coi nhu single-process, KHONG init distributed, code chay y het ban goc
-    (backward-compatible). device tra ve = None khi khong distributed, de main() giu nguyen
-    --device / --device_map nguoi dung tu chon thay vi bi ghi de."""
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -262,10 +274,6 @@ def setup_distributed(nccl_timeout_minutes: int):
     if not torch.cuda.is_available():
         raise RuntimeError("Distributed training (DDP) yeu cau CUDA (backend nccl).")
 
-    # NCCL Watchdog mac dinh timeout sau 10 phut khong nhan duoc collective op tiep theo tu
-    # 1 rank -> crash toan bo job. Cac buoc cham (tokenize du lieu lon, luu/push checkpoint
-    # tren rank 0, load model lon luc resume, straggler GPU...) rat de vuot qua 10 phut o
-    # cluster/mang cham -> tang len 30 phut de chiu duoc ma khong bi kill oan.
     os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
     os.environ.setdefault("NCCL_TIMEOUT", str(nccl_timeout_minutes * 60))
 
@@ -294,34 +302,12 @@ def is_main_process(rank: int) -> bool:
 
 
 def unwrap_model(model):
-    """PeftModel.save_pretrained() khong ton tai tren DistributedDataParallel -> phai lay
-    .module (peft model that su ben trong) ra truoc khi save/push checkpoint."""
     return model.module if hasattr(model, "module") else model
 
 
 def sync_grads_across_ranks(trainable_params, world_size: int):
-    """All-reduce (trung binh) gradient THU CONG, goi DUNG 1 LAN sau khi toan bo cac lan
-    backward() cua 1 step (ke ca cac sub-batch sinh ra do dynamic OOM splitting) da chay
-    xong. Xem giai thich chi tiet tai noi goi model.no_sync() trong training loop ve ly do
-    khong the de DDP tu dong sync nhu binh thuong.
-
-    [FIX CHAM NANG VOI MoE NHIEU EXPERTS]
-    Ban cu goi dist.all_reduce() RIENG LE cho TUNG tham so (for p in trainable_params:
-    dist.all_reduce(p.grad)). LoRA o day gan tren attention + router + TAT CA experts
-    trong 1/3 so layer giua -> voi backbone co nhieu expert, so luong tensor gradient
-    (LoRA A/B x moi expert x moi layer x moi projection) co the len toi hang nghin. Moi
-    dist.all_reduce() la 1 NCCL kernel + 1 lan dong bo (fixed overhead) RIENG, chay TUAN
-    TU trong vong lap Python (khong gop, khong overlap voi tinh toan) -> tong thoi gian
-    sync tang gan nhu TUYEN TINH theo so luong expert, dung trieu chung "cang nhieu
-    expert cang cham".
-
-    Fix: GOM (flatten) toan bo gradient thanh 1 buffer lien tuc DUY NHAT cho moi dtype
-    (thuong LoRA chi co 1 dtype nen thuc te la 1 buffer), goi dist.all_reduce() DUNG 1
-    LAN tren buffer do, roi tach (unflatten) gia tri da all-reduce nguoc lai vao .grad
-    cua tung tham so. Ket qua toan hoc giong het ban cu (van la trung binh cong gradient
-    qua cac rank cho tung tham so, khong doi logic), chi giam SO LUONG NCCL CALL tu
-    O(so luong tensor) xuong O(so luong dtype) (~1). Chi phi bo sung (copy vao/ra buffer)
-    ret nho vi day chi la gradient cua LoRA, khong phai toan bo base model."""
+    """All-reduce (trung binh) gradient THU CONG, gop thanh 1 buffer lien tuc de giam so
+    luong NCCL call (xem giai thich chi tiet trong code alignment finetuning)."""
     from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
     grads_by_dtype = {}
@@ -338,11 +324,10 @@ def sync_grads_across_ranks(trainable_params, world_size: int):
 
 
 def reduce_result_across_ranks(result: dict, device, world_size: int) -> dict:
-    """Gop loss / so sample cua tat ca rank lai de log/plot phan anh dung so lieu TOAN CUC,
-    thay vi chi so lieu cua rieng shard tren rank 0. Cung dung de dong bo quyet dinh
-    do_step giua cac rank (xem training loop)."""
+    """Gop loss / accuracy / so sample cua tat ca rank lai de log/plot phan anh dung so lieu
+    TOAN CUC, va de dong bo quyet dinh do_step giua cac rank."""
     loss_t = torch.tensor(
-        [result["lm_loss"], result["lb_loss"], result["total_loss"]],
+        [result["lm_loss"], result["lb_loss"], result["total_loss"], result["label_acc"]],
         device=device, dtype=torch.float32,
     )
     count_t = torch.tensor(
@@ -356,92 +341,114 @@ def reduce_result_across_ranks(result: dict, device, world_size: int) -> dict:
         "lm_loss": loss_t[0].item(),
         "lb_loss": loss_t[1].item(),
         "total_loss": loss_t[2].item(),
+        "label_acc": loss_t[3].item(),
         "n_processed": int(count_t[0].item()),
         "n_skipped": int(count_t[1].item()),
     }
 
 
 # ============================================================================================
-# Du lieu: doc flores/ted/ntrex -> flatten thanh list cau (moi field ngon ngu = 1 sample)
+# Du lieu SNLI: doc JSON -> build prompt instruction + mask label cho tung sample
 # ============================================================================================
-def load_all_sentences(data_dir: str, data_files: Sequence[str]) -> List[str]:
-    sentences: List[str] = []
-    for fname in data_files:
-        path = os.path.join(data_dir, fname)
-        if not os.path.exists(path):
-            logger.warning(f"Khong tim thay file {path}, bo qua.")
+def load_snli_records(data_file: str) -> List[Dict]:
+    """Doc file JSON dang list cac object {"premise": ..., "hypothesis": ..., "label": 0/1/2}.
+    Bo qua record thieu field, hoac label khong nam trong {0, 1, 2} (SNLI goc dung -1 cho
+    cac cau khong dong thuan giua annotator)."""
+    if not os.path.exists(data_file):
+        raise FileNotFoundError(f"Khong tim thay file du lieu SNLI: {data_file}")
+    with open(data_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    records: List[Dict] = []
+    n_skipped = 0
+    for rec in data:
+        if not isinstance(rec, dict):
+            n_skipped += 1
             continue
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        records = list(data.values()) if isinstance(data, dict) else data
-        n_before = len(sentences)
-        for rec in records:
-            if not isinstance(rec, dict):
-                continue
-            for key, val in rec.items():
-                if key == "id":
-                    continue
-                if isinstance(val, str) and val.strip():
-                    sentences.append(val.strip())
-        logger.info(f"{fname}: +{len(sentences) - n_before} cau, tong so record = {len(records)}")
-    return sentences
+        premise = rec.get("premise")
+        hypothesis = rec.get("hypothesis")
+        label = rec.get("label")
+        if premise is None or hypothesis is None or label is None:
+            n_skipped += 1
+            continue
+        try:
+            label = int(label)
+        except (TypeError, ValueError):
+            n_skipped += 1
+            continue
+        if label not in LABEL_TO_WORD:
+            n_skipped += 1
+            continue
+        records.append({
+            "premise": str(premise).strip(),
+            "hypothesis": str(hypothesis).strip(),
+            "label": label,
+        })
+    logger.info(f"Da doc {len(records)} sample hop le tu {data_file} (bo qua {n_skipped} record loi/label khong hop le).")
+    return records
+
+
+def build_prompt(premise: str, hypothesis: str) -> str:
+    """Prompt dang instruction cho NLI. Phan sau 'Answer:' la phan model phai sinh ra va la
+    phan DUY NHAT duoc tinh loss (xem build_full_text + mask trong forward_backward_one_subbatch)."""
+    return (
+        f"Premise: {premise}\n"
+        f"Hypothesis: {hypothesis}\n"
+        f"Question: What is the relationship between the premise and the hypothesis? "
+        f"Choose one: entailment, neutral, or contradiction.\n"
+        f"Answer:"
+    )
+
+
+def build_full_text(premise: str, hypothesis: str, label: int, eos_token: str) -> Tuple[str, str]:
+    prompt = build_prompt(premise, hypothesis)
+    label_word = LABEL_TO_WORD[label]
+    full_text = f"{prompt} {label_word}{eos_token}"
+    return prompt, full_text
+
+
+def build_examples(records: List[Dict], eos_token: str) -> List[Dict]:
+    """Tien xu ly 1 lan: moi record -> {"prompt", "full_text", "label", "label_word"}.
+    Tranh phai build lai chuoi prompt/full_text moi lan __getitem__/moi epoch."""
+    examples = []
+    for rec in records:
+        prompt, full_text = build_full_text(rec["premise"], rec["hypothesis"], rec["label"], eos_token)
+        examples.append({
+            "prompt": prompt,
+            "full_text": full_text,
+            "label": rec["label"],
+            "label_word": LABEL_TO_WORD[rec["label"]],
+        })
+    return examples
 
 
 def compute_lengths(tokenizer, texts: Sequence[str], chunk_size: int = 1000) -> List[int]:
     lengths: List[int] = []
     for i in tqdm(range(0, len(texts), chunk_size), desc="Tinh do dai token cho toan bo sample"):
         chunk = texts[i:i + chunk_size]
-        enc = tokenizer(chunk, add_special_tokens=False)
+        enc = tokenizer(chunk, add_special_tokens=True)
         lengths.extend(len(ids) for ids in enc["input_ids"])
     return lengths
 
 
-class SentenceDataset(Dataset):
-    """Moi sample la 1 cau (string), duoc tokenize sau trong vong lap training
-    de ho tro chia nho batch khi OOM."""
+class SNLIDataset(Dataset):
+    """Moi sample la 1 dict {"prompt", "full_text", "label", "label_word"} (da build san),
+    tokenize thuc su duoc lam sau trong vong lap training de ho tro chia nho batch khi OOM."""
 
-    def __init__(self, texts: List[str]):
-        self.texts = texts
+    def __init__(self, examples: List[Dict]):
+        self.examples = examples
 
     def __len__(self):
-        return len(self.texts)
+        return len(self.examples)
 
     def __getitem__(self, idx):
-        return self.texts[idx]
+        return self.examples[idx]
 
 
 class LengthGroupedBatchSampler(Sampler[List[int]]):
-    """Moi epoch: shuffle toan bo index (TREN TOAN BO DATASET, CHUA chia rank) -> sort theo
-    do dai token -> gom thanh cac "mega-batch" kich thuoc batch_size * world_size -> shuffle
-    thu tu cac mega-batch -> MOI mega-batch duoc chia deu thanh world_size phan LIEN TIEP
-    (moi phan dai batch_size, da nam gan nhau ve do dai vi vua duoc sort), rank r nhan phan
-    thu r. Buoc shuffle truoc khi sort giup cac cau cung nghia (cung id, khac ngon ngu)
-    trong flores/ted/ntrex khong bi dinh lien tuc voi nhau trong 1 batch.
-
-    [FIX STRAGGLER GIUA CAC RANK KHI CHAY DDP NHIEU GPU]
-    Ban cu: shard_texts_for_ddp() chia du lieu cho tung rank TRUOC (round-robin theo thu tu
-    file goc), roi MOI rank tu shuffle + sort + gom batch TREN SHARD RIENG cua minh. Du
-    dung chung 1 seed, permutation do duoc ap dung tren 2 danh sach KHAC NHAU ve noi dung
-    (2 shard khac nhau) -> do dai cau trong batch #k cua rank nay co the rat khac batch #k
-    cua rank kia (vd rank 0 dang xu ly toan cau ngan trong khi rank 2 dang xu ly toan cau
-    dai gan --max_length, hoac te hon la dinh OOM phai chia doi de quy -> rat cham). Vi 1
-    step trong DDP luon co it nhat 2 diem dong bo BAT BUOC moi rank cho nhau
-    (reduce_result_across_ranks, sync_grads_across_ranks), rank nhanh phai NGOI CHO rank
-    cham nhat xong moi duoc di tiep -> ca job bi keo cham theo GPU cham nhat (straggler
-    effect), gay ra hien tuong thoi gian moi step khong on dinh (step nay nhanh, step ke
-    dot ngot cham hon han).
-
-    Fix: KHONG chia rank truoc nua. Sort do dai tren TOAN BO dataset — moi rank tu tinh lai
-    y het nhau (cung seed + cung du lieu goc + cung logic, hoan toan deterministic) nen
-    KHONG can giao tiep gi de dong bo buoc nay. Moi mega-batch (gom batch_size * world_size
-    sample GAN NHAU ve do dai sau khi sort) roi moi duoc chia deu cho cac rank -> o CUNG 1
-    step, moi rank luon nhan cac cau co do dai XAP XI NHAU, giam han straggler va giup thoi
-    gian moi step on dinh hon giua cac GPU.
-
-    Luu y ve phan du: neu tong so sample khong chia het cho (batch_size * world_size), phan
-    du cuoi epoch se bi bo — GIONG HET NHAU tren moi rank (deterministic) nen khong lam
-    lech so step giua cac rank (bat buoc phai vay, xem canh bao trong main() ve NCCL
-    Watchdog neu cac rank co so step khac nhau)."""
+    """Giong het code alignment finetuning: moi epoch shuffle toan bo index (TREN TOAN BO
+    DATASET, CHUA chia rank) -> sort theo do dai token -> gom mega-batch -> shuffle thu tu
+    mega-batch -> chia deu LIEN TIEP cho cac rank, giup moi rank luon nhan sample co do dai
+    xap xi nhau (giam straggler effect khi chay DDP nhieu GPU)."""
 
     def __init__(self, lengths: List[int], batch_size: int, world_size: int = 1,
                  rank: int = 0, seed: int = 42):
@@ -463,9 +470,9 @@ class LengthGroupedBatchSampler(Sampler[List[int]]):
 
         mega_size = self.batch_size * self.world_size
         n_mega = len(indices) // mega_size
-        indices = indices[: n_mega * mega_size]  # bo phan du, giong het tren moi rank
+        indices = indices[: n_mega * mega_size]
         mega_batches = [indices[i:i + mega_size] for i in range(0, len(indices), mega_size)]
-        g.shuffle(mega_batches)  # shuffle thu tu cac mega-batch (van giu cau gan nhau/do dai trong tung mega-batch)
+        g.shuffle(mega_batches)
 
         start = self.rank * self.batch_size
         end = start + self.batch_size
@@ -482,6 +489,7 @@ class LengthGroupedBatchSampler(Sampler[List[int]]):
 
 # ============================================================================================
 # Tu dong tim target module cho LoRA: attention / router / experts trong middle layers
+# (giong het code alignment finetuning)
 # ============================================================================================
 LAYER_IDX_PATTERN = re.compile(r"\.(?:layers|h|blocks|block)\.(\d+)\.")
 
@@ -499,10 +507,9 @@ def is_router_leaf_name(name: str) -> bool:
 
 
 def build_lora_target_modules(model, layer_indices: set):
-    """Tra ve (targets, kinds): targets la list ten module Linear duoc chon lam LoRA
-    target trong khoang layer_indices, kinds la dict ten module -> "router" / "attention" /
-    "expert", dung de gan rank rieng cho tung thanh phan (--lora_r_router / 
-    --lora_r_attention / --lora_r_experts) qua rank_pattern cua PEFT."""
+    """Tra ve (targets, kinds): targets la list ten module Linear duoc chon lam LoRA target
+    trong khoang layer_indices, kinds la dict ten module -> "router" / "attention" / "expert",
+    dung de gan rank rieng cho tung thanh phan qua rank_pattern cua PEFT."""
     targets = []
     kinds = {}
     for name, module in model.named_modules():
@@ -526,10 +533,6 @@ def build_lora_target_modules(model, layer_indices: set):
 def register_router_hooks(peft_model, router_names: List[str], cache_list: list):
     """Hook forward tren cac router Linear (da duoc PEFT wrap LoRA) de lay logits phuc vu
     tinh load-balancing loss. Khong detach de gradient van chay ve LoRA cua router."""
-    # Luu y: sau khi get_peft_model() wrap, module tai vi tri router khong con la
-    # torch.nn.Linear thuan tuy nua ma la peft.tuners.lora.Linear (chi ke thua nn.Module +
-    # LoraLayer, KHONG ke thua nn.Linear) -> khong duoc loc theo isinstance(nn.Linear) o day,
-    # chi can match dung ten (da duoc build_lora_target_modules xac dinh tu truoc).
     hooks = []
     router_name_set = set(router_names)
     if not router_name_set:
@@ -570,49 +573,26 @@ def infer_moe_dims(config, args):
 
 
 # ============================================================================================
-# MoE loss chuan: LM loss + Load Balancing loss (Switch/Mixtral style)
+# MoE loss chuan: LM loss (chi tren label) + Load Balancing loss (Switch/Mixtral style)
 # ============================================================================================
 def compute_load_balancing_loss(router_logits_list: List[torch.Tensor], attention_mask: torch.Tensor,
                                  num_experts: int, top_k: int):
-    """attention_mask: [batch, seq_len] (1 = token that, 0 = padding), CUNG kich thuoc batch/seq
-    voi input da dua vao model. Phai loai bo vi tri padding truoc khi tinh bat ky thong ke nao,
-    vi khong thi:
-      - Token padding (pad_token = eos_token, lap lai giong het nhau) se cho ra router logit
-        gan nhu giong nhau moi lan -> thoi phong / lam lech tan suat chon expert mot cach he
-        thong, khong phan anh dung phan bo cua token that trong cau.
-      - So luong token dung de tinh trung binh (N) cung bi dem du them ca padding, lam sai ca
-        f_i (ti le token/expert) lan gia tri loss cuoi cung.
-    Day la loi tuong tu nhu cach L_LM da loai padding qua ignore_index=-100, chi khac la L_LB
-    truoc do khong nhan attention_mask nen khong loc duoc."""
-    mask_flat = attention_mask.reshape(-1).bool()  # [tokens], cung thu tu voi logits.reshape(-1, ...)
+    """Giong het code alignment finetuning: loai bo padding truoc khi tinh thong ke, noi
+    (concat) token cua TAT CA router layer da hook lai thanh 1 tap DUY NHAT roi moi tinh
+    f_i / P_i / loss (dung cach cua HF load_balancing_loss_func, KHONG lay mean loss rieng
+    tung layer vi ve toan hoc khong tuong duong)."""
+    mask_flat = attention_mask.reshape(-1).bool()
 
-    # QUAN TRONG: HF (load_balancing_loss_func trong modeling_mixtral.py, dung chung cho ca
-    # Qwen2MoE va Qwen3MoE — kien truc qwen3_moe cua Marco-Nano-Instruct) NOI (torch.cat, dim=0)
-    # token cua TAT CA cac router layer lai thanh MOT tap thong ke duy nhat, roi MOI tinh f_i
-    # (ti le token/expert) va P_i (xac suat trung binh/expert) tren tap da noi do -> chi 1 loss
-    # tong the cho toan bo cac layer.
-    # Ban dau code o day tinh rieng tung layer (f_i, P_i, loss theo layer) roi lay .mean() cac
-    # loss lai -> VE TOAN HOC KHONG TUONG DUONG voi cach cua HF, vi:
-    #   mean_layer( sum_i f_i^(layer) * P_i^(layer) )  !=  sum_i mean_layer(f_i^(layer)) * mean_layer(P_i^(layer))
-    # (hai ve chi bang nhau neu khong co hiep phuong sai giua cac layer, noi chung la sai).
-    # -> sua lai: concat truoc, tinh thong ke + loss SAU, dung 1 lan cho toan bo cac router
-    # trong router_logits_list (van chi gom cac layer da duoc hook, tuc la cac layer nam trong
-    # khoang layer duoc gan LoRA — day la lua chon co chu dich cua script, khac voi mac dinh cua
-    # Qwen la tinh tren TOAN BO router layer cua model).
     valid_logits = []
     for logits in router_logits_list:
-        logits = logits.reshape(-1, logits.shape[-1])  # [tokens, num_experts]
+        logits = logits.reshape(-1, logits.shape[-1])
         if logits.shape[0] == mask_flat.shape[0]:
-            logits = logits[mask_flat]  # bo cac vi tri padding truoc khi tinh thong ke
+            logits = logits[mask_flat]
         else:
-            # Kien truc MoE nay flatten/reshape token theo thu tu khac gia dinh o tren (batch
-            # truoc, seq sau) -> khong the index an toan theo mask_flat, bo qua loc padding cho
-            # lan nay thay vi index sai vi tri (van con tot hon crash, nhung se kem chinh xac).
             logger.warning(
                 "compute_load_balancing_loss: kich thuoc router logits "
                 f"({logits.shape[0]}) khong khop attention_mask ({mask_flat.shape[0]}) -> "
-                "bo qua loc padding cho lan tinh nay, kiem tra lai thu tu flatten token cua "
-                "kien truc MoE nay neu thay canh bao lap lai nhieu lan."
+                "bo qua loc padding cho lan tinh nay."
             )
         if logits.shape[0] > 0:
             valid_logits.append(logits)
@@ -620,29 +600,47 @@ def compute_load_balancing_loss(router_logits_list: List[torch.Tensor], attentio
     if not valid_logits:
         return torch.tensor(0.0, device=attention_mask.device)
 
-    concatenated_logits = torch.cat(valid_logits, dim=0)  # [tong_token_qua_cac_layer, num_experts]
+    concatenated_logits = torch.cat(valid_logits, dim=0)
     routing_weights = F.softmax(concatenated_logits, dim=-1)
-    _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)  # [tokens, top_k]
-    expert_mask = F.one_hot(selected_experts, num_experts).float()  # [tokens, top_k, num_experts]
-    # LUU Y: .mean(dim=0) da chia trung binh theo so token roi (cho ra f_i dung chuan,
-    # trong khoang [0,1]) -> KHONG duoc chia them cho logits.shape[0] mot lan nua (bug
-    # cu chia 2 lan lam L_LB nho gia tao ~N lan, N = so token trong sub-batch dang tinh).
-    tokens_per_expert = expert_mask.sum(dim=1).mean(dim=0)  # [num_experts], = f_i
-    avg_prob_per_expert = routing_weights.mean(dim=0)  # [num_experts]
+    _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+    expert_mask = F.one_hot(selected_experts, num_experts).float()
+    tokens_per_expert = expert_mask.sum(dim=1).mean(dim=0)  # f_i, da chia trung binh theo token
+    avg_prob_per_expert = routing_weights.mean(dim=0)
     return num_experts * torch.sum(tokens_per_expert * avg_prob_per_expert)
 
 
-def forward_backward_one_subbatch(sub_texts, tokenizer, model, max_length, device,
+def forward_backward_one_subbatch(sub_examples, tokenizer, model, max_length, device,
                                    router_logits_cache, num_experts, top_k, lb_loss_coef,
                                    loss_weight):
-    """Tokenize + forward + backward cho 1 sub-batch (co the la toan bo batch hoac 1 mieng sau
-    khi chia doi vi OOM). Tra ve (lm_loss_val, lb_loss_val, total_loss_val, n_samples)."""
-    enc = tokenizer(sub_texts, padding=True, truncation=True, max_length=max_length,
+    """Tokenize + forward + backward cho 1 sub-batch (co the la toan bo batch hoac 1 mieng
+    sau khi chia doi vi OOM). moi sample trong sub_examples la dict {"prompt", "full_text",
+    "label", "label_word"}.
+
+    L_LM van la cross-entropy TIEU CHUAN cho next-token prediction, nhung CHI tinh tren phan
+    "<label_word><eos>" (phan prompt + padding bi mask -100), giong cach lam SFT/instruction
+    tuning tieu chuan: model duoc day toan bo prompt lam context (khong ton loss) roi chi
+    hoc sinh ra dung nhan.
+
+    Tra ve (lm_loss_val, lb_loss_val, total_loss_val, label_acc, n_samples)."""
+    full_texts = [ex["full_text"] for ex in sub_examples]
+    prompts = [ex["prompt"] for ex in sub_examples]
+
+    enc = tokenizer(full_texts, padding=True, truncation=True, max_length=max_length,
                      return_tensors="pt")
     input_ids = enc["input_ids"].to(device)
     attention_mask = enc["attention_mask"].to(device)
     labels = input_ids.clone()
-    labels[attention_mask == 0] = -100
+    labels[attention_mask == 0] = -100  # mask padding
+
+    seq_len = labels.shape[1]
+    # Do dai token cua prompt (ke ca special token neu tokenizer tu them) -> dung de mask
+    # toan bo phan prompt trong labels, chi giu lai phan "<label_word><eos>" de tinh loss.
+    prompt_lens = []
+    for p in prompts:
+        ids = tokenizer(p, add_special_tokens=True, truncation=True, max_length=max_length)["input_ids"]
+        prompt_lens.append(min(len(ids), seq_len))
+    for i, plen in enumerate(prompt_lens):
+        labels[i, :plen] = -100
 
     router_logits_cache.clear()
     outputs = model(input_ids=input_ids, attention_mask=attention_mask)
@@ -665,37 +663,39 @@ def forward_backward_one_subbatch(sub_texts, tokenizer, model, max_length, devic
     total_loss = lm_loss + lb_loss_coef * lb_loss
     (total_loss * loss_weight).backward()
 
-    return lm_loss.item(), lb_loss.item(), total_loss.item(), len(sub_texts)
+    # Diagnostics: do chinh xac (xap xi) cua token DAU TIEN cua nhan (entailment/neutral/
+    # contradiction thuong bat dau bang 1 subword rieng) — chi de theo doi qua trinh train,
+    # KHONG dung trong loss.
+    with torch.no_grad():
+        correct, counted = 0, 0
+        for i, plen in enumerate(prompt_lens):
+            pos = plen - 1  # shift_logits[i, pos] du doan token tai vi tri labels[i, plen]
+            if 0 <= pos < shift_labels.shape[1] and shift_labels[i, pos].item() != -100:
+                pred = shift_logits[i, pos].argmax(dim=-1).item()
+                target = shift_labels[i, pos].item()
+                counted += 1
+                correct += int(pred == target)
+        label_acc = (correct / counted) if counted > 0 else 0.0
+
+    return lm_loss.item(), lb_loss.item(), total_loss.item(), label_acc, len(sub_examples)
 
 
-def run_batch_with_dynamic_oom_handling(batch_texts, tokenizer, model, max_length, device,
+def run_batch_with_dynamic_oom_handling(batch_examples, tokenizer, model, max_length, device,
                                          router_logits_cache, num_experts, top_k, lb_loss_coef,
                                          min_batch_size):
-    """Chay 1 batch (list text). Neu OOM: clear memory, chia doi, de quy. Neu OOM ca khi
-    size = 1 (hoac == min_batch_size) thi skip sample do. Luon quay ve batch_size goc cho
-    batch tiep theo (khong giu trang thai giua cac batch).
+    """Chay 1 batch (list example dict). Neu OOM: clear memory, chia doi, de quy. Neu OOM ca
+    khi size = 1 (hoac == min_batch_size) thi skip sample do. Luon quay ve batch_size goc cho
+    batch tiep theo (giong het co che cua code alignment finetuning, xem docstring goc ve ly
+    do tach _attempt/_run de giai phong dung frame bi OOM truoc khi retry)."""
+    original_size = len(batch_examples)
+    agg = {"lm_loss": 0.0, "lb_loss": 0.0, "total_loss": 0.0, "label_acc": 0.0, "n_ok": 0, "n_skipped": 0}
 
-    QUAN TRONG ve vong doi exception: KHONG duoc goi clear_memory()/de quy retry ngay
-    ben trong khoi `except ... as e:`. Trong luc con o trong khoi except do, `e.__traceback__`
-    van giu tham chieu toi toan bo frame cua forward_backward_one_subbatch (input_ids, outputs,
-    logits, ...) cua LAN VUA OOM -> cac tensor GPU do van "reachable" -> gc.collect()/
-    torch.cuda.empty_cache() khong giai phong duoc gi ca, va lan retry (voi batch nho hon)
-    lai chay trong khi bo nho cua lan fail truoc van bi ghim, cong don qua tung cap chia doi.
-    Vi vay ta tach rieng buoc "thu chay 1 lan" (_attempt) khoi buoc "don dep + de quy retry"
-    (_run): _run chi don dep/retry SAU KHI _attempt() da return, tuc la sau khi khoi except
-    da thoat va Python da tu dong `del e` (giai phong that su traceback + frame)."""
-    original_size = len(batch_texts)
-    agg = {"lm_loss": 0.0, "lb_loss": 0.0, "total_loss": 0.0, "n_ok": 0, "n_skipped": 0}
-
-    def _attempt(sub_texts) -> bool:
-        """Chi thu forward+backward DUNG 1 LAN. Tra ve True neu thanh cong, False neu OOM.
-        Khong lam gi khac trong except (khong clear_memory, khong retry) de dam bao khoi
-        except ket thuc ngay, Python tu xoa `e` va giai phong that su frame/tensor bi OOM."""
+    def _attempt(sub_examples) -> bool:
         try:
-            lm, lb, tot, n = forward_backward_one_subbatch(
-                sub_texts, tokenizer, model, max_length, device,
+            lm, lb, tot, acc, n = forward_backward_one_subbatch(
+                sub_examples, tokenizer, model, max_length, device,
                 router_logits_cache, num_experts, top_k, lb_loss_coef,
-                loss_weight=len(sub_texts) / max(original_size, 1),
+                loss_weight=len(sub_examples) / max(original_size, 1),
             )
         except RuntimeError as e:
             if not is_oom_error(e):
@@ -704,53 +704,40 @@ def run_batch_with_dynamic_oom_handling(batch_texts, tokenizer, model, max_lengt
         agg["lm_loss"] += lm * n
         agg["lb_loss"] += lb * n
         agg["total_loss"] += tot * n
+        agg["label_acc"] += acc * n
         agg["n_ok"] += n
         return True
 
-    def _run(sub_texts):
-        if _attempt(sub_texts):
+    def _run(sub_examples):
+        if _attempt(sub_examples):
             return
 
-        # Toi day khoi except cua _attempt() da thoat hoan toan -> `e`/traceback da bi
-        # Python xoa -> frame cua forward_backward_one_subbatch (voi input_ids, outputs,
-        # logits, shift_logits...) that su khong con ai tham chieu nua.
-        #
-        # router_logits_cache: hook forward luu logits KHONG detach (de giu gradient cho
-        # LoRA cua router) -> neu lan OOM vua roi da kip chay qua vai router truoc khi fail,
-        # cache van con om nguyen do thi autograd cua lan do. Binh thuong cache chi duoc
-        # .clear() o DAU lan forward_backward_one_subbatch ke tiep -> qua muon, phai clear
-        # ngay tai day truoc khi goi clear_memory().
         router_logits_cache.clear()
-
-        # KHONG goi model.zero_grad() o day: backward() cua cac sub-batch anh em (da chay
-        # thanh cong truoc do trong cung batch goc) da tich luy gradient hop le vao .grad
-        # theo co che gradient-accumulation (loss_weight = len(sub)/original_size). Goi
-        # zero_grad() se xoa sach ca phan gradient hop le do moi khi co 1 sub-batch OOM,
-        # lam sai lech gradient cua ca buoc optimizer.step() ke tiep.
         clear_memory()
 
-        if len(sub_texts) <= max(min_batch_size, 1):
-            logger.warning(f"OOM ngay ca voi sub-batch size={len(sub_texts)} -> skip sample nay.")
-            agg["n_skipped"] += len(sub_texts)
+        if len(sub_examples) <= max(min_batch_size, 1):
+            logger.warning(f"OOM ngay ca voi sub-batch size={len(sub_examples)} -> skip sample nay.")
+            agg["n_skipped"] += len(sub_examples)
             return
-        mid = len(sub_texts) // 2
-        logger.warning(f"OOM voi sub-batch size={len(sub_texts)} -> chia doi thanh {mid} + {len(sub_texts) - mid}.")
-        _run(sub_texts[:mid])
-        _run(sub_texts[mid:])
+        mid = len(sub_examples) // 2
+        logger.warning(f"OOM voi sub-batch size={len(sub_examples)} -> chia doi thanh {mid} + {len(sub_examples) - mid}.")
+        _run(sub_examples[:mid])
+        _run(sub_examples[mid:])
 
-    _run(batch_texts)
+    _run(batch_examples)
     n = max(agg["n_ok"], 1)
     return {
         "lm_loss": agg["lm_loss"] / n,
         "lb_loss": agg["lb_loss"] / n,
         "total_loss": agg["total_loss"] / n,
+        "label_acc": agg["label_acc"] / n,
         "n_processed": agg["n_ok"],
         "n_skipped": agg["n_skipped"],
     }
 
 
 # ============================================================================================
-# Checkpoint / resume
+# Checkpoint / resume (giong het code alignment)
 # ============================================================================================
 def save_checkpoint(output_dir, model, optimizer, scheduler, epoch, step_in_epoch, global_step):
     ckpt_dir = os.path.join(output_dir, f"checkpoint-{global_step}")
@@ -783,7 +770,6 @@ def find_resume_checkpoint(output_dir, resume_arg: Optional[str]) -> Optional[st
                 path = f.read().strip()
             if os.path.isdir(path):
                 return path
-        # fallback: tim checkpoint-* co global_step lon nhat
         candidates = glob.glob(os.path.join(output_dir, "checkpoint-*"))
         if candidates:
             candidates.sort(key=lambda p: int(p.rsplit("-", 1)[-1]))
@@ -793,7 +779,7 @@ def find_resume_checkpoint(output_dir, resume_arg: Optional[str]) -> Optional[st
 
 
 # ============================================================================================
-# Diagnostics: jsonl + plot
+# Diagnostics: jsonl + plot (loss + accuracy)
 # ============================================================================================
 def log_step_to_jsonl(jsonl_path, global_step, epoch, result):
     rec = {
@@ -802,6 +788,7 @@ def log_step_to_jsonl(jsonl_path, global_step, epoch, result):
         "lm_loss": result["lm_loss"],
         "lb_loss": result["lb_loss"],
         "total_loss": result["total_loss"],
+        "label_acc": result["label_acc"],
         "n_processed": result["n_processed"],
         "n_skipped": result["n_skipped"],
         "timestamp": time.time(),
@@ -810,10 +797,10 @@ def log_step_to_jsonl(jsonl_path, global_step, epoch, result):
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
-def plot_losses(jsonl_path, out_png):
+def _read_jsonl(jsonl_path):
+    steps, lm, lb, total, acc = [], [], [], [], []
     if not os.path.exists(jsonl_path):
-        return
-    steps, lm, lb, total = [], [], [], []
+        return steps, lm, lb, total, acc
     with open(jsonl_path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -824,15 +811,21 @@ def plot_losses(jsonl_path, out_png):
             lm.append(rec["lm_loss"])
             lb.append(rec["lb_loss"])
             total.append(rec["total_loss"])
+            acc.append(rec.get("label_acc", 0.0))
+    return steps, lm, lb, total, acc
+
+
+def plot_losses(jsonl_path, out_png):
+    steps, lm, lb, total, _ = _read_jsonl(jsonl_path)
     if not steps:
         return
     plt.figure(figsize=(10, 6))
-    plt.plot(steps, lm, label="L_LM")
+    plt.plot(steps, lm, label="L_LM (chi tren label)")
     plt.plot(steps, lb, label="L_LB")
     plt.plot(steps, total, label="L_Total")
     plt.xlabel("Training step")
     plt.ylabel("Loss")
-    plt.title("Marco-Nano-Instruct LoRA finetuning loss (tho, tung step)")
+    plt.title("Qwen1.5-MoE-A2.7B-SNLI-Task-Only LoRA finetuning loss (tho, tung step)")
     plt.legend()
     plt.grid(alpha=0.3)
     plt.tight_layout()
@@ -841,31 +834,11 @@ def plot_losses(jsonl_path, out_png):
 
 
 def plot_losses_smoothed(jsonl_path, out_png, window: int):
-    """Ve duong loss da lam min: gom `window` step LIEN TIEP (theo thu tu ghi log, tuc la
-    theo global_step tang dan) thanh 1 "bin", lay TRUNG BINH CONG lm/lb/total trong bin do
-    lam 1 diem tren do thi. Khac voi plot_losses() (ve tho tung step, rat messy vi L_LB/L_LM
-    dao qua lai theo tung batch nho), o day so diem giam di ~window lan nen xu huong tang/giam
-    that su cua loss de nhin hon nhieu."""
-    if not os.path.exists(jsonl_path) or window <= 1:
-        return
-    steps, lm, lb, total = [], [], [], []
-    with open(jsonl_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            rec = json.loads(line)
-            steps.append(rec["step"])
-            lm.append(rec["lm_loss"])
-            lb.append(rec["lb_loss"])
-            total.append(rec["total_loss"])
-    if not steps:
+    steps, lm, lb, total, _ = _read_jsonl(jsonl_path)
+    if not steps or window <= 1:
         return
 
     def bin_mean(values):
-        # Diem cuoi cung cua moi bin (step lon nhat trong bin) duoc dung lam nhan truc x, de
-        # truc x van la "global_step" chu khong phai "thu tu bin" (de so sanh voi save_steps,
-        # log_every de dang hon).
         xs, ys = [], []
         for i in range(0, len(values), window):
             chunk = values[i:i + window]
@@ -883,7 +856,7 @@ def plot_losses_smoothed(jsonl_path, out_png, window: int):
     plt.plot(x_tot, y_tot, label="L_Total (mean)", marker="o", markersize=3)
     plt.xlabel(f"Training step (moi diem = trung binh cong cua {window} step lien tiep)")
     plt.ylabel("Loss (trung binh)")
-    plt.title(f"Marco-Nano-Instruct LoRA finetuning loss - trung binh moi {window} step")
+    plt.title(f"Qwen1.5-MoE-A2.7B-SNLI-Task-Only LoRA finetuning loss - trung binh moi {window} step")
     plt.legend()
     plt.grid(alpha=0.3)
     plt.tight_layout()
@@ -891,40 +864,75 @@ def plot_losses_smoothed(jsonl_path, out_png, window: int):
     plt.close()
 
 
-def plot_all(jsonl_path, plot_path, plot_path_smoothed, smooth_window):
-    """Goi ca 2 ham ve: loss_curve.png (tho, tung step) va loss_curve_smoothed.png (trung
-    binh cong moi smooth_window step) trong 1 lan, dung o moi diem trong training loop can
-    cap nhat plot (log_every, save_steps, cuoi training, KeyboardInterrupt) — ca 2 file nam
-    chung trong diagnostics_dir nen push_to_hub() (upload_folder toan bo thu muc) se tu dong
-    day len hub cung voi checkpoint, khong can sua push_to_hub."""
+def plot_accuracy(jsonl_path, out_png, window: int):
+    """Bieu do rieng cho label_acc (xap xi, chi tren token dau tien cua nhan), da lam min
+    theo `window` step lien tiep giong plot_losses_smoothed, vi ban chat acc theo tung step
+    rat nhieu nhieu (batch nho / lech nhau)."""
+    steps, _, _, _, acc = _read_jsonl(jsonl_path)
+    if not steps:
+        return
+    window = max(window, 1)
+    xs, ys = [], []
+    for i in range(0, len(acc), window):
+        chunk = acc[i:i + window]
+        xs.append(steps[i + len(chunk) - 1])
+        ys.append(sum(chunk) / len(chunk))
+    plt.figure(figsize=(10, 6))
+    plt.plot(xs, ys, label="Label accuracy (train, xap xi)", color="green", marker="o", markersize=3)
+    plt.xlabel(f"Training step (moi diem = trung binh cong cua {window} step lien tiep)")
+    plt.ylabel("Accuracy")
+    plt.ylim(0.0, 1.0)
+    plt.title("Qwen1.5-MoE-A2.7B-SNLI-Task-Only — do chinh xac nhan tren train batch")
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=150)
+    plt.close()
+
+
+def plot_all(jsonl_path, plot_path, plot_path_smoothed, plot_path_acc, smooth_window):
     plot_losses(jsonl_path, plot_path)
     plot_losses_smoothed(jsonl_path, plot_path_smoothed, smooth_window)
+    plot_accuracy(jsonl_path, plot_path_acc, smooth_window)
 
 
 # ============================================================================================
 # Hugging Face Hub push
 # ============================================================================================
-def build_model_card(args, num_experts, top_k, layer_start, layer_end, num_layers, data_files) -> str:
+def build_model_card(args, num_experts, top_k, layer_start, layer_end, num_layers) -> str:
     return f"""---
 license: apache-2.0
 base_model: {args.model_name_or_path}
+datasets:
+- snli
 tags:
 - lora
 - peft
 - moe
 - mixture-of-experts
-- machine-translation
+- nli
+- snli
 - fine-tuned
 ---
 
-# Macro-Nano-Instruct-Finetuning
+# Qwen1.5-MoE-A2.7B-SNLI-Task-Only
 
 Day la LoRA adapter finetune tu [`{args.model_name_or_path}`]\
-(https://huggingface.co/{args.model_name_or_path}), mot mo hinh Mixture-of-Experts.
+(https://huggingface.co/{args.model_name_or_path}), mot mo hinh Mixture-of-Experts, tren task
+SNLI (Stanford Natural Language Inference) — phan loai quan he giua premise/hypothesis thanh
+`entailment` / `neutral` / `contradiction`.
+
+## Prompt format
+```
+Premise: <premise>
+Hypothesis: <hypothesis>
+Question: What is the relationship between the premise and the hypothesis? Choose one: entailment, neutral, or contradiction.
+Answer: <entailment|neutral|contradiction>
+```
 
 ## Cau hinh LoRA
 - Layer duoc finetune: `[{layer_start}, {layer_end})` trong tong so `{num_layers}` layer
-  (tuong ung khoang 1L/3 -> 2L/3).
+  (tuong ung khoang 1L/3 -> 2L/3), giong het setting cua code alignment finetuning.
 - Module duoc gan LoRA: **attention**, **router**, **experts** trong khoang layer tren, moi
   thanh phan mot rank rieng qua `rank_pattern` cua PEFT:
   - attention: r = {args.lora_r_attention}
@@ -937,22 +945,21 @@ Loss MoE tieu chuan:
 
 `L_total = L_LM + lb_loss_coef * L_LB`
 
-- `L_LM`: cross-entropy chuan tren token tiep theo.
+- `L_LM`: cross-entropy chuan tren token tiep theo, CHI tinh tren phan
+  `<label_word><eos>` (prompt bi mask, giong instruction-tuning/SFT tieu chuan).
 - `L_LB`: load balancing loss chuan cua MoE (Switch/Mixtral style), tinh tren cac router
   nam trong khoang layer duoc finetune.
-- `lb_loss_coef` = {args.lb_loss_coef}
+- `lb_loss_coef` (lambda) = {args.lb_loss_coef}
 - `num_experts` = {num_experts}, `top_k` = {top_k}
 
 ## Du lieu
-Alignment data duoc chon qua `--alignment_data` (`{" ".join(args.alignment_data)}`), gom sample
-tu cac file: `{"`, `".join(data_files)}` (moi field ngon ngu trong 1 record duoc coi la 1
-sample), shuffle va sort theo do dai token truoc khi gom batch.
+SNLI, doc tu `{args.data_file}` (list object `{{"premise", "hypothesis", "label"}}`, label
+0/1/2 = entailment/neutral/contradiction).
 
 ## Diagnostics
-Xem `diagnostics/loss_log.jsonl` (log theo tung step), `diagnostics/loss_curve.png` (bieu do
-tho L_LM / L_LB / L_Total theo tung step) va `diagnostics/loss_curve_smoothed.png` (cung 3
-duong loss nhung da lay trung binh cong moi `{args.smooth_window}` step lien tiep — de doc
-xu huong hon vi bieu do tho rat messy o cap do tung step).
+Xem `diagnostics/loss_log.jsonl` (log theo tung step), `diagnostics/loss_curve.png`,
+`diagnostics/loss_curve_smoothed.png` va `diagnostics/accuracy_curve.png` (do chinh xac xap xi
+tren token dau tien cua nhan, tinh tren batch train, da lam min moi `{args.smooth_window}` step).
 """
 
 
@@ -987,14 +994,11 @@ def main():
     if is_distributed:
         if args.device_map:
             raise ValueError(
-                "Khong dung --device_map cung luc voi distributed training (torchrun). "
-                "DDP: moi process giu 1 ban sao model day du tren 1 GPU rieng (qua "
-                "--nproc_per_node). device_map (model-parallel, 1 process nhieu GPU) la co "
-                "che khac, khong tuong thich voi DDP."
+                "Khong dung --device_map cung luc voi distributed training (torchrun)."
             )
         args.device = ddp_device
         if rank != 0:
-            logger.setLevel(logging.WARNING)  # tranh log trung lap tu tat ca rank
+            logger.setLevel(logging.WARNING)
 
     set_seed(args.seed)
 
@@ -1004,6 +1008,7 @@ def main():
     jsonl_path = os.path.join(diagnostics_dir, "loss_log.jsonl")
     plot_path = os.path.join(diagnostics_dir, "loss_curve.png")
     plot_path_smoothed = os.path.join(diagnostics_dir, "loss_curve_smoothed.png")
+    plot_path_acc = os.path.join(diagnostics_dir, "accuracy_curve.png")
 
     dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
     dtype = dtype_map[args.dtype]
@@ -1047,16 +1052,7 @@ def main():
     num_experts, top_k = infer_moe_dims(base_model.config, args)
 
     lb_loss_coef = args.lb_loss_coef
-    if lb_loss_coef is None:
-        lb_loss_coef = float(getattr(base_model.config, "router_aux_loss_coef", 0.001))
-        if lb_loss_coef == 0.0:
-            logger.warning(
-                "config.router_aux_loss_coef = 0.0 (thuong gap o cac checkpoint da POST-TRAIN/"
-                "INSTRUCT vi aux loss chi can luc pretrain) -> L_LB dang bi TAT hoan toan trong "
-                "lan chay nay. Neu ban van muon dung load-balancing loss khi LoRA SFT, hay truyen "
-                "--lb_loss_coef thu cong (vd 0.001)."
-            )
-    logger.info(f"lb_loss_coef (trong so load-balancing, nhu finetune binh thuong) = {lb_loss_coef}")
+    logger.info(f"lb_loss_coef (lambda load balancing) = {lb_loss_coef}")
 
     # ---------------------------------------------------------------------------- resume / LoRA
     resume_dir = find_resume_checkpoint(args.output_dir, args.resume_from_checkpoint)
@@ -1064,11 +1060,6 @@ def main():
         logger.info(f"Resume LoRA adapter tu checkpoint: {resume_dir}")
         model = PeftModel.from_pretrained(base_model, resume_dir, is_trainable=True)
     else:
-        # rank_pattern cua PEFT: dict {regex ten module -> rank rieng}, khac voi rank
-        # mac dinh `r`. Matching duoc peft thuc hien dang "(.*\\.)?(<key>)$" (khop HAU TO
-        # cua ten module day du) -> escape ten module bang re.escape() de chi khop CHINH
-        # XAC module do (tranh dau "." trong ten bi hieu nham thanh wildcard cua regex).
-        # attention KHONG can dua vao rank_pattern vi da dung r mac dinh (lora_r_attention).
         rank_pattern = {}
         rank_pattern.update({re.escape(n): args.lora_r_router for n in router_target_names})
         rank_pattern.update({re.escape(n): args.lora_r_experts for n in expert_target_names})
@@ -1095,48 +1086,34 @@ def main():
             model,
             device_ids=[local_rank],
             output_device=local_rank,
-            # MoE top-k routing: khong phai expert nao cung duoc chon o moi step, va LoRA
-            # chi gan tren 1 khoang layer -> luon co tham so KHONG nhan gradient o mot so
-            # step -> BAT BUOC True, neu khong DDP se bao loi "Expected to have finished
-            # reduction..." ngay khi gap batch dau tien co expert/module khong duoc dung toi.
             find_unused_parameters=True,
         )
 
     # ------------------------------------------------------------------------------------ data
-    # --alignment_data (flores/ntrex/ted, co the ket hop) -> danh sach file JSON thuc te.
-    # dict.fromkeys(...) de loai trung neu nguoi dung lo nhap trung ten (van giu thu tu).
-    data_files = [ALIGNMENT_DATA_FILENAMES[name] for name in dict.fromkeys(args.alignment_data)]
-    logger.info(f"Dang doc du lieu tu {args.data_dir}, alignment_data={args.alignment_data} "
-                f"(file tuong ung: {data_files}) ...")
-    texts = load_all_sentences(args.data_dir, data_files)
+    logger.info(f"Dang doc du lieu SNLI tu {args.data_file} ...")
+    records = load_snli_records(args.data_file)
     if args.max_samples:
-        random.Random(args.seed).shuffle(texts)
-        texts = texts[: args.max_samples]
-    logger.info(f"Tong so sample (cau) sau khi gom {len(data_files)} bo du lieu da chon: {len(texts)}")
-    if len(texts) == 0:
-        raise RuntimeError("Khong doc duoc sample nao — kiem tra lai --data_dir / --alignment_data.")
+        random.Random(args.seed).shuffle(records)
+        records = records[: args.max_samples]
+    logger.info(f"Tong so sample SNLI su dung: {len(records)}")
+    if len(records) == 0:
+        raise RuntimeError("Khong doc duoc sample nao — kiem tra lai --data_file.")
 
-    lengths = compute_lengths(tokenizer, texts)
+    examples = build_examples(records, tokenizer.eos_token)
+    lengths = compute_lengths(tokenizer, [ex["full_text"] for ex in examples])
 
-    # --batch_size la batch size CHO MOI GPU (giong per_device_train_batch_size cua HF
-    # Trainer) -> global batch size thuc te = batch_size * world_size. KHONG shard texts
-    # thu cong nua — dataset giu nguyen TOAN BO du lieu, viec chia GPU nao xu ly sample nao
-    # duoc LengthGroupedBatchSampler dam nhiem (sort do dai TOAN CUC roi moi chia deu cho
-    # cac rank theo tung mega-batch, xem docstring cua class do de biet ly do: giam
-    # straggler giua cac GPU so voi cach shard-truoc-roi-sort-rieng ban cu).
     mega_size = args.batch_size * world_size
-    if len(texts) < mega_size:
+    if len(examples) < mega_size:
         raise RuntimeError(
-            f"Chi co {len(texts)} sample, khong du de tao 1 step voi batch_size="
+            f"Chi co {len(examples)} sample, khong du de tao 1 step voi batch_size="
             f"{args.batch_size} x world_size={world_size} (can it nhat {mega_size} sample)."
         )
-    n_dropped = len(texts) % mega_size
+    n_dropped = len(examples) % mega_size
     if n_dropped and is_main_process(rank):
-        logger.info(f"Moi epoch se bo {n_dropped} sample cuoi (trong tong {len(texts)}) de "
-                    f"chia deu {args.batch_size} sample/rank x {world_size} rank cho MOI "
-                    f"step (giup moi rank luon nhan cau co do dai xap xi nhau).")
+        logger.info(f"Moi epoch se bo {n_dropped} sample cuoi (trong tong {len(examples)}) de "
+                    f"chia deu {args.batch_size} sample/rank x {world_size} rank cho MOI step.")
 
-    dataset = SentenceDataset(texts)
+    dataset = SNLIDataset(examples)
     batch_sampler = LengthGroupedBatchSampler(lengths, batch_size=args.batch_size,
                                                world_size=world_size, rank=rank, seed=args.seed)
     dataloader = DataLoader(dataset, batch_sampler=batch_sampler, collate_fn=lambda b: b)
@@ -1144,8 +1121,8 @@ def main():
     # ------------------------------------------------------------------------------- optimizer
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate,
-                                weight_decay=args.weight_decay, foreach=True)  # hoặc fused=True nếu CUDA hỗ trợ
-    
+                                weight_decay=args.weight_decay, foreach=True)
+
     steps_per_epoch = len(batch_sampler)
     total_steps = steps_per_epoch * args.num_train_epochs
     scheduler = get_linear_schedule_with_warmup(
@@ -1161,7 +1138,7 @@ def main():
             state = torch.load(state_path, map_location="cpu")
             optimizer.load_state_dict(state["optimizer"])
             for group in optimizer.param_groups:
-                group["foreach"] = True  # fix bug: AdamW state_dict khong luu foreach=True -> load_state_dict() se reset lai thanh False
+                group["foreach"] = True
             if state.get("scheduler"):
                 scheduler.load_state_dict(state["scheduler"])
             start_epoch = state["epoch"]
@@ -1175,7 +1152,7 @@ def main():
                 start_epoch += 1
                 start_step_in_epoch = 0
 
-    readme_text = build_model_card(args, num_experts, top_k, layer_start, layer_end, num_layers, data_files)
+    readme_text = build_model_card(args, num_experts, top_k, layer_start, layer_end, num_layers)
 
     # ------------------------------------------------------------------------------ training loop
     model_device = next(model.parameters()).device
@@ -1192,31 +1169,16 @@ def main():
                 desc=f"Epoch {epoch + 1}/{args.num_train_epochs}",
                 disable=not is_main_process(rank),
             )
-            for step_in_epoch, batch_texts in pbar:
+            for step_in_epoch, batch_examples in pbar:
                 if step_in_epoch < step_offset:
-                    # dang resume: bo qua nhanh cac batch da xu ly o lan chay truoc
                     continue
 
                 model.train()
-                # set_to_none=False khi distributed: dam bao MOI param luon co san tensor
-                # .grad (khong bi None), ke ca khi rank nay bi skip toan bo sample do OOM o
-                # step nay -> can thiet de sync_grads_across_ranks() ben duoi goi all_reduce
-                # dong bo duoc giua cac rank (all_reduce doi hoi TAT CA rank cung tham gia
-                # voi tensor ton tai, khong the "vang mat").
                 optimizer.zero_grad(set_to_none=not is_distributed)
 
-                # Toan bo cac lan backward() cua step nay (ke ca cac sub-batch do dynamic
-                # OOM splitting sinh ra ben trong ham duoi) duoc boc trong no_sync(): tat co
-                # che DDP tu dong all-reduce gradient sau MOI lan backward(). Neu khong tat,
-                # 1 step goi backward() nhieu lan se khien DDP all-reduce nhieu lan/sai nhip
-                # tren cung 1 tap tham so -> loi kinh dien "Expected to mark a variable ready
-                # only once" (cang de gap hon khi find_unused_parameters=True). Thay vao do,
-                # ta tu all_reduce THU CONG dung 1 LAN (sync_grads_across_ranks) ngay sau khi
-                # toan bo cac lan backward can thiet cua step da chay xong, truoc khi goi
-                # optimizer.step().
                 with no_sync_ctx():
                     result = run_batch_with_dynamic_oom_handling(
-                        batch_texts=batch_texts,
+                        batch_examples=batch_examples,
                         tokenizer=tokenizer,
                         model=model,
                         max_length=args.max_length,
@@ -1229,11 +1191,6 @@ def main():
                     )
 
                 if is_distributed:
-                    # Gop n_processed/loss cua TAT CA rank: vua de quyet dinh do_step DONG
-                    # BO giua cac rank (tranh truong hop rank nay goi optimizer.step() con
-                    # rank kia thi khong — se lam tham so cac rank lech nhau vinh vien vi DDP
-                    # gia dinh tham so luon giong het nhau giua cac rank), vua de log dung so
-                    # lieu toan cuc thay vi chi shard rieng cua rank 0.
                     result = reduce_result_across_ranks(result, model_device, world_size)
                 do_step = result["n_processed"] > 0
 
@@ -1249,6 +1206,7 @@ def main():
                     "L_LM": f"{result['lm_loss']:.4f}",
                     "L_LB": f"{result['lb_loss']:.4f}",
                     "L_Total": f"{result['total_loss']:.4f}",
+                    "acc": f"{result['label_acc']:.3f}",
                     "skipped": result["n_skipped"],
                 })
 
@@ -1257,12 +1215,12 @@ def main():
                         log_step_to_jsonl(jsonl_path, global_step, epoch, result)
 
                     if global_step % args.log_every == 0:
-                        plot_all(jsonl_path, plot_path, plot_path_smoothed, args.smooth_window)
+                        plot_all(jsonl_path, plot_path, plot_path_smoothed, plot_path_acc, args.smooth_window)
 
                     if global_step % args.save_steps == 0:
                         ckpt_dir = save_checkpoint(args.output_dir, unwrap_model(model), optimizer,
                                                     scheduler, epoch, step_in_epoch, global_step)
-                        plot_all(jsonl_path, plot_path, plot_path_smoothed, args.smooth_window)
+                        plot_all(jsonl_path, plot_path, plot_path_smoothed, plot_path_acc, args.smooth_window)
                         logger.info(f"Da luu checkpoint local: {ckpt_dir}")
                         if args.push_to_hub:
                             push_to_hub(ckpt_dir, diagnostics_dir, args.hub_model_id,
@@ -1270,19 +1228,14 @@ def main():
                             logger.info(f"Da push checkpoint len hub: {args.hub_model_id}")
 
                 if is_distributed and global_step % args.save_steps == 0:
-                    # Cac rank khac cho rank 0 ghi xong checkpoint/push len hub roi moi vao
-                    # step tiep theo, tranh lech nhip qua nhieu giua cac rank (rank 0 lam
-                    # I/O/network cham) -> giam nguy co NCCL Watchdog timeout o cac collective
-                    # op (all_reduce gradient) cua step ke tiep.
                     dist.barrier()
 
-            start_step_in_epoch = 0  # tu epoch tiep theo tro di, khong can offset resume nua
+            start_step_in_epoch = 0
 
-        # checkpoint cuoi cung sau khi hoan thanh training
         if is_main_process(rank):
             final_ckpt = save_checkpoint(args.output_dir, unwrap_model(model), optimizer, scheduler,
                                           args.num_train_epochs - 1, steps_per_epoch - 1, global_step)
-            plot_all(jsonl_path, plot_path, plot_path_smoothed, args.smooth_window)
+            plot_all(jsonl_path, plot_path, plot_path_smoothed, plot_path_acc, args.smooth_window)
             if args.push_to_hub:
                 push_to_hub(final_ckpt, diagnostics_dir, args.hub_model_id, args.hub_private, readme_text)
             logger.info("Training hoan tat.")
@@ -1294,7 +1247,7 @@ def main():
         if is_main_process(rank):
             save_checkpoint(args.output_dir, unwrap_model(model), optimizer, scheduler,
                              epoch, step_in_epoch, global_step)
-            plot_all(jsonl_path, plot_path, plot_path_smoothed, args.smooth_window)
+            plot_all(jsonl_path, plot_path, plot_path_smoothed, plot_path_acc, args.smooth_window)
         raise
     finally:
         for h in hooks:

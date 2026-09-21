@@ -22,9 +22,16 @@ Tải các bộ dữ liệu cho OT-MOE và lưu ra JSON, tổ chức theo cấu 
                           refs/convert/parquet trên HF Hub), KHÔNG dùng
                           load_dataset() thông thường -- xem ghi chú "LƯU Ý
                           LỖI XQuAD" bên dưới.
-        tatoeba/       <- mteb/tatoeba-bitext-mining, MỖI CẶP NGÔN NGỮ 1 FILE JSON
-                          (thay cho OPUS-100 trước đây). Danh sách cặp được lấy tự
-                          động qua datasets.get_dataset_config_names(), không hardcode.
+      english_task/    <- các bộ task TIẾNG ANH (dùng cho hướng alternate training:
+                          alignment -> task -> alignment), mỗi bộ 1 thư mục, mỗi split
+                          1 file JSON:
+        snli/          <- stanfordnlp/snli (config "plain_text"; train/validation/test)
+                          LƯU Ý: giữ nguyên dữ liệu gốc, các dòng không có nhãn gold
+                          có label = -1 (chưa lọc).
+        squad/         <- rajpurkar/squad (config "plain_text", SQuAD v1.1 -- cùng
+                          phiên bản gốc với XQuAD; train/validation)
+        mmlu/          <- cais/mmlu (config "all", gộp 57 subject; auxiliary_train/
+                          test/validation/dev). auxiliary_train rất lớn (~100k dòng).
 
 CƠ CHẾ SKIP (bỏ qua nếu đã tải):
     Mặc định, trước khi tải bất kỳ đơn vị dữ liệu nào (1 config/locale/ngôn ngữ/
@@ -47,8 +54,16 @@ LƯU Ý LỖI XQuAD ("Feature type 'List' not found"):
 
 Script này được đặt ở ROOT của project (ngang hàng với thư mục data/, ví dụ
 OT-MOE/download_data.py), đúng như cấu trúc project hiện tại của bạn, nên:
-    ALIGNMENT_DIR  = data/alignment
-    DOWNSTREAM_DIR = data/downstream
+    ALIGNMENT_DIR    = data/alignment
+    DOWNSTREAM_DIR   = data/downstream
+    ENGLISH_TASK_DIR = data/english_task
+
+CƠ CHẾ FALLBACK CHO SNLI / SQuAD / MMLU:
+    Các bộ này có trường dạng list (answers, choices) nên có nguy cơ gặp lại lỗi
+    metadata "Feature type 'List' not found" như XQuAD. Vì vậy chúng được tải
+    bằng load_splits_with_parquet_fallback(): thử load_dataset() trước; nếu lỗi
+    thì tự đọc thẳng file .parquet bằng pyarrow (thử nhánh refs/convert/parquet,
+    rồi tới nhánh main của repo).
 
 Cài đặt:
     pip install -r requirements.txt
@@ -57,10 +72,9 @@ Cài đặt:
     cần trust_remote_code=True. Từ `datasets` bản 4.0 trở lên, cơ chế này đã
     bị GỠ BỎ hoàn toàn (sẽ báo lỗi "trust_remote_code is not supported
     anymore"). Vì vậy requirements.txt ghim `datasets<4.0.0` — đừng tự ý
-    nâng cấp `datasets` lên bản mới hơn nếu vẫn muốn tải bộ này. Tatoeba
-    (mteb/tatoeba-bitext-mining) là parquet chuẩn nên không bị ảnh hưởng bởi
-    giới hạn này. XQuAD cũng không bị ảnh hưởng nữa vì đã chuyển sang đọc
-    parquet trực tiếp (xem ghi chú ở trên).
+    nâng cấp `datasets` lên bản mới hơn nếu vẫn muốn tải bộ này. XQuAD không
+    bị ảnh hưởng bởi giới hạn này vì đã chuyển sang đọc parquet trực tiếp
+    (xem ghi chú ở trên).
 
     XQuAD dùng `requests` (tải file parquet) và `pyarrow` (đọc parquet) —
     cả hai đều đã có sẵn vì là dependency của `datasets`.
@@ -74,6 +88,8 @@ Chạy:
     python download_data.py --only flores ntrex ted2025
     python download_data.py --only xquad            # chỉ tải XQuAD
     python download_data.py --only ted2025          # chỉ tải TED-2025 (từ Google Drive)
+    python download_data.py --only snli squad mmlu  # chỉ tải 3 bộ task tiếng Anh
+                                                    # (lưu ý: "mmlu" khác "mmmlu")
     python download_data.py --list                 # xem danh sách các bộ hỗ trợ
     python download_data.py --force                # tải lại toàn bộ, ghi đè dữ liệu cũ
 """
@@ -90,7 +106,7 @@ from pathlib import Path
 import requests
 import pyarrow.parquet as pq
 from tqdm import tqdm
-from datasets import load_dataset, get_dataset_config_names
+from datasets import load_dataset
 from huggingface_hub import login, list_repo_files
 from dotenv import load_dotenv
 
@@ -125,6 +141,7 @@ else:
 SCRIPT_DIR = Path(__file__).resolve().parent        # .../OT-MOE (root project)
 DOWNSTREAM_DIR = SCRIPT_DIR / "data" / "downstream"  # OT-MOE/data/downstream
 ALIGNMENT_DIR = SCRIPT_DIR / "data" / "alignment"    # OT-MOE/data/alignment
+ENGLISH_TASK_DIR = SCRIPT_DIR / "data" / "english_task"  # OT-MOE/data/english_task
 
 # --------------------------------------------------------------------------
 # 3. CẤU HÌNH NGÔN NGỮ / SUBSET CHO TỪNG DATASET
@@ -151,12 +168,8 @@ XQUAD_LANGUAGES = [
     "ar", "de", "el", "en", "es", "hi", "ro", "ru", "th", "tr", "vi", "zh",
 ]
 
-# Tatoeba (mteb/tatoeba-bitext-mining): KHÔNG hardcode danh sách cặp nữa.
-# Script tự gọi datasets.get_dataset_config_names() để lấy toàn bộ config
-# (mỗi config là 1 cặp ngôn ngữ, dạng "xxx-eng") rồi tải từng cặp.
-
 # Giới hạn số dòng tải về cho mỗi split (đặt None để tải toàn bộ).
-# Hữu ích khi chỉ muốn test nhanh trước khi tải full (Tatoeba/XNLI rất lớn).
+# Hữu ích khi chỉ muốn test nhanh trước khi tải full (XNLI rất lớn).
 MAX_EXAMPLES_PER_SPLIT = None  # ví dụ: 5000
 
 # TED-2025: link chia sẻ Google Drive của file .zip (dataset không nằm trên
@@ -239,7 +252,9 @@ def safe_load_dataset(repo_id: str, config: str = None, **kwargs):
         return None
 
 
-def load_dataset_via_parquet(repo_id: str, config_name: str) -> dict:
+def load_dataset_via_parquet(
+    repo_id: str, config_name: str, revision: str = "refs/convert/parquet"
+) -> dict:
     """Đọc thẳng dữ liệu của 1 config từ các file .parquet đã được Hugging
     Face tự động chuyển đổi (nhánh 'refs/convert/parquet' của repo), BỎ QUA
     hoàn toàn dataset_info.json/README YAML của repo gốc.
@@ -250,10 +265,14 @@ def load_dataset_via_parquet(repo_id: str, config_name: str) -> dict:
     lỗi "Feature type 'List' not found" dù dữ liệu vẫn tải được bình thường.
     Đọc thẳng parquet bằng pyarrow tránh được lỗi này hoàn toàn.
 
+    Tham số `revision` mặc định là nhánh tự động chuyển đổi của HF
+    ('refs/convert/parquet', dùng cho XQuAD). Với các repo vốn đã là parquet
+    (như SNLI/SQuAD/MMLU), nhánh convert có thể không tồn tại -> truyền
+    revision="main" để đọc thẳng file parquet gốc của repo.
+
     Trả về dict {split_name: [row_dict, ...]} (list[dict] kiểu Python thuần,
     sẵn sàng json.dump), hoặc {} nếu không tìm thấy/không tải được.
     """
-    revision = "refs/convert/parquet"
     try:
         files = list_repo_files(repo_id, repo_type="dataset", revision=revision)
     except Exception as e:
@@ -305,6 +324,43 @@ def save_records_as_json(records: list, out_path: Path, desc: str):
         json.dump(records, f, ensure_ascii=False, indent=2)
 
     print(f"    -> đã lưu {len(records)} dòng vào {out_path}")
+
+
+def load_splits_with_parquet_fallback(repo_id: str, config: str = None) -> dict:
+    """Tải tất cả split của 1 dataset, có cơ chế dự phòng khi load_dataset()
+    lỗi (ví dụ lỗi metadata "Feature type 'List' not found" với datasets<4.0):
+
+      1. Thử load_dataset() bình thường.
+      2. Nếu lỗi: đọc thẳng file parquet ở nhánh 'refs/convert/parquet'.
+      3. Nếu vẫn không có: đọc file parquet gốc ở nhánh 'main' (dành cho các
+         repo vốn đã là parquet nên HF không tạo nhánh convert).
+
+    Trả về dict {split_name: HF Dataset hoặc list[dict]}, hoặc {} nếu thất bại.
+    Dùng save_any_split() để ghi từng phần tử ra JSON.
+    """
+    ds = safe_load_dataset(repo_id, config)
+    if ds is not None:
+        return {split: ds[split] for split in ds.keys()}
+
+    if not config:
+        return {}
+
+    for revision in ("refs/convert/parquet", "main"):
+        print(f"    -> Thử đọc thẳng file parquet của {repo_id} "
+              f"(config={config}, revision={revision}) ...")
+        splits = load_dataset_via_parquet(repo_id, config, revision=revision)
+        if splits:
+            return splits
+    return {}
+
+
+def save_any_split(split_data, out_path: Path, desc: str):
+    """Ghi 1 split ra JSON, dù nó là HF Dataset (từ load_dataset) hay
+    list[dict] (từ load_dataset_via_parquet)."""
+    if isinstance(split_data, list):
+        save_records_as_json(split_data, out_path, desc=desc)
+    else:
+        save_split_as_json(split_data, out_path, desc=desc)
 
 
 def is_macos_zip_junk(member_path: str) -> bool:
@@ -525,7 +581,7 @@ def download_ted2025():
 
 
 # --------------------------------------------------------------------------
-# 6. DOWNSTREAM: MMMLU, XNLI, XQuAD, Tatoeba
+# 6. DOWNSTREAM: MMMLU, XNLI, XQuAD
 # --------------------------------------------------------------------------
 def download_mmmlu():
     print("\n=== MMMLU -> downstream/mmmlu/ ===")
@@ -593,41 +649,56 @@ def download_xquad():
             )
 
 
-def download_tatoeba():
-    print("\n=== Tatoeba (mteb/tatoeba-bitext-mining) -> downstream/tatoeba/ ===")
-    out_root = DOWNSTREAM_DIR / "tatoeba"
-    repo_id = "mteb/tatoeba-bitext-mining"
-
-    # Không hardcode danh sách cặp: lấy toàn bộ config (mỗi config là 1 cặp
-    # ngôn ngữ, dạng "xxx-eng") trực tiếp từ Hugging Face Hub.
-    try:
-        configs = get_dataset_config_names(repo_id)
-    except Exception as e:
-        print(f"[LỖI] Không lấy được danh sách cặp ngôn ngữ của {repo_id}: {e}")
+# --------------------------------------------------------------------------
+# 7. ENGLISH TASK: SNLI, SQuAD, MMLU
+#    (task tiếng Anh tương ứng XNLI / XQuAD / MMMLU, dùng cho alternate training)
+# --------------------------------------------------------------------------
+def _download_english_task(display_name: str, folder: str, repo_id: str, config: str):
+    """Hàm chung cho các bộ task tiếng Anh: mỗi bộ -> english_task/<folder>/,
+    mỗi split 1 file <split>.json. Tự skip nếu thư mục đã có file .json."""
+    print(f"\n=== {display_name} -> english_task/{folder}/ ===")
+    out_dir = ENGLISH_TASK_DIR / folder
+    if not FORCE_REDOWNLOAD and output_already_exists(out_dir):
+        print(f"  [skip] {folder} đã có dữ liệu tại {out_dir} -> bỏ qua toàn bộ "
+              f"(dùng --force để tải lại).")
         return
 
-    print(f"  Tìm thấy {len(configs)} cặp ngôn ngữ trong {repo_id}.")
+    splits = load_splits_with_parquet_fallback(repo_id, config)
+    if not splits:
+        print(f"[LỖI] Không tải được {repo_id} (config={config}) bằng cả 2 cách.")
+        return
 
-    for pair in tqdm(configs, desc="Tatoeba language pairs"):
-        if not FORCE_REDOWNLOAD and output_already_exists(out_root / pair):
-            print(f"  [skip] tatoeba/{pair} đã có dữ liệu -> bỏ qua.")
-            continue
+    print(f"  Các split có sẵn: {list(splits.keys())} "
+          f"({', '.join(f'{s}={len(d)} dòng' for s, d in splits.items())})")
 
-        ds = safe_load_dataset(repo_id, pair)
-        if ds is None:
-            continue
-        # Mỗi cặp ngôn ngữ -> 1 file JSON riêng cho mỗi split (thường chỉ có
-        # split "test", nên thực chất là 1 file JSON / cặp ngôn ngữ).
-        for split in ds.keys():
-            save_split_as_json(
-                ds[split],
-                out_root / pair / f"{split}.json",
-                desc=f"  tatoeba/{pair}/{split}",
-            )
+    for split, data in splits.items():
+        save_any_split(data, out_dir / f"{split}.json", desc=f"  {folder}/{split}")
+
+
+def download_snli():
+    # LƯU Ý: SNLI gốc có các dòng không có nhãn gold (label = -1, ~1-2% mỗi
+    # split). Script giữ nguyên dữ liệu gốc, KHÔNG lọc -- hãy lọc label != -1
+    # lúc train/eval nếu cần.
+    _download_english_task("SNLI", "snli", "stanfordnlp/snli", "plain_text")
+
+
+def download_squad():
+    # LƯU Ý: rajpurkar/squad là SQuAD v1.1 (train ~87.6k, validation ~10.6k),
+    # cùng phiên bản gốc mà XQuAD được dịch ra từ đó. Nếu cần SQuAD v2.0
+    # (có câu không trả lời được) thì đổi sang "rajpurkar/squad_v2".
+    _download_english_task("SQuAD", "squad", "rajpurkar/squad", "plain_text")
+
+
+def download_mmlu():
+    # LƯU Ý: config "all" gộp 57 subject vào 1 bộ (cột "subject" cho biết
+    # môn nào), gồm 4 split: auxiliary_train (~99.8k dòng, tập train phụ gộp từ
+    # ARC/RACE/OBQA/...), test (~14k), validation (~1.5k), dev (285, few-shot).
+    # auxiliary_train nặng -- đặt MAX_EXAMPLES_PER_SPLIT nếu chỉ cần test nhanh.
+    _download_english_task("MMLU", "mmlu", "cais/mmlu", "all")
 
 
 # --------------------------------------------------------------------------
-# 7. MAIN
+# 8. MAIN
 # --------------------------------------------------------------------------
 DATASET_REGISTRY = {
     "flores": download_flores200,
@@ -636,7 +707,9 @@ DATASET_REGISTRY = {
     "mmmlu": download_mmmlu,
     "xnli": download_xnli,
     "xquad": download_xquad,
-    "tatoeba": download_tatoeba,
+    "snli": download_snli,
+    "squad": download_squad,
+    "mmlu": download_mmlu,
 }
 
 
@@ -673,6 +746,7 @@ def main():
     print(f"Sẽ tải: {targets}")
     print(f"ALIGNMENT_DIR  = {ALIGNMENT_DIR}")
     print(f"DOWNSTREAM_DIR = {DOWNSTREAM_DIR}")
+    print(f"ENGLISH_TASK_DIR = {ENGLISH_TASK_DIR}")
     print(f"Chế độ: {'FORCE tải lại toàn bộ (ghi đè)' if FORCE_REDOWNLOAD else 'tự động SKIP phần đã có sẵn'}")
 
     for name in targets:

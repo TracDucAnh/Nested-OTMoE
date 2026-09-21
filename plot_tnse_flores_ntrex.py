@@ -120,6 +120,35 @@ def select_top_languages(observations: list[dict], top_k: Optional[int]) -> list
     return ranked[:top_k]
 
 
+def resolve_languages(
+    observations: list[dict], top_k: Optional[int], languages: Optional[list[str]]
+) -> list[str]:
+    """
+    Nếu --languages được chỉ định: dùng đúng danh sách đó (chuẩn hoá về chữ thường,
+    3 ký tự), cảnh báo mã nào không tồn tại trong dữ liệu.
+    Ngược lại: chọn theo top_k như cũ.
+    """
+    if languages is not None:
+        normalized = [code.strip().lower()[:3] for code in languages if code.strip()]
+        available = set()
+        for record in observations:
+            available.update(build_lang_index(record).keys())
+
+        missing = [code for code in normalized if code not in available]
+        if missing:
+            print(
+                f"[Cảnh báo] Các mã ngôn ngữ sau không tìm thấy trong dữ liệu và sẽ bị bỏ qua: {missing}"
+            )
+        resolved = [code for code in normalized if code in available]
+        if not resolved:
+            raise ValueError(
+                "Không có mã ngôn ngữ hợp lệ nào trong --languages khớp với dữ liệu."
+            )
+        return resolved
+
+    return select_top_languages(observations, top_k)
+
+
 def filter_samples_to_top_languages(
     observations: list[dict], top_langs: list[str]
 ) -> list[dict]:
@@ -309,7 +338,20 @@ def parse_args():
         "--top_k",
         type=str,
         default=str(DEFAULT_TOP_K),
-        help="Số ngôn ngữ phổ biến nhất cần giữ lại. Truyền 'none' để lấy tất cả.",
+        help=(
+            "Số ngôn ngữ phổ biến nhất cần giữ lại. Truyền 'none' để lấy tất cả. "
+            "Bị bỏ qua nếu --languages được chỉ định."
+        ),
+    )
+    parser.add_argument(
+        "--languages",
+        type=str,
+        nargs="+",
+        default=None,
+        help=(
+            "Danh sách mã ngôn ngữ 3 ký tự cần lấy (ví dụ: eng vie jpn zho). "
+            "Nếu được chỉ định, sẽ dùng đúng danh sách này thay vì chọn theo top_k."
+        ),
     )
     parser.add_argument(
         "--layers",
@@ -363,8 +405,11 @@ def main():
     observations = load_observations()
     print(f"Tổng số mẫu gộp: {len(observations)}")
 
-    top_langs = select_top_languages(observations, top_k)
-    print(f"Top ngôn ngữ được chọn ({len(top_langs)}): {top_langs}")
+    top_langs = resolve_languages(observations, top_k, args.languages)
+    if args.languages is not None:
+        print(f"Ngôn ngữ được chỉ định thủ công ({len(top_langs)}): {top_langs}")
+    else:
+        print(f"Top ngôn ngữ được chọn ({len(top_langs)}): {top_langs}")
 
     filtered = filter_samples_to_top_languages(observations, top_langs)
     print(f"Số mẫu còn lại sau khi lọc: {len(filtered)}")
