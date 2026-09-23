@@ -2,10 +2,10 @@
 
 How to run:
 
-torchrun --standalone --nproc_per_node=4 Qwen1.5-MoE-A2.7B-SNLI.py \
+torchrun --standalone --nproc_per_node=8 Qwen1.5-MoE-A2.7B-SNLI.py \
   --model_name_or_path Qwen/Qwen1.5-MoE-A2.7B \
   --data_file data/english_task/snli/train.json \
-  --batch_size 128 \
+  --batch_size 64 \
   --save_steps 200 \
   --push_to_hub 
 
