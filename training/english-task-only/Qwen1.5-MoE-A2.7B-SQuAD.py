@@ -1129,11 +1129,11 @@ theo doi qua trinh train).
 """
 
 
-def push_to_hub(local_ckpt_dir, diagnostics_dir, hub_model_id, private, readme_text):
+def push_to_hub(local_ckpt_dir, diagnostics_dir, hub_model_id, private, readme_text, token=None):
     if not HF_HUB_AVAILABLE:
         logger.warning("huggingface_hub chua duoc cai, bo qua buoc push_to_hub.")
         return
-    api = HfApi()
+    api = HfApi(token=token)
     api.create_repo(repo_id=hub_model_id, private=private, exist_ok=True)
     api.upload_folder(folder_path=local_ckpt_dir, repo_id=hub_model_id, path_in_repo=".",
                        commit_message=f"Update checkpoint: {os.path.basename(local_ckpt_dir)}")
@@ -1167,6 +1167,13 @@ def main():
             logger.setLevel(logging.WARNING)
 
     set_seed(args.seed)
+
+    hf_token = load_hf_token(args.env_file, args.hf_token) if args.push_to_hub else None
+    if args.push_to_hub and hf_token is None:
+        logger.warning(
+            "push_to_hub=True nhung khong tim thay HF token nao (--hf_token / bien moi truong / .env). "
+            "Buoc push co the that bai voi 401 Unauthorized neu repo chua ton tai hoac chua co quyen ghi san."
+        )
 
     os.makedirs(args.output_dir, exist_ok=True)
     diagnostics_dir = args.diagnostics_dir or os.path.join(args.output_dir, "diagnostics")
@@ -1392,9 +1399,15 @@ def main():
                         plot_all(jsonl_path, plot_path, plot_path_smoothed, plot_path_acc, args.smooth_window)
                         logger.info(f"Da luu checkpoint local: {ckpt_dir}")
                         if args.push_to_hub:
-                            push_to_hub(ckpt_dir, diagnostics_dir, args.hub_model_id,
-                                        args.hub_private, readme_text)
-                            logger.info(f"Da push checkpoint len hub: {args.hub_model_id}")
+                            try:
+                                push_to_hub(ckpt_dir, diagnostics_dir, args.hub_model_id,
+                                            args.hub_private, readme_text, token=hf_token)
+                                logger.info(f"Da push checkpoint len hub: {args.hub_model_id}")
+                            except Exception as e:
+                                logger.error(
+                                    f"Push checkpoint len hub that bai (khong lam gian doan training, "
+                                    f"checkpoint local van da luu tai {ckpt_dir}): {e}"
+                                )
 
                 if is_distributed and global_step % args.save_steps == 0:
                     dist.barrier()
@@ -1406,7 +1419,14 @@ def main():
                                           args.num_train_epochs - 1, steps_per_epoch - 1, global_step)
             plot_all(jsonl_path, plot_path, plot_path_smoothed, plot_path_acc, args.smooth_window)
             if args.push_to_hub:
-                push_to_hub(final_ckpt, diagnostics_dir, args.hub_model_id, args.hub_private, readme_text)
+                try:
+                    push_to_hub(final_ckpt, diagnostics_dir, args.hub_model_id, args.hub_private,
+                                readme_text, token=hf_token)
+                except Exception as e:
+                    logger.error(
+                        f"Push checkpoint cuoi cung len hub that bai (checkpoint local van da luu "
+                        f"tai {final_ckpt}): {e}"
+                    )
             logger.info("Training hoan tat.")
         if is_distributed:
             dist.barrier()
