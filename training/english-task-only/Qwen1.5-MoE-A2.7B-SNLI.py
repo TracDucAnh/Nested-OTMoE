@@ -307,15 +307,34 @@ def unwrap_model(model):
 
 def sync_grads_across_ranks(trainable_params, world_size: int):
     """All-reduce (trung binh) gradient THU CONG, gop thanh 1 buffer lien tuc de giam so
-    luong NCCL call (xem giai thich chi tiet trong code alignment finetuning)."""
+    luong NCCL call (xem giai thich chi tiet trong code alignment finetuning).
+
+    FIX DEADLOCK (quan trong voi MoE): router chi dinh tuyen moi sample toi mot tap con
+    expert, nen giua cac rank (du lieu local khac nhau) co the co truong hop 1 param LoRA
+    cua mot expert NHAN duoc gradient o rank nay nhung KHONG nhan duoc (p.grad is None) o
+    rank khac, trong CUNG mot step. Ban goc chi dua vao all_reduce nhung param co
+    p.grad is not None -> tap hop/kich thuoc tensor sau khi flatten se KHAC NHAU giua cac
+    rank, khien dist.all_reduce nhan tensor shape khac nhau tren tung rank -> NCCL treo
+    (deadlock) hoac loi/hang ngam cho toi khi het NCCL_TIMEOUT. O day BAT BUOC dam bao MOI
+    rank dua vao all_reduce CHINH XAC cung mot danh sach param, cung thu tu, voi grad =
+    zeros() cho param nao khong nhan gradient trong step nay (tuong duong ve mat toan hoc
+    voi cach DDP tu dong xu ly unused parameters khi find_unused_parameters=True)."""
     from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
-    grads_by_dtype = {}
+    # Dam bao MOI trainable param co grad (khong None) TRUOC khi gom nhom theo dtype, de
+    # tap hop + thu tu tensor dua vao all_reduce GIONG NHAU tren tat ca rank.
     for p in trainable_params:
-        if p.grad is not None:
-            grads_by_dtype.setdefault(p.grad.dtype, []).append(p.grad)
+        if p.grad is None:
+            p.grad = torch.zeros_like(p)
 
-    for dtype, grads in grads_by_dtype.items():
+    grads_by_dtype: Dict[torch.dtype, List[torch.Tensor]] = {}
+    for p in trainable_params:
+        grads_by_dtype.setdefault(p.grad.dtype, []).append(p.grad)
+
+    # Sort theo ten dtype de thu tu duyet dict dam bao giong nhau tren moi rank (an toan
+    # tuyet doi, phong truong hop trainable_params bi doi thu tu vi ly do nao do).
+    for dtype in sorted(grads_by_dtype.keys(), key=str):
+        grads = grads_by_dtype[dtype]
         flat = _flatten_dense_tensors(grads)
         dist.all_reduce(flat, op=dist.ReduceOp.SUM)
         flat.div_(world_size)
@@ -1094,6 +1113,15 @@ def main():
             device_ids=[local_rank],
             output_device=local_rank,
             find_unused_parameters=True,
+            # FIX DEADLOCK: mac dinh DDP broadcast buffer (collective) ngay trong MOI lan
+            # goi model(...), khong bi model.no_sync() chan. Vi dynamic OOM batching chia
+            # nho sub-batch bang de quy RIENG cho tung rank (run_batch_with_dynamic_oom_handling),
+            # so lan goi model(...) trong CUNG mot step co the KHAC NHAU giua cac rank ->
+            # so luong/loai collective call lech nhau -> NCCL treo. Backbone bi freeze va
+            # chi LoRA (duoc sync tay qua sync_grads_across_ranks) duoc train, nen buffer
+            # (vd rotary embedding cache) khong bao gio thay doi trong luc train -> tat
+            # broadcast nay vua an toan vua can thiet.
+            broadcast_buffers=False,
         )
 
     # ------------------------------------------------------------------------------------ data
