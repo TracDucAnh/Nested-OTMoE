@@ -1,123 +1,76 @@
 """
-MidAlign baseline cho mo hinh Mixture-of-Experts Qwen/Qwen1.5-MoE-A2.7B.
+MidAlign baseline cho mo hinh Mixture-of-Experts Qwen/Qwen1.5-MoE-A2.7B
+(kien truc Qwen2MoeForCausalLM) — phien ban TASK STEP = LM loss tren SQuAD + SNLI + MMLU.
 
-Adapt tu "Middle-Layer Representation Alignment for Cross-Lingual Transfer in
-Fine-Tuned LLMs" (Liu & Niehues, 2025) sang backbone MoE Qwen1.5-MoE-A2.7B
-(kien truc Qwen2MoeForCausalLM), dung Alternate Training (Figure 2 trong
-paper): moi step CHI toi uu MOT trong hai objective, xen ke theo global_step
-(chan = task step, le = align step).
+Adapt tu "Middle-Layer Representation Alignment for Cross-Lingual Transfer in Fine-Tuned
+LLMs" (Liu & Niehues, 2025), dung Alternate Training (Figure 2 trong paper): moi optimizer
+step CHI toi uu MOT trong hai objective, xen ke theo step:
 
-  - Task step:  L_task = L_LM (+ lb_loss_coef * L_LB vi day la backbone MoE)
-        L_LM: causal LM loss (cross-entropy chuan, shift-by-1) tinh tren cau
-              TARGET LANGUAGE (phia "other", khong phai tieng Anh).
-        L_LB: load-balancing loss chuan cua MoE (Switch/Mixtral style), tinh
-              tren (cac) router nam trong layer duoc gan LoRA. Day la phan
-              phu tro danh rieng cho backbone MoE, khong thuoc dinh nghia
-              goc cua MidAlign nhung duoc giu lai vi model la MoE; co the tat
-              bang --lb_loss_coef 0 neu chi muon L_task = L_LM thuan tuy.
-  - Align step: L_align = contrastive loss (in-batch negatives, symmetric
-        InfoNCE, tuong duong Eq.1 trong paper) giua mean-pooled hidden state
-        cua cau tieng Anh va cau target, trich xuat tai DUNG 1 layer duy nhat
-        (--align_layer). Mac dinh (--align_layer khong duoc truyen, = None) la
-        TU DONG suy ra middle layer = num_hidden_layers // 2 CUA CHINH backbone
-        dang load tai runtime (xem infer_middle_layer() va main()) — KHONG con
-        hard-code co dinh = 12 (con so nay truoc day chi dung neu backbone co
-        dung 24 layer nhu Qwen1.5-MoE-A2.7B; voi backbone khac so layer no se
-        sai). Quy uoc chi so: hidden_states[align_layer] tuc la output SAU
-        decoder block co index 0-based = align_layer - 1 (giong truc "Layer ID"
-        trong Figure 1/4 cua paper, trong do Layer ID 0 = embedding).
+  - step CHAN (0, 2, 4, ...) = TASK step:
+        L_task = L_LM (+ lb_loss_coef * L_LB, phu tro cho backbone MoE)
+        L_LM  : cross-entropy chuan, CHI tinh tren phan dap an (<answer>/<label>/<letter><eos>),
+                prompt bi mask -100 — DUNG cach doc du lieu + build prompt + mask cua cac file
+                finetuning english-task-only (Qwen1.5-MoE-A2.7B-SQuAD/SNLI/MMLU.py):
+                  SQuAD: "Context: ...\nQuestion: ...\nAnswer: <answer><eos>" (co context windowing)
+                  SNLI : "Premise/Hypothesis/Question/Answer: <entailment|neutral|contradiction><eos>"
+                  MMLU : "The following are multiple choice questions ... Answer: <letter><eos>"
+        Ba tap duoc GOP THANH 1 POOL DUY NHAT, moi task step lay 1 batch ngau nhien tu pool nay
+        (tron lan 3 task trong cung 1 batch).
+  - step LE (1, 3, 5, ...) = ALIGN (contrastive) step:
+        L_align = symmetric InfoNCE (in-batch negatives) giua mean-pooled hidden state cua cau
+        tieng Anh va cau target (cap english-other), tai DUNG 1 layer (--align_layer, mac dinh
+        TU DONG = num_hidden_layers // 2 cua backbone dang load).
 
-Cac dieu kien giu nguyen theo yeu cau:
-  1. Alternate training giua task loss va contrastive loss, batch_size mac
-     dinh = 128 (per-process, xem phan Distributed ben duoi).
-  2. Task loss la causal LM tren TARGET LANGUAGE (khong tach prefix/output
-     rieng — day la lua chon CO CHU DICH: phase alignment o day chi dung du
-     lieu da ngu thuan tuy, tach bach voi phase zero-shot-task (xnli, xquad,
-     ...) o pipeline khac, nen "task" trong Alternate Training nay DUNG LA
-     causal LM, giong dinh nghia trong main method).
-  3. Cap ngon ngu la english - other (khong phai cap other-other).
-  4. Alignment loss (contrastive) CHI trich xuat tai dung 1 layer (mac dinh:
-     middle layer, TU DONG suy ra tu num_hidden_layers thuc te cua backbone
-     dang load, khong con hard-code = 12).
+RANG BUOC "DUNG HET DU LIEU" va cach tinh so step
+-------------------------------------------------
+Vi step chan/le xen ke deu nhau, trong 1 epoch co N task step va N align step (tong 2N step,
+steps_per_epoch luon CHAN nen epoch nao cung bat dau bang task step). De moi epoch:
+    - N task step  tieu thu DUNG HET  n_task  sample (SQuAD + SNLI + MMLU sau khi loc),
+    - N align step tieu thu DUNG HET  n_align cap bitext,
+moi sample duoc dung dung 1 lan / epoch (khong lap, khong bo), ta chon N roi CHIA DEU
+n_task va n_align cho N step (step k nhan floor hoac ceil cua n/N sample), roi chia tiep cho
+cac rank. Co 2 cach chon N (chon bang co CLI, phia con lai duoc TINH RA):
+    (mac dinh)  neo theo ALIGN: --align_batch_size (per-rank, mac dinh 128)
+                N = round(n_align / (align_batch_size * world_size))
+                -> batch size task per-rank trung binh = n_task / (N * world_size)
+    (tuy chon)  neo theo TASK:  truyen --task_batch_size (per-rank)
+                N = round(n_task / (task_batch_size * world_size))
+                -> batch size align per-rank trung binh = n_align / (N * world_size)
+Neu batch task per-rank lon thi moi rank tu dong chia thanh nhieu micro-batch (theo ngan sach
+token --task_micro_batch_tokens, sort theo do dai de giam padding) va cong don gradient truoc
+khi optimizer.step() — nen KHONG can OOM-split. Contrastive step khong chia micro-batch duoc
+(can in-batch negatives), nen neu neo theo task ma align batch tinh ra qua lon thi giam
+--task_batch_size de tang N.
 
-Cac dieu kien thay doi theo yeu cau:
-  1. Dataset/DataLoader: doc bitext english-other duoc SAMPLE tu du lieu goc
-     dang JSON multiway-parallel (moi record co nhieu key = ma ngon ngu,
-     vd "eng_Latn", "ace_Arab", "bam_Latn", ...). Voi moi record, cau
-     eng_Latn duoc ghep voi TUNG ngon ngu khac trong record de tao thanh 1
-     cap bitext rieng.
-  2. LoRA ap dung cho MOT RANGE layer [L/3, 2L/3) (nua-mo, floor-division
-     tren tong so layer L), TACH BACH voi layer dung de tinh alignment loss
-     (chi 1 layer duy nhat, dieu kien #4 o tren). Ly do dung range nay thay
-     vi toan bo mang: fair ve compute budget so voi main method (main method
-     chi dung range [L/2, 2L/3)), dong thoi van toi da hoa tinh than cua
-     MidAlign — LoRA phu ca mot vung middle-layer (khong phai toan mang, va
-     cung khong chi 1 diem duy nhat).
+Dong bo gradient: THAY DDP bang all-reduce gradient thu cong (giong cac file finetuning
+english-task-only). Ly do: task step cong don gradient qua nhieu micro-batch (so micro-batch
+co the khac nhau giua cac rank) va 2 loai step co do thi autograd khac nhau, nen tranh phai
+phu thuoc vao hanh vi cua DDP Reducer / static_graph. Sau backward, MOI tham so trainable
+(ke ca LoRA cua expert khong nhan token nao trong step do -> grad None) deu duoc dien 0 roi
+all-reduce 1 lan duy nhat -> khong con nguy co NCCL watchdog / "marked ready twice".
+(Do do cac co --find_unused_parameters / zero_grad_anchor / _set_static_graph da bo.)
 
-Ghi chu kien truc: Qwen1.5-MoE-A2.7B (Qwen2MoeForCausalLM) dat ten
-router/experts theo quy uoc chuan cua HF transformers (vd:
-model.layers.{i}.self_attn.*, model.layers.{i}.mlp.gate,
-model.layers.{i}.mlp.experts.{e}.*, model.layers.{i}.mlp.shared_expert*).
-Du kien truc da biet truoc, script nay VAN GIU nguyen co che TU DONG DO TIM
-cac module attention / router / experts bang ten (regex) thay vi hard-code,
-de dam bao tinh tong quat va cho phep override qua CLI neu can.
+Cac dieu kien giu nguyen tu ban MidAlign truoc:
+  1. LoRA ap dung cho RANGE layer [L/3, 2L/3), tach bach voi layer tinh alignment loss.
+     Attention / router / experts moi nhom 1 rank rieng (router 4, attn 16, experts 16).
+  2. Cap ngon ngu english - other, doc tu du lieu multiway-parallel JSON (flores/ntrex/bible).
+  3. Checkpoint chi giu ban moi nhat, push len HF Hub, resume tu checkpoint.
 
-Distributed training (thay the hoan toan co che OOM dynamic-split cua ban
-plain-LoRA goc):
-  - Khong con retry/chia doi batch khi OOM, khong con skip sample.
-  - Chay multi-GPU bang torch.distributed (DistributedDataParallel), khoi
-    chay qua torchrun. Sau moi optimizer step, TAT CA process dong bo qua
-    dist.barrier() (dam bao moi GPU da chay xong step do) roi CHI rank 0
-    thuc hien ghi checkpoint + push len Hugging Face Hub; sau khi rank 0
-    xong, mot barrier thu hai dam bao cac rank khac cho truoc khi sang step
-    tiep theo.
-  - Checkpoint chi giu ban moi nhat: sau khi luu checkpoint-N thanh cong,
-    checkpoint truoc do (vd checkpoint-(N - save_steps)) se bi xoa
-    (shutil.rmtree) ngay lap tuc.
-
-Fix NCCL Watchdog Timeout / SIGABRT (c10d::ProcessGroupNCCL::ncclCommWatchdog()):
-  - Nguyen nhan cot loi: voi backbone MoE + LoRA tren 1 range layer [L/3, 2L/3),
-    router chi chon top_k << num_experts cho moi token, nen rat de co (cac) expert LoRA
-    khong nhan token nao tren mot GPU o mot step nao do -> khong co gradient.
-    Voi find_unused_parameters=False (mac dinh cu cua PyTorch), DDP Reducer
-    cho vo han gradient con thieu do trong backward(), dan den NCCL Watchdog
-    het han sau 10 phut (mac dinh) va gui SIGABRT (exit code -6), keo theo
-    torchrun dung ca cac rank khac.
-  - Fix: DDP duoc khoi tao voi find_unused_parameters=True (CLI:
-    --find_unused_parameters / --no_find_unused_parameters, mac dinh True) de
-    DDP tu duyet lai autograd graph sau moi forward va bo qua dung cac tham
-    so khong duoc dung trong step do thay vi cho vo han.
-  - Bien phap phong ho them (khong lien quan MoE, vd DataLoader stall khi doc
-    tu Lustre/NFS): --nccl_timeout_minutes (mac dinh 30, thay cho 10 phut mac
-    dinh cua PyTorch) va persistent_workers/--dataloader_prefetch_factor cho
-    DataLoader.
-  - Fix bo sung (zero_grad_anchor(), xem dinh nghia truoc compute_task_step):
-    cong vao loss (task va align) 1 "neo" = 0.0 * sum(p.sum() cho MOI tham so
-    trainable). Gia tri toan hoc luon = 0 nen KHONG doi loss/gradient that,
-    nhung buoc MOI tham so — ke ca LoRA cua expert khong nhan token nao trong
-    step do — THAT SU xuat hien trong autograd graph voi gradient = 0 thay vi
-    None. Nho vay training AN TOAN VOI CA find_unused_parameters=True LAN
-    False (--no_find_unused_parameters), khong con phu thuoc DDP phai tu
-    duyet lai graph. Da CO Y KHONG dung cach gop 2 forward pass (task +
-    align) lam 1 de ep moi expert deu duoc dung: cach do da thu va gay OOM vi
-    phai giu dong thoi 2 do thi activation trong VRAM; zero_grad_anchor() chi
-    thao tac tren cac tensor tham so co san (khong forward them qua model)
-    nen khong lam tang peak memory.
-
-Vi du chay (4 GPU tren 1 node; khong can truyen --align_layer, se tu suy ra
-middle layer tu num_hidden_layers thuc te cua model, vd = 12 voi backbone
-24-layer nhu Qwen1.5-MoE-A2.7B):
-    torchrun --standalone --nproc_per_node=4 Qwen1.5-MoE-A2.7B-MidAlign.py \
-        --model_name_or_path Qwen/Qwen1.5-MoE-A2.7B \
-        --data_dir data/processed_alignment \
+Vi du chay (8 GPU):
+    torchrun --standalone --nproc_per_node=8 Qwen1.5-MoE-A2.7B.py \\
+        --model_name_or_path Qwen/Qwen1.5-MoE-A2.7B \\
+        --data_dir data/processed_alignment \\
+        --squad_file data/english_task/squad/train.json \\
+        --snli_file data/english_task/snli/train.json \\
+        --mmlu_file data/english_task/mmlu/auxiliary_train.json \\
         --push_to_hub
-    # (Tuy chon: truyen --align_layer <N> de override thu cong.)
 
-Chay 1 GPU / CPU (khong can torchrun):
-    python Qwen1.5-MoE-A2.7B-MidAlign.py --model_name_or_path Qwen/Qwen1.5-MoE-A2.7B
+Smoke test (1 GPU, du lieu nho):
+    python Qwen1.5-MoE-A2.7B.py --max_samples 20000 --max_task_samples 5000 --no_push_to_hub
 
 Resume:
-    torchrun --standalone --nproc_per_node=4 Qwen1.5-MoE-A2.7B-MidAlign.py --resume_from_checkpoint auto
+    torchrun --standalone --nproc_per_node=8 Qwen1.5-MoE-A2.7B.py --resume_from_checkpoint auto
+(Resume yeu cau giu nguyen world_size, batch size va du lieu de N khong doi — se bao loi neu lech.)
 """
 
 import argparse
@@ -125,20 +78,18 @@ import gc
 import glob
 import json
 import logging
-import math
 import os
 import random
 import re
 import shutil
+import string
 import time
 from datetime import timedelta
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import Dataset, DataLoader, DistributedSampler, RandomSampler
 from tqdm.auto import tqdm
 
 from transformers import AutoModelForCausalLM, AutoTokenizer, get_linear_schedule_with_warmup
@@ -164,7 +115,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 logger = logging.getLogger("midalign_qwen15_moe")
 
 
-# Cac ten bien moi truong pho bien cho HF token, thu theo thu tu nay
+# ============================================================================================
+# HF token + mapping nguon alignment (giu nguyen tu ban MidAlign truoc)
+# ============================================================================================
 _HF_TOKEN_ENV_VARS = ("HF_TOKEN", "HUGGINGFACE_HUB_TOKEN", "HUGGING_FACE_HUB_TOKEN")
 
 
@@ -201,8 +154,6 @@ def load_hf_token(env_file: Optional[str], cli_token: Optional[str]) -> Optional
     return None
 
 
-# Anh xa tu ten nguon du lieu alignment (--alignment_data) sang ten file JSON tuong ung trong
-# --data_dir. Them nguon moi bang cach them 1 dong vao dict nay.
 ALIGNMENT_DATASET_FILES = {
     "flores": "flores.json",
     "ntrex": "ntrex.json",
@@ -230,103 +181,87 @@ def resolve_data_files(alignment_data: Sequence[str], data_files: Optional[Seque
 # ============================================================================================
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="MidAlign baseline (alternate CLM + contrastive align) cho MoE Qwen1.5-MoE-A2.7B"
+        description="MidAlign (alternate task-LM[SQuAD+SNLI+MMLU] / contrastive align) cho Qwen1.5-MoE-A2.7B"
     )
 
-    # Model / data / output
+    # Model / output
     p.add_argument("--model_name_or_path", type=str, default="Qwen/Qwen1.5-MoE-A2.7B")
+    p.add_argument("--output_dir", type=str,
+                    default="training/MidAlign/checkpoints/Qwen1.5-MoE-A2.7B")
+
+    # Du lieu ALIGNMENT (contrastive step, bitext english-other)
     p.add_argument("--data_dir", type=str, default="data/processed_alignment")
     p.add_argument("--alignment_data", type=str, nargs="+",
                     choices=sorted(ALIGNMENT_DATASET_FILES.keys()),
                     default=["flores", "ntrex", "bible"],
-                    help="Chon 1 hoac nhieu nguon du lieu alignment de finetune, cach nhau boi "
-                         "dau cach: flores | ntrex | bible. Vd --alignment_data flores ntrex se "
-                         "gop ca FLORES va NTREX de finetune. Duoc anh xa sang ten file JSON "
-                         "tuong ung trong --data_dir (xem dict ALIGNMENT_DATASET_FILES). Bi "
-                         "--data_files ghi de neu --data_files duoc truyen thu cong.")
+                    help="Nguon du lieu alignment: flores | ntrex | bible (1 hoac nhieu).")
     p.add_argument("--data_files", type=str, nargs="+", default=None,
-                    help="[Nang cao] Chi dinh truc tiep danh sach ten file JSON trong --data_dir, "
-                         "GHI DE hoan toan --alignment_data neu duoc truyen (vd de dung file "
-                         "khong nam trong ALIGNMENT_DATASET_FILES). Mac dinh None -> tu suy ra "
-                         "tu --alignment_data.")
-    p.add_argument("--output_dir", type=str,
-                    default="training/MidAlign/checkpoints/Qwen1.5-MoE-A2.7B")
-    p.add_argument("--max_samples", type=int, default=None,
-                    help="Gioi han so cap bitext (debug/smoke test), None = dung het du lieu")
-
-    # Bitext english-other (dieu kien thay doi #1)
-    p.add_argument("--eng_key", type=str, default="eng_Latn",
-                    help="Ten key tieng Anh trong moi record JSON (vd 'eng_Latn')")
+                    help="[Nang cao] Ghi de --alignment_data bang danh sach file JSON trong --data_dir.")
+    p.add_argument("--eng_key", type=str, default="eng_Latn")
     p.add_argument("--max_lang_pairs_per_record", type=int, default=None,
-                    help="Gioi han so ngon ngu khac duoc ghep voi eng_key trong 1 record "
-                         "(None = dung tat ca ngon ngu co trong record, vd toan bo FLORES-200)")
+                    help="Gioi han so ngon ngu ghep voi eng_key trong 1 record (None = dung het).")
+    p.add_argument("--max_samples", type=int, default=None,
+                    help="Gioi han so cap bitext alignment (debug), None = dung het.")
+
+    # Du lieu TASK (task step, LM loss) — doc giong het cac file finetuning english-task-only
+    p.add_argument("--task_datasets", type=str, nargs="+", choices=["squad", "snli", "mmlu"],
+                    default=["squad", "snli", "mmlu"],
+                    help="Cac tap duoc gop vao pool task step.")
+    p.add_argument("--squad_file", type=str, default="data/english_task/squad/train.json")
+    p.add_argument("--snli_file", type=str, default="data/english_task/snli/train.json")
+    p.add_argument("--mmlu_file", type=str, default="data/english_task/mmlu/auxiliary_train.json")
+    p.add_argument("--max_task_samples", type=int, default=None,
+                    help="Gioi han so sample MOI tap task (debug), None = dung het.")
 
     # Hugging Face Hub
     p.add_argument("--push_to_hub", action="store_true", default=True)
     p.add_argument("--no_push_to_hub", dest="push_to_hub", action="store_false")
     p.add_argument("--hub_model_id", type=str, default="ducanhdinh/Qwen1.5-MoE-A2.7B-MidAlign")
     p.add_argument("--hub_private", action="store_true")
-    p.add_argument("--env_file", type=str, default=".env",
-                    help="Duong dan file .env chua HF_TOKEN, tu dong nap bang python-dotenv")
-    p.add_argument("--hf_token", type=str, default=None,
-                    help="Override HF token thu cong, uu tien cao hon .env/bien moi truong")
+    p.add_argument("--env_file", type=str, default=".env")
+    p.add_argument("--hf_token", type=str, default=None)
 
-    # Training schedule
+    # Training schedule + batch (xem docstring dau file ve cach tinh so step)
     p.add_argument("--num_train_epochs", type=int, default=3)
-    p.add_argument("--batch_size", type=int, default=128,
-                    help="Batch size per-process (moi GPU xu ly ngan nay cap bitext / step)")
-    p.add_argument("--max_length", type=int, default=256)
+    p.add_argument("--align_batch_size", type=int, default=128,
+                    help="Batch size align per-rank (so cap bitext / rank / align step). Mac dinh la "
+                         "ANCHOR quyet dinh N = so task step = so align step moi epoch. Bi bo qua "
+                         "(tinh lai) neu truyen --task_batch_size.")
+    p.add_argument("--task_batch_size", type=int, default=None,
+                    help="Neu truyen: dung lam ANCHOR (per-rank) thay cho --align_batch_size; batch "
+                         "size align khi do se TU DONG TINH de dung het du lieu alignment.")
+    p.add_argument("--task_micro_batch_tokens", type=int, default=16384,
+                    help="Ngan sach token (so sample * do dai da padding) cho 1 micro-batch cua task "
+                         "step. Giam neu OOM, tang neu con du VRAM.")
+    p.add_argument("--max_length", type=int, default=256,
+                    help="max_length cho cau alignment (contrastive step).")
+    p.add_argument("--task_max_length", type=int, default=512,
+                    help="max_length cho sample task (SQuAD can 512; sample SQuAD dai hon duoc "
+                         "windowing, MMLU/SNLI dai hon bi bo).")
     p.add_argument("--learning_rate", type=float, default=2e-4)
     p.add_argument("--weight_decay", type=float, default=0.0)
     p.add_argument("--warmup_ratio", type=float, default=0.03)
     p.add_argument("--gradient_clip_norm", type=float, default=1.0)
-    p.add_argument("--num_workers", type=int, default=2, help="So worker cho DataLoader")
 
-    # MidAlign: alignment objective (dieu kien giu nguyen #4)
+    # MidAlign: alignment objective
     p.add_argument("--align_layer", type=int, default=None,
-                    help="Layer dung de trich xuat hidden state cho contrastive loss (KHONG con "
-                         "quyet dinh vi tri LoRA — LoRA nay ap dung cho ca range [L/3, 2L/3), "
-                         "tinh doc lap tu num_layers, xem build_lora_target_modules trong main()). "
-                         "Quy uoc: hidden_states[align_layer], tuc output SAU decoder block co "
-                         "index 0-based = align_layer - 1 (giong truc Layer ID trong paper "
-                         "MidAlign, Layer ID 0 = embedding). Mac dinh None: TU DONG suy ra middle "
-                         "layer = num_hidden_layers // 2 cua CHINH backbone dang load (xem "
-                         "infer_middle_layer() va main()), khong con hard-code = 12 (con so nay "
-                         "chi dung neu backbone co dung 24 layer). Truyen gia tri de override "
-                         "thu cong neu muon 1 layer khac middle.")
-    p.add_argument("--align_temperature", type=float, default=1.5,
-                    help="Nhiet do tau cho contrastive loss (tune tren dev loss, xem App. D.1 "
-                         "paper MidAlign: Llama dung 0.1, Qwen dung 1.5 -> mac dinh 1.5 vi "
-                         "backbone o day la ho Qwen).")
+                    help="Layer lay hidden state cho contrastive loss (hidden_states[align_layer]). "
+                         "None = TU DONG num_hidden_layers // 2 cua backbone dang load.")
+    p.add_argument("--align_temperature", type=float, default=1.5)
 
-    # MoE loss (phu tro cho task step, xem docstring dau file)
+    # MoE loss (phu tro cho task step)
     p.add_argument("--lb_loss_coef", type=float, default=None,
-                    help="He so cho load-balancing loss. None = lay tu config.router_aux_loss_coef, "
-                         "fallback 0.01. Dat = 0 neu chi muon task loss la CLM thuan tuy.")
-    p.add_argument("--num_local_experts", type=int, default=None,
-                    help="Override so luong experts, None = tu doc trong config model")
-    p.add_argument("--num_experts_per_tok", type=int, default=None,
-                    help="Override top-k router, None = tu doc trong config model")
+                    help="He so load-balancing loss. None = config.router_aux_loss_coef, fallback "
+                         "0.01. Dat 0 de task loss la LM thuan tuy.")
+    p.add_argument("--num_local_experts", type=int, default=None)
+    p.add_argument("--num_experts_per_tok", type=int, default=None)
 
-    # LoRA — rank rieng cho tung thanh phan (dieu kien thay doi #2). Module duoc gan LoRA
-    # (attention / router / experts, xem build_lora_target_modules) deu nam trong 1 trong 3
-    # nhom nay nen --lora_r chi con dong vai tro fallback (khong bao gio thuc su duoc dung
-    # trong dieu kien binh thuong, xem rank_pattern trong main()).
-    p.add_argument("--lora_r", type=int, default=16,
-                    help="Rank fallback/mac dinh, dung neu co module LoRA nao khong roi vao dung "
-                         "1 trong 3 nhom router/attention/experts (khong nen xay ra trong dieu "
-                         "kien binh thuong). Uu tien dung 3 co --lora_r_router/--lora_r_attn/"
-                         "--lora_r_expert ben duoi de chinh rank theo tung thanh phan.")
-    p.add_argument("--lora_r_router", type=int, default=4,
-                    help="Rank LoRA rieng cho cac module router (gate/router/gating).")
-    p.add_argument("--lora_r_attn", type=int, default=16,
-                    help="Rank LoRA rieng cho cac module attention (self_attn/attention/attn).")
-    p.add_argument("--lora_r_expert", type=int, default=16,
-                    help="Rank LoRA rieng cho cac module experts (mlp.experts.*).")
-    p.add_argument("--lora_alpha", type=int, default=32,
-                    help="lora_alpha ap dung DONG NHAT cho ca 3 nhom (chi rank la khac nhau); "
-                         "scaling thuc te = lora_alpha / r nen se khac nhau theo tung nhom vi r "
-                         "khac nhau (peft tinh scaling per-module dua tren rank_pattern).")
+    # LoRA
+    p.add_argument("--lora_r", type=int, default=16, help="Rank fallback (khong nen duoc dung).")
+    p.add_argument("--lora_r_router", type=int, default=4)
+    p.add_argument("--lora_r_attn", type=int, default=16)
+    p.add_argument("--lora_r_expert", type=int, default=16)
+    p.add_argument("--lora_alpha", type=int, default=32)
     p.add_argument("--lora_dropout", type=float, default=0.05)
 
     # Checkpoint / resume
@@ -335,53 +270,51 @@ def build_argparser() -> argparse.ArgumentParser:
                     help="'auto' de tu tim checkpoint moi nhat trong output_dir, hoac duong dan cu the")
 
     # Distributed
-    p.add_argument("--local_rank", type=int, default=-1,
-                    help="Duoc torchrun/torch.distributed.launch tu dong truyen qua bien moi "
-                         "truong LOCAL_RANK; CLI arg nay chi la fallback.")
-    p.add_argument("--find_unused_parameters", dest="find_unused_parameters",
-                    action="store_true", default=True,
-                    help="[FIX NCCL Watchdog SIGABRT] Mac dinh True. Cung voi zero_grad_anchor() "
-                         "(cong 0.0 * sum(param) vao loss truoc backward(), xem dinh nghia truoc "
-                         "compute_task_step) — 2 co che nay DOC LAP nhau va CA HAI cung dam bao "
-                         "MOI tham so LoRA (ke ca expert khong nhan token nao trong 1 step/GPU, "
-                         "do router chi chon top_k << num_experts, vd 4/60) deu co gradient (0 "
-                         "hoac that) thay vi None, nen KHONG con nguy co DDP Reducer cho vo han "
-                         "gradient -> NCCL Watchdog SIGABRT (exit code -6). Vi zero_grad_anchor() "
-                         "da tu no du de chan loi nay, --no_find_unused_parameters (tat co che "
-                         "duyet lai graph cua DDP, nhanh hon 1 chut) gio AN TOAN de dung, khong "
-                         "con la nguyen nhan truc tiep gay SIGABRT nhu truoc nua.")
-    p.add_argument("--no_find_unused_parameters", dest="find_unused_parameters",
-                    action="store_false")
-    p.add_argument("--nccl_timeout_minutes", type=int, default=30,
-                    help="[FIX NCCL Watchdog SIGABRT] Timeout (phut) cho moi thao tac dong bo "
-                         "NCCL (all_reduce gradient, dist.barrier(), ...). Mac dinh cua PyTorch "
-                         "chi la 10 phut — qua ngan lam bien do an toan cho cac stall tam thoi "
-                         "khong lien quan MoE (vd DataLoader doc cham/lag khi data nam tren "
-                         "Lustre/NFS). Tang gia tri nay LA BIEN PHAP PHONG HO THEM, khong thay "
-                         "the cho --find_unused_parameters (fix tan goc nguyen nhan MoE).")
-    p.add_argument("--dataloader_prefetch_factor", type=int, default=4,
-                    help="So batch moi DataLoader worker doc truoc (chi co hieu luc khi "
-                         "--num_workers > 0). Tang gia tri nay + persistent_workers=True (tu "
-                         "dong bat khi num_workers > 0) giup giam nguy co DataLoader bi stall "
-                         "khi doc du lieu tu file-system mang (vd Lustre), mot nguyen nhan phu "
-                         "co the gay trieu chung treo NCCL giong het truong hop MoE.")
+    p.add_argument("--local_rank", type=int, default=-1)
+    p.add_argument("--nccl_timeout_minutes", type=int, default=30)
 
     # Misc
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--dtype", type=str, default="bfloat16",
-                    choices=["bfloat16", "float16", "float32"])
+    p.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16", "float32"])
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu",
                     help="Chi dung khi CHAY DON PROCESS (khong qua torchrun)")
     p.add_argument("--trust_remote_code", action="store_true", default=True)
-    p.add_argument("--diagnostics_dir", type=str, default=None,
-                    help="None = <output_dir>/diagnostics")
-    p.add_argument("--log_every", type=int, default=10, help="Cap nhat plot loss moi N step")
-
+    p.add_argument("--diagnostics_dir", type=str, default=None)
+    p.add_argument("--log_every", type=int, default=10)
+    p.add_argument("--smooth_window", type=int, default=50,
+                    help="So step lien tiep duoc trung binh cho moi diem tren duong *_smoothed.png.")
     return p
 
 
+def sync_grads_across_ranks(trainable_params: List[torch.Tensor], world_size: int):
+    """All-reduce (trung binh) gradient THU CONG, gop thanh 1 buffer lien tuc theo dtype.
+    Tham so khong co grad (None) — vd LoRA cua expert khong nhan token nao tren rank nay — duoc
+    dien 0 TRUOC khi gop, de MOI rank luon all-reduce buffer cung kich thuoc va cung thu tu."""
+    from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+
+    for p in trainable_params:
+        if p.grad is None:
+            p.grad = torch.zeros_like(p)
+    grads_by_dtype: Dict[torch.dtype, List[torch.Tensor]] = {}
+    for p in trainable_params:
+        grads_by_dtype.setdefault(p.grad.dtype, []).append(p.grad)
+    for _, grads in grads_by_dtype.items():
+        flat = _flatten_dense_tensors(grads)
+        dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+        flat.div_(world_size)
+        for g, synced in zip(grads, _unflatten_dense_tensors(flat, grads)):
+            g.copy_(synced)
+
+
+def broadcast_trainable_params(trainable_params: List[torch.Tensor], src: int = 0):
+    """Dong bo gia tri khoi tao LoRA tu rank 0 (khong con DDP tu broadcast luc khoi tao)."""
+    for p in trainable_params:
+        dist.broadcast(p.data, src=src)
+
+
+
 # ============================================================================================
-# Utils chung
+# Utils + distributed (khong con DDP — xem docstring dau file)
 # ============================================================================================
 def set_seed(seed: int):
     random.seed(seed)
@@ -396,9 +329,6 @@ def clear_memory():
         torch.cuda.empty_cache()
 
 
-# ============================================================================================
-# Distributed setup: thay the hoan toan co che OOM dynamic-split cua ban plain-LoRA goc bang DDP.
-# ============================================================================================
 def setup_distributed(args) -> Tuple[bool, int, int, int, torch.device]:
     """Tra ve (is_distributed, local_rank, global_rank, world_size, device).
 
@@ -409,10 +339,8 @@ def setup_distributed(args) -> Tuple[bool, int, int, int, torch.device]:
     if world_size > 1:
         local_rank = int(os.environ.get("LOCAL_RANK", args.local_rank if args.local_rank >= 0 else 0))
         backend = "nccl" if torch.cuda.is_available() else "gloo"
-        # [FIX NCCL Watchdog SIGABRT] Mac dinh PyTorch chi cho 10 phut (600s) cho moi thao tac
-        # dong bo NCCL. Voi backbone MoE + LoRA tren 1 layer, nguyen nhan chinh gay treo la
-        # find_unused_parameters (xem noi khoi tao DDP ben duoi); timeout duoc tang o day chi
-        # la bien do an toan PHU cho cac stall tam thoi khac (vd DataLoader doc tu Lustre lag).
+        # Mac dinh PyTorch chi cho 10 phut cho moi thao tac NCCL; tang len --nccl_timeout_minutes
+        # de chiu duoc luc rank 0 luu checkpoint / push len Hub trong khi cac rank khac cho o barrier.
         dist.init_process_group(
             backend=backend,
             init_method="env://",
@@ -441,9 +369,7 @@ def get_underlying_model(model):
 
 
 # ============================================================================================
-# Du lieu: doc bitext english-other tu du lieu multiway-parallel dang JSON (dieu kien thay
-# doi #1). Moi record trong file JSON co dang {"id": ..., "eng_Latn": "...", "<lang>": "...", ...}
-# -> voi moi ngon ngu khac ngoai eng_key, tao 1 cap (eng_text, other_text, lang_code).
+# Du lieu ALIGNMENT: bitext english-other tu JSON multiway-parallel
 # ============================================================================================
 def load_bitext_pairs(data_dir: str, data_files: Sequence[str], eng_key: str,
                        max_lang_pairs_per_record: Optional[int] = None,
@@ -482,30 +408,409 @@ def load_bitext_pairs(data_dir: str, data_files: Sequence[str], eng_key: str,
     return pairs
 
 
-class BitextPairDataset(Dataset):
-    """Moi sample la 1 tuple (eng_text, other_text, lang_code). Tokenize duoc thuc hien
-    theo tung batch trong vong lap training (khong tokenize truoc toan bo)."""
-
-    def __init__(self, pairs: List[Tuple[str, str, str]]):
-        self.pairs = pairs
-
-    def __len__(self):
-        return len(self.pairs)
-
-    def __getitem__(self, idx):
-        return self.pairs[idx]
+# ============================================================================================
+# Doc du lieu TASK — COPY NGUYEN VAN tu cac file finetuning english-task-only
+# (chi doi ten build_prompt/build_full_text/build_examples them tien to squad_/snli_/mmlu_ de khong trung ten)
+# ============================================================================================
+WORD_SPAN_PATTERN = re.compile(r"\S+")
+CHOICE_LETTERS = string.ascii_uppercase
 
 
-def collate_bitext(batch: List[Tuple[str, str, str]]):
-    eng_texts, other_texts, lang_codes = zip(*batch)
-    return list(eng_texts), list(other_texts), list(lang_codes)
+LABEL_TO_WORD = {0: "entailment", 1: "neutral", 2: "contradiction"}
+
+
+# ---------------------------------------- SQuAD ----------------------------------------
+def load_squad_records(data_file: str) -> List[Dict]:
+    """Doc file JSON dang list cac object SQuAD chuan:
+        {"id", "title", "context", "question",
+         "answers": {"text": [...], "answer_start": [...]}}
+    Bo qua record thieu field, khong co dap an (SQuAD 2.0 "unanswerable", answers.text rong —
+    khong phu hop voi muc tieu zero-shot tren cac benchmark luon-co-dap-an nhu XQuAD), hoac
+    answer_start khong khop voi noi dung context (loi du lieu)."""
+    if not os.path.exists(data_file):
+        raise FileNotFoundError(f"Khong tim thay file du lieu SQuAD: {data_file}")
+    with open(data_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    records: List[Dict] = []
+    n_skipped_missing = 0
+    n_skipped_unanswerable = 0
+    n_skipped_mismatch = 0
+    for rec in data:
+        if not isinstance(rec, dict):
+            n_skipped_missing += 1
+            continue
+        context = rec.get("context")
+        question = rec.get("question")
+        answers = rec.get("answers")
+        if context is None or question is None or not isinstance(answers, dict):
+            n_skipped_missing += 1
+            continue
+        texts = answers.get("text") or []
+        starts = answers.get("answer_start") or []
+        if not texts or not starts:
+            n_skipped_unanswerable += 1
+            continue
+
+        # SQuAD train thuong chi co 1 dap an/cau hoi; neu co nhieu, lay dap an dau tien de train
+        # (giong quy uoc pho bien khi finetune generative QA tren SQuAD).
+        answer_text = str(texts[0]).strip()
+        try:
+            answer_start = int(starts[0])
+        except (TypeError, ValueError):
+            n_skipped_missing += 1
+            continue
+        if not answer_text:
+            n_skipped_unanswerable += 1
+            continue
+
+        context = str(context)
+        # Kiem tra answer_start co thuc su tro dung vao answer_text trong context khong (an
+        # toan du lieu — mot so file SQuAD-like bi lech offset do tien xu ly khac nhau).
+        span = context[answer_start: answer_start + len(answer_text)]
+        if span.strip() != answer_text.strip():
+            # Thu tim lai vi tri chinh xac trong context (fallback) truoc khi bo qua han.
+            found_at = context.find(answer_text)
+            if found_at == -1:
+                n_skipped_mismatch += 1
+                continue
+            answer_start = found_at
+
+        records.append({
+            "id": rec.get("id"),
+            "context": context.strip(),
+            "question": str(question).strip(),
+            "answer_text": answer_text,
+            "answer_start": answer_start,
+        })
+    logger.info(
+        f"Da doc {len(records)} sample hop le tu {data_file} "
+        f"(bo qua {n_skipped_missing} record thieu field, "
+        f"{n_skipped_unanswerable} cau hoi khong co dap an, "
+        f"{n_skipped_mismatch} record lech offset answer_start/context)."
+    )
+    return records
+
+
+def squad_build_prompt(context: str, question: str) -> str:
+    """Prompt dang instruction cho extractive QA. Phan sau 'Answer:' la phan model phai sinh ra
+    va la phan DUY NHAT duoc tinh loss (xem squad_build_full_text + mask trong
+    forward_backward_one_subbatch). Dung format nay de tuong thich truc tiep voi cach eval
+    zero-shot pho bien cho SQuAD/XQuAD (prompt giong het khi generate o eval, chi bo phan dap an)."""
+    return (
+        f"Context: {context}\n"
+        f"Question: {question}\n"
+        f"Answer:"
+    )
+
+
+def squad_build_full_text(context: str, question: str, answer_text: str, eos_token: str) -> Tuple[str, str]:
+    prompt = squad_build_prompt(context, question)
+    full_text = f"{prompt} {answer_text}{eos_token}"
+    return prompt, full_text
+
+
+def select_context_window(context: str, answer_start: int, answer_text: str,
+                           tokenizer, max_context_tokens: int) -> str:
+    """Khi full_text vuot qua --max_length, KHONG truncate tho tu tokenizer (se cat mat phan
+    'Answer: ...' nam o cuoi chuoi), ma chon 1 CUA SO cac TU trong context BAO QUANH vi tri
+    cua answer (dua vao answer_start), roi mo rong dan sang trai/phai (giu nguyen tung tu) cho
+    toi khi vua sat ngan sach max_context_tokens. Nho vay context van luon chua answer."""
+    spans = [m.span() for m in WORD_SPAN_PATTERN.finditer(context)]
+    if not spans:
+        return context
+
+    answer_end = answer_start + len(answer_text)
+    left_idx, right_idx = None, None
+    for i, (s, e) in enumerate(spans):
+        if e > answer_start and left_idx is None:
+            left_idx = i
+        if s < answer_end:
+            right_idx = i
+    if left_idx is None or right_idx is None:
+        left_idx, right_idx = 0, 0
+    lo, hi = left_idx, right_idx
+
+    def window_text(lo, hi):
+        return context[spans[lo][0]: spans[hi][1]]
+
+    def token_len(s: str) -> int:
+        return len(tokenizer(s, add_special_tokens=False)["input_ids"])
+
+    cur_text = window_text(lo, hi)
+    if token_len(cur_text) > max_context_tokens:
+        # Ngay ca cua so toi thieu (chi vua du cac tu cua answer) da vuot ngan sach -> tra ve
+        # nguyen trang, ham goi se tu phat hien full_text van qua dai va skip sample nay.
+        return cur_text
+
+    while True:
+        moved = False
+        if lo > 0:
+            candidate = window_text(lo - 1, hi)
+            if token_len(candidate) <= max_context_tokens:
+                lo -= 1
+                cur_text = candidate
+                moved = True
+        if hi < len(spans) - 1:
+            candidate = window_text(lo, hi + 1)
+            if token_len(candidate) <= max_context_tokens:
+                hi += 1
+                cur_text = candidate
+                moved = True
+        if not moved:
+            break
+    return cur_text
+
+
+def compute_lengths(tokenizer, texts: Sequence[str], chunk_size: int = 1000) -> List[int]:
+    lengths: List[int] = []
+    for i in tqdm(range(0, len(texts), chunk_size), desc="Tinh do dai token cho toan bo sample"):
+        chunk = texts[i:i + chunk_size]
+        enc = tokenizer(chunk, add_special_tokens=True)
+        lengths.extend(len(ids) for ids in enc["input_ids"])
+    return lengths
+
+
+def squad_build_examples(records: List[Dict], tokenizer, eos_token: str, max_length: int) -> Tuple[List[Dict], List[int]]:
+    """Tien xu ly: moi record -> {"prompt", "full_text", "answer_text"}.
+    Sample nao co full_text vuot qua max_length se duoc "windowing" lai context (xem
+    select_context_window); neu van khong vua sau khi windowing (hiem) thi bi bo qua.
+    Tra ve (examples, lengths) da loc, dong bo index voi nhau — dung truc tiep cho
+    LengthGroupedBatchSampler, tranh phai tokenize lai toan bo lan nua."""
+    # Buoc 1: build naive (chua windowing) cho toan bo, tinh do dai token 1 lan (batch, nhanh).
+    naive_examples = []
+    for rec in records:
+        prompt, full_text = squad_build_full_text(rec["context"], rec["question"], rec["answer_text"], eos_token)
+        naive_examples.append({
+            "prompt": prompt,
+            "full_text": full_text,
+            "answer_text": rec["answer_text"],
+            "context": rec["context"],
+            "question": rec["question"],
+            "answer_start": rec["answer_start"],
+        })
+    naive_lengths = compute_lengths(tokenizer, [ex["full_text"] for ex in naive_examples])
+
+    # Buoc 2: chi ap dung windowing (co the cham hon, goi tokenizer nhieu lan) cho phan THIEU SO
+    # sample vuot qua max_length — da so sample SQuAD se vua trong 1 lan, khong can qua buoc nay.
+    examples: List[Dict] = []
+    lengths: List[int] = []
+    n_windowed = 0
+    n_dropped_too_long = 0
+    for ex, naive_len in tqdm(list(zip(naive_examples, naive_lengths)),
+                               desc="Kiem tra/loc do dai (windowing context qua dai neu can)"):
+        if naive_len <= max_length:
+            examples.append({"prompt": ex["prompt"], "full_text": ex["full_text"]})
+            lengths.append(naive_len)
+            continue
+
+        # Ngan sach token danh cho context = max_length tru phan "Context: \nQuestion: ...\n
+        # Answer: <answer><eos>" (moi thu tru context), tru them margin an toan cho cac dac thu
+        # tokenization (BOS/khoang trang noi tu ...).
+        overhead_text = f"Context: \nQuestion: {ex['question']}\nAnswer: {ex['answer_text']}{eos_token}"
+        overhead_tokens = len(tokenizer(overhead_text, add_special_tokens=True)["input_ids"])
+        max_context_tokens = max_length - overhead_tokens - 8
+        if max_context_tokens <= 0:
+            n_dropped_too_long += 1
+            continue
+
+        windowed_context = select_context_window(
+            ex["context"], ex["answer_start"], ex["answer_text"], tokenizer, max_context_tokens
+        )
+        new_prompt, new_full_text = squad_build_full_text(windowed_context, ex["question"], ex["answer_text"], eos_token)
+        new_len = len(tokenizer(new_full_text, add_special_tokens=True)["input_ids"])
+        if new_len > max_length:
+            n_dropped_too_long += 1
+            continue
+
+        examples.append({"prompt": new_prompt, "full_text": new_full_text})
+        lengths.append(new_len)
+        n_windowed += 1
+
+    logger.info(
+        f"squad_build_examples: {len(examples)} sample giu lai (trong do {n_windowed} sample da duoc "
+        f"windowing context vi vuot max_length={max_length}), bo qua {n_dropped_too_long} sample "
+        f"van qua dai ngay ca sau khi windowing."
+    )
+    return examples, lengths
+
+
+# ---------------------------------------- SNLI -----------------------------------------
+def load_snli_records(data_file: str) -> List[Dict]:
+    """Doc file JSON dang list cac object {"premise": ..., "hypothesis": ..., "label": 0/1/2}.
+    Bo qua record thieu field, hoac label khong nam trong {0, 1, 2} (SNLI goc dung -1 cho
+    cac cau khong dong thuan giua annotator)."""
+    if not os.path.exists(data_file):
+        raise FileNotFoundError(f"Khong tim thay file du lieu SNLI: {data_file}")
+    with open(data_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    records: List[Dict] = []
+    n_skipped = 0
+    for rec in data:
+        if not isinstance(rec, dict):
+            n_skipped += 1
+            continue
+        premise = rec.get("premise")
+        hypothesis = rec.get("hypothesis")
+        label = rec.get("label")
+        if premise is None or hypothesis is None or label is None:
+            n_skipped += 1
+            continue
+        try:
+            label = int(label)
+        except (TypeError, ValueError):
+            n_skipped += 1
+            continue
+        if label not in LABEL_TO_WORD:
+            n_skipped += 1
+            continue
+        records.append({
+            "premise": str(premise).strip(),
+            "hypothesis": str(hypothesis).strip(),
+            "label": label,
+        })
+    logger.info(f"Da doc {len(records)} sample hop le tu {data_file} (bo qua {n_skipped} record loi/label khong hop le).")
+    return records
+
+
+def snli_build_prompt(premise: str, hypothesis: str) -> str:
+    """Prompt dang instruction cho NLI. Phan sau 'Answer:' la phan model phai sinh ra va la
+    phan DUY NHAT duoc tinh loss (xem snli_build_full_text + mask trong forward_backward_one_subbatch)."""
+    return (
+        f"Premise: {premise}\n"
+        f"Hypothesis: {hypothesis}\n"
+        f"Question: What is the relationship between the premise and the hypothesis? "
+        f"Choose one: entailment, neutral, or contradiction.\n"
+        f"Answer:"
+    )
+
+
+def snli_build_full_text(premise: str, hypothesis: str, label: int, eos_token: str) -> Tuple[str, str]:
+    prompt = snli_build_prompt(premise, hypothesis)
+    label_word = LABEL_TO_WORD[label]
+    full_text = f"{prompt} {label_word}{eos_token}"
+    return prompt, full_text
+
+
+def snli_build_examples(records: List[Dict], eos_token: str) -> List[Dict]:
+    """Tien xu ly 1 lan: moi record -> {"prompt", "full_text", "label", "label_word"}.
+    Tranh phai build lai chuoi prompt/full_text moi lan __getitem__/moi epoch."""
+    examples = []
+    for rec in records:
+        prompt, full_text = snli_build_full_text(rec["premise"], rec["hypothesis"], rec["label"], eos_token)
+        examples.append({
+            "prompt": prompt,
+            "full_text": full_text,
+            "label": rec["label"],
+            "label_word": LABEL_TO_WORD[rec["label"]],
+        })
+    return examples
+
+
+# ---------------------------------------- MMLU -----------------------------------------
+def load_mmlu_records(data_file: str) -> List[Dict]:
+    """Doc file JSON dang list cac object MMLU chuan:
+        {"question": str, "choices": [str, ...], "answer": int, "subject": str}
+    Bo qua record thieu field, choices khong hop le (khong phai list, < 2 phan tu), hoac answer
+    khong nam trong khoang [0, len(choices)-1]."""
+    if not os.path.exists(data_file):
+        raise FileNotFoundError(f"Khong tim thay file du lieu MMLU: {data_file}")
+    with open(data_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    records: List[Dict] = []
+    n_skipped_missing = 0
+    n_skipped_bad_answer = 0
+    for rec in data:
+        if not isinstance(rec, dict):
+            n_skipped_missing += 1
+            continue
+        question = rec.get("question")
+        choices = rec.get("choices")
+        answer = rec.get("answer")
+        subject = rec.get("subject", "")
+        if question is None or not isinstance(choices, list) or len(choices) < 2 or answer is None:
+            n_skipped_missing += 1
+            continue
+        try:
+            answer = int(answer)
+        except (TypeError, ValueError):
+            n_skipped_bad_answer += 1
+            continue
+        if not (0 <= answer < len(choices)):
+            n_skipped_bad_answer += 1
+            continue
+        if len(choices) > len(CHOICE_LETTERS):
+            n_skipped_bad_answer += 1
+            continue
+
+        records.append({
+            "question": str(question).strip(),
+            "choices": [str(c).strip() for c in choices],
+            "answer": answer,
+            "subject": str(subject).strip() if subject else "",
+        })
+    logger.info(
+        f"Da doc {len(records)} sample hop le tu {data_file} "
+        f"(bo qua {n_skipped_missing} record thieu field, "
+        f"{n_skipped_bad_answer} record answer/choices khong hop le)."
+    )
+    return records
+
+
+def mmlu_build_prompt(question: str, choices: List[str], subject: str) -> str:
+    """Prompt dang trac nghiem, DUNG CHUAN format pho bien khi eval MMLU (lm-evaluation-harness
+    / paper goc), de tuong thich truc tiep voi zero-shot eval tren MMLU/MMMLU. Phan sau
+    'Answer:' la phan model phai sinh ra va la phan DUY NHAT duoc tinh loss (xem mmlu_build_full_text
+    + mask trong forward_backward_one_subbatch)."""
+    if subject:
+        header = f"The following are multiple choice questions (with answers) about {subject.replace('_', ' ')}.\n\n"
+    else:
+        header = "The following are multiple choice questions (with answers).\n\n"
+    choice_lines = "\n".join(f"{CHOICE_LETTERS[i]}. {c}" for i, c in enumerate(choices))
+    return f"{header}{question}\n{choice_lines}\nAnswer:"
+
+
+def mmlu_build_full_text(question: str, choices: List[str], subject: str, answer_idx: int,
+                     eos_token: str) -> Tuple[str, str]:
+    prompt = mmlu_build_prompt(question, choices, subject)
+    letter = CHOICE_LETTERS[answer_idx]
+    full_text = f"{prompt} {letter}{eos_token}"
+    return prompt, full_text
+
+
+def mmlu_build_examples(records: List[Dict], tokenizer, eos_token: str, max_length: int) -> Tuple[List[Dict], List[int]]:
+    """Tien xu ly 1 lan: moi record -> {"prompt", "full_text"}. Khac SQuAD (khong co "context"
+    dai can windowing) — MMLU prompt thuong ngan, sample nao (hiem) vuot max_length se bi BO QUA
+    hoan toan (KHONG truncate tho, vi truncation se cat mat dung phan "Answer: <letter>" o cuoi
+    chuoi). Tra ve (examples, lengths) da loc, dong bo index — dung truc tiep cho
+    LengthGroupedBatchSampler."""
+    full_texts, prompts = [], []
+    for rec in records:
+        prompt, full_text = mmlu_build_full_text(rec["question"], rec["choices"], rec["subject"],
+                                             rec["answer"], eos_token)
+        prompts.append(prompt)
+        full_texts.append(full_text)
+
+    lengths_all = compute_lengths(tokenizer, full_texts)
+
+    examples: List[Dict] = []
+    lengths: List[int] = []
+    n_dropped_too_long = 0
+    for prompt, full_text, length in zip(prompts, full_texts, lengths_all):
+        if length > max_length:
+            n_dropped_too_long += 1
+            continue
+        examples.append({"prompt": prompt, "full_text": full_text})
+        lengths.append(length)
+
+    logger.info(
+        f"mmlu_build_examples: {len(examples)} sample giu lai, bo qua {n_dropped_too_long} sample "
+        f"vuot qua max_length={max_length} (khong truncate de tranh cat mat nhan)."
+    )
+    return examples, lengths
 
 
 # ============================================================================================
-# Tu dong tim target module cho LoRA: attention / router / experts trong MOT RANGE layer
-# (dieu kien thay doi #2 — range [L/3, 2L/3), TACH BACH voi layer dung de tinh alignment loss).
-# `layer_indices` la mot SET cac chi so layer (0-based) tuy y, ham nay khong quan tam no la
-# 1 layer hay nhieu layer.
+# Tu dong tim target module LoRA (range layer) + MoE helpers (giu nguyen tu ban MidAlign truoc)
 # ============================================================================================
 LAYER_IDX_PATTERN = re.compile(r"\.(?:layers|h|blocks|block)\.(\d+)\.")
 
@@ -609,9 +914,6 @@ def infer_moe_dims(config, args):
     return num_experts, top_k
 
 
-# ============================================================================================
-# MoE load-balancing loss chuan (Switch/Mixtral style) — phu tro cho task step (xem docstring)
-# ============================================================================================
 def compute_load_balancing_loss(router_logits_list: List[torch.Tensor], attention_mask: torch.Tensor,
                                  num_experts: int, top_k: int):
     """attention_mask: [batch, seq_len] (1 = token that, 0 = padding). Phai loai bo vi tri
@@ -645,104 +947,7 @@ def compute_load_balancing_loss(router_logits_list: List[torch.Tensor], attentio
 
 
 # ============================================================================================
-# [FIX RuntimeError "Expected to mark a variable ready only once"]
-# `compute_alignment_step` ben duoi goi model(...) HAI LAN rieng biet trong CUNG 1 iteration
-# (1 lan cho eng_texts, 1 lan cho other_texts) roi moi backward() MOT LAN cho tong align_loss.
-# Day la pattern "nhieu forward - mot backward" (kieu Siamese network). Voi backbone MoE, neu
-# router CUA STEP DO tinh co chon TRUNG 1 expert (vd expert 33 o layer 15) cho ca token trong
-# batch eng LAN batch other, thi tham so LoRA cua expert do xuat hien trong CA HAI do thi
-# forward rieng biet; khi goi backward() 1 lan, autograd hook cua DDP Reducer cho tham so do
-# bi kich hoat 2 LAN trong cung 1 iteration -> DDP mac dinh coi day la loi ("moi tham so chi
-# duoc ready dung 1 lan/iteration") va raise RuntimeError. Day la ly do loi CHI xuat hien sau
-# hang chuc nghin step: no phu thuoc hoan toan vao viec router co tinh co chon trung expert
-# giua 2 batch eng/other hay khong (ngau nhien theo noi dung tung batch), khong lien quan gi
-# den do dai sample.
-#
-# Fix: goi `model._set_static_graph()` DUY NHAT 1 LAN ngay sau khi wrap DDP, TRUOC forward
-# dau tien cua toan bo qua trinh train (xem noi khoi tao DDP ben duoi). `static_graph=True`
-# chuyen DDP Reducer sang co che gom all-reduce SAU KHI toan bo backward cua iteration hoan
-# tat (thay vi ban all-reduce ngay khi tung tham so "ready"), nen 1 tham so nhan gradient tu
-# nhieu nhanh forward khac nhau trong cung 1 iteration (dung truong hop tren) khong con gay
-# loi nua — day chinh la use-case PyTorch liet ke ro trong doc cua static_graph ("multiple
-# forward passes are computed in one iteration with multiple corresponding backward passes").
-# Dieu kien de static_graph AN TOAN: tap tham so tham gia gradient phai KHONG doi giua cac
-# iteration — dieu nay da duoc dam bao san boi `zero_grad_anchor` o duoi (moi LoRA param, du
-# expert co duoc router chon hay khong, deu duoc "neo" vao graph voi grad=0 moi step), nen
-# static_graph hoan toan tuong thich va an toan de bat cung luc voi zero_grad_anchor.
-# KHONG lam thay doi cach tokenize/batch (khong gop eng+other), nen KHONG anh huong peak
-# memory/OOM nhu cach gop batch da thu truoc do.
-# ============================================================================================
-
-
-# ============================================================================================
-# [FIX NCCL Watchdog SIGABRT — bo sung, KHONG them forward pass nao]
-#
-# find_unused_parameters=True (o noi khoi tao DDP) da sua duoc goc van de, nhung no la 1
-# CO CHE CUA DDP: yeu cau DDP duyet lai toan bo autograd graph SAU MOI forward, va CHI co
-# hieu luc khi --find_unused_parameters duoc BAT. Neu chay voi --no_find_unused_parameters
-# (vd de tiet kiem chi phi duyet graph moi step) ma van con (cac) expert LoRA khong nhan
-# token nao trong 1 step/GPU nao do, loi NCCL Watchdog -> SIGABRT y het log gap phai se quay
-# lai, vi luc do khong con ai bao DDP Reducer bo qua tham so thieu gradient nua.
-#
-# Fix bo sung o day KHONG phu thuoc --find_unused_parameters: cong them vao loss 1 "neo"
-# = 0.0 * sum(p.sum() cho MOI tham so trainable). Ve mat toan hoc gia tri neo nay LUON = 0
-# (nhan voi 0.0) nen KHONG lam sai lech loss/gradient that; nhung ve mat autograd, moi tham
-# so trainable — ke ca LoRA cua (cac) expert khong duoc router chon token nao trong step do
-# — gio THAT SU xuat hien trong graph va nhan duoc gradient = 0 (thay vi None), nen DDP
-# Reducer luon thay du gradient o MOI iteration, du find_unused_parameters la True hay False.
-#
-# Da CO Y KHONG chon cach gop 2 forward pass (task + align) lam 1 de "ep" moi expert deu
-# duoc dung: cach do lam tang dinh (peak) activation memory vi phai giu dong thoi 2 do thi
-# tinh toan trong VRAM -> da gay OOM khi thu. Cach "neo" ben duoi chi thao tac tren cac
-# TENSOR THAM SO da co san (khong forward lai qua model, khong sinh activation moi), nen chi
-# phi gan nhu bang 0 va khong lam tang peak memory.
-# ============================================================================================
-def zero_grad_anchor(trainable_params: List[torch.Tensor], device) -> torch.Tensor:
-    """Tra ve 1 scalar tensor = 0.0 nhung phu thuoc (autograd) vao TOAN BO trainable_params.
-    Cong ket qua nay vao loss TRUOC khi goi backward() de dam bao khong con "unused
-    parameter" trong DDP, bat ke find_unused_parameters=True/False."""
-    if not trainable_params:
-        return torch.zeros((), device=device)
-    return sum(p.sum() for p in trainable_params) * 0.0
-
-
-# ============================================================================================
-# Task step: causal LM tren TARGET LANGUAGE (dieu kien giu nguyen #2) (+ L_LB phu tro MoE)
-# ============================================================================================
-def compute_task_step(other_texts: List[str], tokenizer, model, max_length: int, device,
-                       router_logits_cache: list, num_experts, top_k, lb_loss_coef: float):
-    enc = tokenizer(other_texts, padding=True, truncation=True, max_length=max_length,
-                     return_tensors="pt")
-    input_ids = enc["input_ids"].to(device, non_blocking=True)
-    attention_mask = enc["attention_mask"].to(device, non_blocking=True)
-    labels = input_ids.clone()
-    labels[attention_mask == 0] = -100
-
-    router_logits_cache.clear()
-    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-    logits = outputs.logits
-
-    shift_logits = logits[..., :-1, :].contiguous()
-    shift_labels = labels[..., 1:].contiguous()
-    lm_loss = F.cross_entropy(
-        shift_logits.view(-1, shift_logits.size(-1)),
-        shift_labels.view(-1),
-        ignore_index=-100,
-    )
-
-    if router_logits_cache and num_experts and top_k:
-        lb_loss = compute_load_balancing_loss(router_logits_cache, attention_mask, num_experts, top_k)
-        lb_loss = lb_loss.to(lm_loss.device)
-    else:
-        lb_loss = torch.zeros((), device=lm_loss.device)
-
-    total_loss = lm_loss + lb_loss_coef * lb_loss
-    return lm_loss, lb_loss, total_loss
-
-
-# ============================================================================================
-# Align step: contrastive loss tai DUNG 1 middle layer (tu dong suy tu num_hidden_layers,
-# xem infer_middle_layer()), cap english-other (dieu kien giu nguyen #3, #4)
+# Align step: contrastive loss tai DUNG 1 middle layer (giu nguyen tu ban MidAlign truoc)
 # ============================================================================================
 def mean_pool_hidden(hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
     mask = attention_mask.unsqueeze(-1).to(hidden_states.dtype)
@@ -789,10 +994,209 @@ def compute_alignment_step(eng_texts: List[str], other_texts: List[str], tokeniz
 
 
 # ============================================================================================
-# Checkpoint / resume — chi giu 1 checkpoint moi nhat, tu dong xoa checkpoint cu
+# Task pool: gop SQuAD + SNLI + MMLU thanh 1 danh sach example duy nhat {"prompt","full_text","src"}
+# (doc/build prompt/windowing/loc do dai bang CHINH cac ham cua cac file finetuning goc)
+# ============================================================================================
+def build_task_pool(args, tokenizer) -> Tuple[List[Dict], List[int], Dict[str, Dict[str, int]]]:
+    eos = tokenizer.eos_token
+    rng = random.Random(args.seed)
+    examples: List[Dict] = []
+    lengths: List[int] = []
+    stats: Dict[str, Dict[str, int]] = {}
+
+    def _cap(records):
+        if args.max_task_samples and len(records) > args.max_task_samples:
+            records = list(records)
+            rng.shuffle(records)
+            records = records[: args.max_task_samples]
+        return records
+
+    def _add(src: str, exs: List[Dict], lens: List[int], n_loaded: int):
+        for ex, ln in zip(exs, lens):
+            examples.append({"prompt": ex["prompt"], "full_text": ex["full_text"], "src": src})
+            lengths.append(ln)
+        stats[src] = {"loaded": n_loaded, "kept": len(exs), "dropped": n_loaded - len(exs)}
+
+    if "squad" in args.task_datasets:
+        recs = _cap(load_squad_records(args.squad_file))
+        exs, lens = squad_build_examples(recs, tokenizer, eos, args.task_max_length)
+        _add("squad", exs, lens, len(recs))
+    if "snli" in args.task_datasets:
+        recs = _cap(load_snli_records(args.snli_file))
+        all_exs = snli_build_examples(recs, eos)
+        all_lens = compute_lengths(tokenizer, [e["full_text"] for e in all_exs])
+        keep = [(e, l) for e, l in zip(all_exs, all_lens) if l <= args.task_max_length]
+        _add("snli", [k[0] for k in keep], [k[1] for k in keep], len(recs))
+    if "mmlu" in args.task_datasets:
+        recs = _cap(load_mmlu_records(args.mmlu_file))
+        exs, lens = mmlu_build_examples(recs, tokenizer, eos, args.task_max_length)
+        _add("mmlu", exs, lens, len(recs))
+
+    for src, st in stats.items():
+        logger.info(f"[task pool] {src}: doc {st['loaded']}, giu {st['kept']}, "
+                    f"bo (qua dai khong the cat) {st['dropped']}")
+    return examples, lengths, stats
+
+
+# ============================================================================================
+# Lich xen ke task/align + chia du lieu: moi epoch = N task step + N align step, dung HET data
+# ============================================================================================
+def solve_steps_per_side(n_task: int, n_align: int, world_size: int, align_batch_size: int,
+                          task_batch_size: Optional[int]) -> Tuple[int, str]:
+    """Tra ve (N, anchor). N = so task step = so align step moi epoch."""
+    if task_batch_size is None:
+        n = int(n_align / (align_batch_size * world_size) + 0.5)
+        return max(1, n), "align"
+    n = int(n_task / (task_batch_size * world_size) + 0.5)
+    return max(1, n), "task"
+
+
+def split_sizes(total: int, parts: int) -> List[int]:
+    """Chia `total` thanh `parts` phan chenh nhau toi da 1 (phan dau nhan them 1 neu du)."""
+    base, rem = divmod(total, parts)
+    return [base + 1 if i < rem else base for i in range(parts)]
+
+
+class AlternatePlan:
+    """Moi epoch: shuffle (seed + epoch) pool task va pool align, cat thanh N lat theo
+    split_sizes -> MOI sample xuat hien DUNG 1 LAN / epoch. Moi lat chia tiep cho cac rank
+    (rank r lay phan tu r, r+W, r+2W, ...). Lat task duoc sort theo do dai TRUOC khi chia rank
+    de moi rank co phan phoi do dai nhu nhau (can bang tai) va batch cua rank da sap xep tang
+    dan (thuan loi cho micro-batching theo token). Xac dinh hoan toan theo (seed, epoch) nen
+    resume giua epoch cho ra dung cac batch nhu lan chay truoc."""
+
+    def __init__(self, n_task, n_align, task_lengths, steps_per_side, world_size, rank, seed):
+        self.n_task, self.n_align = n_task, n_align
+        self.task_lengths = task_lengths
+        self.N, self.W, self.rank, self.seed = steps_per_side, world_size, rank, seed
+
+    def _perm(self, n: int, epoch: int, salt: int) -> List[int]:
+        rng = random.Random(self.seed * 1_000_003 + epoch * 101 + salt)
+        perm = list(range(n))
+        rng.shuffle(perm)
+        return perm
+
+    def epoch_batches(self, epoch: int) -> Tuple[List[List[int]], List[List[int]]]:
+        t_perm = self._perm(self.n_task, epoch, 1)
+        a_perm = self._perm(self.n_align, epoch, 2)
+        task_batches, align_batches = [], []
+        pos = 0
+        for s in split_sizes(self.n_task, self.N):
+            chunk = t_perm[pos:pos + s]
+            pos += s
+            chunk.sort(key=lambda i: self.task_lengths[i])
+            task_batches.append(chunk[self.rank::self.W])
+        pos = 0
+        for s in split_sizes(self.n_align, self.N):
+            chunk = a_perm[pos:pos + s]
+            pos += s
+            align_batches.append(chunk[self.rank::self.W])
+        return task_batches, align_batches
+
+
+# ============================================================================================
+# Task step: LM loss (chi tren phan dap an) tren batch tron SQuAD/SNLI/MMLU (+ L_LB phu tro MoE)
+# Chia batch cua rank thanh micro-batch theo ngan sach token, cong don gradient.
+# ============================================================================================
+def make_micro_batches(sorted_idx: List[int], lengths: List[int], token_budget: int) -> List[List[int]]:
+    """sorted_idx da sap xep TANG DAN theo do dai -> sample moi them vao luon la dai nhat nen
+    kich thuoc padded cua micro-batch = so_sample * do_dai_sample_moi."""
+    micro, cur = [], []
+    for i in sorted_idx:
+        if cur and (len(cur) + 1) * lengths[i] > token_budget:
+            micro.append(cur)
+            cur = []
+        cur.append(i)
+    if cur:
+        micro.append(cur)
+    return micro
+
+
+def forward_backward_task_micro(sub_examples, tokenizer, model, max_length, device,
+                                 router_logits_cache, num_experts, top_k, lb_loss_coef,
+                                 loss_weight):
+    """Tokenize + forward + backward cho 1 micro-batch. L_LM = cross-entropy CHI tren token
+    cua phan dap an ("<answer|label|letter><eos>"); prompt + padding bi mask -100 (giong cac
+    file finetuning goc). Cross-entropy chi tinh tren cac vi tri co nhan (tuong duong
+    ignore_index=-100 nhung khong phai copy ca tensor [B, T, V] logits).
+    Tra ve (lm, lb, total, n_correct_tokens, n_answer_tokens)."""
+    full_texts = [ex["full_text"] for ex in sub_examples]
+    prompts = [ex["prompt"] for ex in sub_examples]
+
+    enc = tokenizer(full_texts, padding=True, truncation=True, max_length=max_length,
+                     return_tensors="pt")
+    input_ids = enc["input_ids"].to(device, non_blocking=True)
+    attention_mask = enc["attention_mask"].to(device, non_blocking=True)
+    labels = input_ids.clone()
+    labels[attention_mask == 0] = -100
+
+    seq_len = labels.shape[1]
+    for i, p in enumerate(prompts):
+        ids = tokenizer(p, add_special_tokens=True, truncation=True, max_length=max_length)["input_ids"]
+        labels[i, :min(len(ids), seq_len)] = -100
+
+    router_logits_cache.clear()
+    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+    logits = outputs.logits
+
+    shift_labels = labels[..., 1:]
+    ans_mask = shift_labels != -100
+    sel_logits = logits[..., :-1, :][ans_mask]          # [n_answer_tokens, V]
+    sel_labels = shift_labels[ans_mask]
+    if sel_labels.numel() > 0:
+        lm_loss = F.cross_entropy(sel_logits, sel_labels)
+    else:
+        lm_loss = logits.sum() * 0.0
+
+    if router_logits_cache and num_experts and top_k:
+        lb_loss = compute_load_balancing_loss(router_logits_cache, attention_mask, num_experts, top_k)
+        lb_loss = lb_loss.to(lm_loss.device)
+    else:
+        lb_loss = torch.zeros((), device=lm_loss.device)
+
+    total_loss = lm_loss + lb_loss_coef * lb_loss
+    (total_loss * loss_weight).backward()
+
+    with torch.no_grad():
+        n_ans = int(sel_labels.numel())
+        n_correct = int((sel_logits.argmax(dim=-1) == sel_labels).sum().item()) if n_ans else 0
+    router_logits_cache.clear()
+    return lm_loss.item(), lb_loss.item(), total_loss.item(), n_correct, n_ans
+
+
+def compute_task_step(batch_idx: List[int], task_examples: List[Dict], task_lengths: List[int],
+                       tokenizer, model, max_length: int, token_budget: int, device,
+                       router_logits_cache: list, num_experts, top_k, lb_loss_coef: float) -> dict:
+    n = len(batch_idx)
+    agg = {"lm": 0.0, "lb": 0.0, "tot": 0.0, "correct": 0, "ans": 0}
+    for mb in make_micro_batches(batch_idx, task_lengths, token_budget):
+        sub = [task_examples[i] for i in mb]
+        lm, lb, tot, corr, cnt = forward_backward_task_micro(
+            sub, tokenizer, model, max_length, device, router_logits_cache,
+            num_experts, top_k, lb_loss_coef, loss_weight=len(mb) / n,
+        )
+        agg["lm"] += lm * len(mb)
+        agg["lb"] += lb * len(mb)
+        agg["tot"] += tot * len(mb)
+        agg["correct"] += corr
+        agg["ans"] += cnt
+    return {"lm": agg["lm"] / n, "lb": agg["lb"] / n, "tot": agg["tot"] / n,
+            "correct": agg["correct"], "ans": agg["ans"]}
+
+
+def reduce_metrics(vals: List[float], device, is_distributed: bool) -> List[float]:
+    t = torch.tensor(vals, dtype=torch.float64, device=device)
+    if is_distributed:
+        dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    return t.tolist()
+
+
+# ============================================================================================
+# Checkpoint / resume — chi giu 1 checkpoint moi nhat
 # ============================================================================================
 def save_checkpoint_and_rotate(output_dir, model, optimizer, scheduler, epoch, step_in_epoch,
-                                global_step, prev_checkpoint_dir: Optional[str]) -> str:
+                                global_step, steps_per_epoch, world_size,
+                                prev_checkpoint_dir: Optional[str]) -> str:
     underlying = get_underlying_model(model)
     ckpt_dir = os.path.join(output_dir, f"checkpoint-{global_step}")
     os.makedirs(ckpt_dir, exist_ok=True)
@@ -802,23 +1206,160 @@ def save_checkpoint_and_rotate(output_dir, model, optimizer, scheduler, epoch, s
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict() if scheduler is not None else None,
             "epoch": epoch,
-            "step_in_epoch": step_in_epoch,
+            "step_in_epoch": step_in_epoch,   # step CUOI CUNG DA HOAN THANH trong epoch (-1 = chua co)
             "global_step": global_step,
-            "torch_rng_state": torch.get_rng_state(),
-            "python_rng_state": random.getstate(),
+            "steps_per_epoch": steps_per_epoch,
+            "world_size": world_size,
         },
         os.path.join(ckpt_dir, "trainer_state.pt"),
     )
     with open(os.path.join(output_dir, "latest_checkpoint.txt"), "w") as f:
         f.write(ckpt_dir)
-
-    # Chi giu checkpoint moi nhat: xoa checkpoint truoc do ngay sau khi luu xong checkpoint moi
-    # (vd luu xong checkpoint-400 thi xoa ngay checkpoint-200 truoc do).
     if prev_checkpoint_dir and os.path.isdir(prev_checkpoint_dir) and prev_checkpoint_dir != ckpt_dir:
         shutil.rmtree(prev_checkpoint_dir, ignore_errors=True)
         logger.info(f"Da xoa checkpoint cu: {prev_checkpoint_dir}")
-
     return ckpt_dir
+
+
+# ============================================================================================
+# Diagnostics: jsonl + plot (tach task loss va align loss vi 2 loai step khac nhau)
+# ============================================================================================
+def log_step_to_jsonl(jsonl_path, global_step, epoch, step_type, lm_loss=None, lb_loss=None,
+                       task_total_loss=None, token_acc=None, align_loss=None, n_samples=None):
+    rec = {
+        "step": global_step, "epoch": epoch, "step_type": step_type,
+        "lm_loss": lm_loss, "lb_loss": lb_loss, "task_total_loss": task_total_loss,
+        "token_acc": token_acc, "align_loss": align_loss, "n_samples": n_samples,
+        "timestamp": time.time(),
+    }
+    with open(jsonl_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def _block_mean(steps: List[int], vals: List[float], window: int):
+    if window <= 1 or len(vals) <= 1:
+        return steps, vals
+    xs, ys = [], []
+    for i in range(0, len(vals), window):
+        blk = vals[i:i + window]
+        xs.append(steps[min(i + window, len(steps)) - 1])
+        ys.append(sum(blk) / len(blk))
+    return xs, ys
+
+
+def plot_losses(jsonl_path, out_png, align_layer, smooth_window: int = 1):
+    if not os.path.exists(jsonl_path):
+        return
+    t_steps, lm, lb, tot, acc, a_steps, al = [], [], [], [], [], [], []
+    with open(jsonl_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            if rec["step_type"] == "task":
+                t_steps.append(rec["step"]); lm.append(rec["lm_loss"]); lb.append(rec["lb_loss"])
+                tot.append(rec["task_total_loss"]); acc.append(rec.get("token_acc") or 0.0)
+            else:
+                a_steps.append(rec["step"]); al.append(rec["align_loss"])
+    if not t_steps and not a_steps:
+        return
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 9), sharex=True)
+    if t_steps:
+        for name, ys in (("L_LM (task: SQuAD+SNLI+MMLU)", lm), ("L_LB (task, MoE)", lb),
+                         ("L_task_total", tot)):
+            xs, ys2 = _block_mean(t_steps, ys, smooth_window)
+            ax1.plot(xs, ys2, label=name)
+    if a_steps:
+        xs, ys2 = _block_mean(a_steps, al, smooth_window)
+        ax1.plot(xs, ys2, label=f"L_align (contrastive @ layer {align_layer})")
+    ax1.set_ylabel("Loss")
+    ax1.set_title("MidAlign (Qwen1.5-MoE-A2.7B) — task step (chan) / align step (le)")
+    ax1.legend(); ax1.grid(alpha=0.3)
+    if t_steps:
+        xs, ys2 = _block_mean(t_steps, acc, smooth_window)
+        ax2.plot(xs, ys2, label="token acc tren phan dap an (task step)")
+        ax2.legend()
+    ax2.set_xlabel("Training step"); ax2.set_ylabel("Token acc"); ax2.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=150)
+    plt.close(fig)
+
+
+def plot_all(jsonl_path, plot_path, plot_path_smoothed, align_layer, smooth_window):
+    plot_losses(jsonl_path, plot_path, align_layer, 1)
+    plot_losses(jsonl_path, plot_path_smoothed, align_layer, smooth_window)
+
+
+# ============================================================================================
+# Hugging Face Hub push
+# ============================================================================================
+def build_model_card(args, num_experts, top_k, align_layer_0based, num_layers,
+                      lora_layer_start, lora_layer_end, n_task, n_align, steps_per_side,
+                      task_stats, world_size) -> str:
+    task_lines = "\n".join(f"  - {k}: {v['kept']} sample (doc {v['loaded']}, bo {v['dropped']})"
+                           for k, v in task_stats.items())
+    return f"""---
+license: apache-2.0
+base_model: {args.model_name_or_path}
+tags:
+- lora
+- peft
+- moe
+- mixture-of-experts
+- qwen
+- cross-lingual-alignment
+- midalign
+---
+
+# Qwen1.5-MoE-A2.7B-MidAlign (task = SQuAD + SNLI + MMLU)
+
+LoRA adapter finetune tu `{args.model_name_or_path}` theo baseline **MidAlign**, Alternate
+Training: step chan = task step (LM loss), step le = contrastive align step.
+
+## Alternate Training
+- **Task step (chan)**: `L_task = L_LM + lb_loss_coef * L_LB`. `L_LM` chi tinh tren phan dap an
+  (prompt bi mask), tren pool gop cua cac tap: {", ".join(args.task_datasets)}.
+{task_lines}
+  - `lb_loss_coef` = {args.lb_loss_coef}, `num_experts` = {num_experts}, `top_k` = {top_k}
+- **Align step (le)**: symmetric InfoNCE (in-batch negatives) giua mean-pooled hidden state cau
+  tieng Anh va cau target tai layer {args.align_layer} (block 0-indexed = {align_layer_0based}
+  / {num_layers} layer), temperature = {args.align_temperature}.
+- Moi epoch: {steps_per_side} task step + {steps_per_side} align step; dung het {n_task} sample task
+  va {n_align} cap bitext (nguon: {", ".join(args.alignment_data)}), moi sample 1 lan / epoch.
+- world_size = {world_size}, align_batch_size = {args.align_batch_size}, task_batch_size = {args.task_batch_size}
+  (None = tinh tu align), task_micro_batch_tokens = {args.task_micro_batch_tokens}.
+
+## LoRA
+- Range layer `[{lora_layer_start}, {lora_layer_end})` (0-indexed), attention / router / experts.
+- Rank: attention {args.lora_r_attn}, router {args.lora_r_router}, experts {args.lora_r_expert};
+  alpha = {args.lora_alpha}, dropout = {args.lora_dropout}.
+
+## Training
+- {args.num_train_epochs} epoch, gradient all-reduce thu cong (khong DDP), checkpoint chi giu ban moi nhat.
+- Diagnostics: `diagnostics/loss_log.jsonl`, `loss_curve.png`, `loss_curve_smoothed.png`.
+"""
+
+
+def push_to_hub(local_ckpt_dir, diagnostics_dir, hub_model_id, private, readme_text, token=None):
+    if not HF_HUB_AVAILABLE:
+        logger.warning("huggingface_hub chua duoc cai, bo qua buoc push_to_hub.")
+        return
+    api = HfApi(token=token)
+    api.create_repo(repo_id=hub_model_id, private=private, exist_ok=True)
+    api.upload_folder(folder_path=local_ckpt_dir, repo_id=hub_model_id, path_in_repo=".",
+                       commit_message=f"Update checkpoint: {os.path.basename(local_ckpt_dir)}")
+    if os.path.isdir(diagnostics_dir):
+        api.upload_folder(folder_path=diagnostics_dir, repo_id=hub_model_id,
+                           path_in_repo="diagnostics", commit_message="Update diagnostics")
+    readme_path = os.path.join(local_ckpt_dir, "_README_tmp.md")
+    with open(readme_path, "w", encoding="utf-8") as f:
+        f.write(readme_text)
+    api.upload_file(path_or_fileobj=readme_path, path_in_repo="README.md", repo_id=hub_model_id,
+                     commit_message="Update model card")
+    os.remove(readme_path)
+
 
 
 def find_resume_checkpoint(output_dir, resume_arg: Optional[str]) -> Optional[str]:
@@ -840,178 +1381,34 @@ def find_resume_checkpoint(output_dir, resume_arg: Optional[str]) -> Optional[st
 
 
 # ============================================================================================
-# Diagnostics: jsonl + plot (tach rieng duong task loss va align loss vi 2 loai step khac nhau)
-# ============================================================================================
-def log_step_to_jsonl(jsonl_path, global_step, epoch, step_type, lm_loss=None, lb_loss=None,
-                       task_total_loss=None, align_loss=None):
-    rec = {
-        "step": global_step,
-        "epoch": epoch,
-        "step_type": step_type,
-        "lm_loss": lm_loss,
-        "lb_loss": lb_loss,
-        "task_total_loss": task_total_loss,
-        "align_loss": align_loss,
-        "timestamp": time.time(),
-    }
-    with open(jsonl_path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-
-
-def plot_losses(jsonl_path, out_png, align_layer):
-    if not os.path.exists(jsonl_path):
-        return
-    task_steps, lm, lb, task_total = [], [], [], []
-    align_steps, align = [], []
-    with open(jsonl_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            rec = json.loads(line)
-            if rec["step_type"] == "task":
-                task_steps.append(rec["step"])
-                lm.append(rec["lm_loss"])
-                lb.append(rec["lb_loss"])
-                task_total.append(rec["task_total_loss"])
-            else:
-                align_steps.append(rec["step"])
-                align.append(rec["align_loss"])
-    if not task_steps and not align_steps:
-        return
-
-    plt.figure(figsize=(10, 6))
-    if task_steps:
-        plt.plot(task_steps, lm, label="L_LM (task step, target language)")
-        plt.plot(task_steps, lb, label="L_LB (task step, MoE)")
-        plt.plot(task_steps, task_total, label="L_task_total (task step)")
-    if align_steps:
-        plt.plot(align_steps, align, label=f"L_align (contrastive @ layer {align_layer})")
-    plt.xlabel("Training step")
-    plt.ylabel("Loss")
-    plt.title("MidAlign baseline (Qwen1.5-MoE-A2.7B) — alternate task/align training")
-    plt.legend()
-    plt.grid(alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(out_png, dpi=150)
-    plt.close()
-
-
-# ============================================================================================
-# Hugging Face Hub push
-# ============================================================================================
-def build_model_card(args, num_experts, top_k, align_layer_0based, num_layers,
-                      lora_layer_start, lora_layer_end) -> str:
-    return f"""---
-license: apache-2.0
-base_model: {args.model_name_or_path}
-tags:
-- lora
-- peft
-- moe
-- mixture-of-experts
-- qwen
-- cross-lingual-alignment
-- midalign
-- machine-translation
----
-
-# Qwen1.5-MoE-A2.7B-MidAlign
-
-LoRA adapter finetune tu [`{args.model_name_or_path}`]\
-(https://huggingface.co/{args.model_name_or_path}), mot mo hinh Mixture-of-Experts
-(Qwen2MoeForCausalLM), theo baseline **MidAlign** (Middle-Layer Representation Alignment,
-Liu & Niehues 2025) — Alternate Training giua task objective (causal LM tren target language)
-va alignment objective (contrastive loss tai 1 middle layer) — adapt sang backbone MoE.
-
-## Cau hinh LoRA / Alignment
-- Alignment loss (contrastive) trich xuat hidden state tai DUNG layer thu
-  `{args.align_layer}` (0-indexed block = {align_layer_0based}) trong tong so `{num_layers}` layer.
-- LoRA ap dung cho RANGE layer `[{lora_layer_start}, {lora_layer_end})` 0-indexed
-  ({lora_layer_end - lora_layer_start} layer) — tach bach voi layer dung de tinh alignment loss.
-- Module duoc gan LoRA: **attention**, **router**, **experts** trong range layer tren.
-- rank rieng theo tung nhom (rank_pattern): attention r = {args.lora_r_attn}, router r = {args.lora_r_router}, experts r = {args.lora_r_expert}
-- alpha = {args.lora_alpha} (dong nhat ca 3 nhom), dropout = {args.lora_dropout}
-- Nhiet do contrastive tau = {args.align_temperature}
-
-## Loss (Alternate Training — moi step chi 1 trong 2)
-- **Task step**: `L_task = L_LM + lb_loss_coef * L_LB`
-  - `L_LM`: causal LM loss tren cau TARGET LANGUAGE (phia "other" trong cap english-other).
-    Day la causal LM THUAN TUY (khong prefix/output rieng), vi phase alignment nay chi dung
-    du lieu da ngu, tach bach voi phase zero-shot-task (xnli, xquad, ...) xuat hien o buoc sau.
-  - `L_LB`: load balancing loss chuan cua MoE tai router trong range layer duoc finetune.
-  - `lb_loss_coef` = {args.lb_loss_coef}, `num_experts` = {num_experts}, `top_k` = {top_k}
-- **Align step**: `L_align` = symmetric InfoNCE / contrastive loss (in-batch negatives) giua
-  mean-pooled hidden state cua cau tieng Anh va cau target tai layer {args.align_layer}.
-
-## Du lieu
-Nguon alignment (--alignment_data): `{", ".join(args.alignment_data)}` -> file: `{", ".join(args.data_files)}`.
-Cap bitext english-other duoc sample tu cac bo du lieu multiway-parallel tren.
-Voi moi record, cau `{args.eng_key}` duoc ghep voi tung ngon ngu khac trong cung record de tao
-1 cap bitext rieng.
-
-## Training
-- {args.num_train_epochs} epoch, batch_size = {args.batch_size} (per-process).
-- Multi-GPU: DistributedDataParallel (torchrun), checkpoint chi giu ban moi nhat.
-- DDP: find_unused_parameters = {args.find_unused_parameters} (bat buoc True voi MoE + LoRA
-  1 layer de tranh NCCL Watchdog SIGABRT khi co expert khong nhan token trong 1 step/GPU),
-  NCCL timeout = {args.nccl_timeout_minutes} phut.
-
-## Diagnostics
-Xem `diagnostics/loss_log.jsonl` (log theo tung step, phan biet step_type=task/align) va
-`diagnostics/loss_curve.png`.
-"""
-
-
-def push_to_hub(local_ckpt_dir, diagnostics_dir, hub_model_id, private, readme_text):
-    if not HF_HUB_AVAILABLE:
-        logger.warning("huggingface_hub chua duoc cai, bo qua buoc push_to_hub.")
-        return
-    api = HfApi()
-    api.create_repo(repo_id=hub_model_id, private=private, exist_ok=True)
-    api.upload_folder(folder_path=local_ckpt_dir, repo_id=hub_model_id, path_in_repo=".",
-                       commit_message=f"Update checkpoint: {os.path.basename(local_ckpt_dir)}")
-    if os.path.isdir(diagnostics_dir):
-        api.upload_folder(folder_path=diagnostics_dir, repo_id=hub_model_id,
-                           path_in_repo="diagnostics", commit_message="Update diagnostics")
-    readme_path = os.path.join(local_ckpt_dir, "_README_tmp.md")
-    with open(readme_path, "w", encoding="utf-8") as f:
-        f.write(readme_text)
-    api.upload_file(path_or_fileobj=readme_path, path_in_repo="README.md", repo_id=hub_model_id,
-                     commit_message="Update model card")
-    os.remove(readme_path)
-
-
-# ============================================================================================
 # Main
 # ============================================================================================
 def main():
     args = build_argparser().parse_args()
     set_seed(args.seed)
 
-    is_distributed, local_rank, global_rank, world_size, device = setup_distributed(args)
-    is_main_process = (global_rank == 0)
+    is_distributed, local_rank, rank, world_size, device = setup_distributed(args)
+    is_main = (rank == 0)
+    if not is_main:
+        logger.setLevel(logging.WARNING)
 
-    # --data_files (neu duoc truyen thu cong) ghi de --alignment_data; nguoc lai suy ra tu
-    # --alignment_data qua ALIGNMENT_DATASET_FILES (dieu kien thay doi #1).
     args.data_files = resolve_data_files(args.alignment_data, args.data_files)
-    if is_main_process:
-        logger.info(f"--alignment_data={args.alignment_data} -> data_files={args.data_files}")
+    logger.info(f"--alignment_data={args.alignment_data} -> data_files={args.data_files}")
 
-    if is_main_process:
-        os.makedirs(args.output_dir, exist_ok=True)
+    hf_token = load_hf_token(args.env_file, args.hf_token) if args.push_to_hub else None
+
     diagnostics_dir = args.diagnostics_dir or os.path.join(args.output_dir, "diagnostics")
-    if is_main_process:
+    if is_main:
+        os.makedirs(args.output_dir, exist_ok=True)
         os.makedirs(diagnostics_dir, exist_ok=True)
     jsonl_path = os.path.join(diagnostics_dir, "loss_log.jsonl")
     plot_path = os.path.join(diagnostics_dir, "loss_curve.png")
+    plot_path_smoothed = os.path.join(diagnostics_dir, "loss_curve_smoothed.png")
 
-    dtype_map = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
-    dtype = dtype_map[args.dtype]
+    dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[args.dtype]
 
     # ---------------------------------------------------------------------------------- model
-    if is_main_process:
-        logger.info(f"Dang load tokenizer va model tu {args.model_name_or_path} ...")
+    logger.info(f"Dang load tokenizer va model tu {args.model_name_or_path} ...")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path,
                                                trust_remote_code=args.trust_remote_code)
     if tokenizer.pad_token is None:
@@ -1025,187 +1422,120 @@ def main():
 
     num_layers = get_num_layers(base_model.config)
     if args.align_layer is None:
-        # KHONG con hard-code = 12: suy ra middle layer tu num_layers THUC TE cua
-        # backbone dang load (vd 24 layer -> 12, 28 -> 14, 32 -> 16), xem infer_middle_layer().
         args.align_layer = infer_middle_layer(num_layers)
-        if is_main_process:
-            logger.info(f"--align_layer khong duoc chi dinh -> tu dong suy ra middle layer = "
-                        f"{args.align_layer} (num_hidden_layers={num_layers} cua "
-                        f"{args.model_name_or_path}, cong thuc num_layers // 2).")
+        logger.info(f"--align_layer khong duoc chi dinh -> middle layer = {args.align_layer} "
+                    f"(num_hidden_layers={num_layers}, num_layers // 2).")
     if not (1 <= args.align_layer <= num_layers):
-        raise ValueError(f"--align_layer={args.align_layer} phai nam trong [1, {num_layers}] "
-                          f"(model co {num_layers} layer).")
-    align_layer_0based = args.align_layer - 1  # dung de tra hidden_states[align_layer] (mean-pool)
+        raise ValueError(f"--align_layer={args.align_layer} phai nam trong [1, {num_layers}].")
+    align_layer_0based = args.align_layer - 1
 
-    # LoRA ap dung cho MOT RANGE layer [L/3, 2L/3) (nua-mo, floor-division tren num_layers),
-    # TACH BACH voi layer dung de tinh alignment loss (align_layer_0based, chi 1 layer duy
-    # nhat, xem compute_alignment_step). Ly do dung range nay (thay vi toan bo mang, hay
-    # chi 1 layer nhu ban truoc): fair ve compute budget so voi main method (main method chi
-    # dung range [L/2, 2L/3)), dong thoi toi da hoa tinh than cua MidAlign — LoRA phu ca mot
-    # vung middle-layer chu khong phai 1 diem.
     lora_layer_start = num_layers // 3
-    lora_layer_end = (2 * num_layers) // 3  # exclusive (nua-mo, giong quy uoc [L/3, 2L/3))
+    lora_layer_end = (2 * num_layers) // 3  # exclusive
     layer_indices = set(range(lora_layer_start, lora_layer_end))
-    if is_main_process:
-        logger.info(f"Tong so layer = {num_layers}. Alignment loss trich xuat tai DUNG layer "
-                    f"{args.align_layer} (block 0-indexed = {align_layer_0based}, "
-                    f"hidden_states[{args.align_layer}]). LoRA ap dung cho range layer "
-                    f"[{lora_layer_start}, {lora_layer_end}) 0-indexed ({len(layer_indices)} layer).")
-        if align_layer_0based not in layer_indices:
-            logger.warning(
-                f"[canh bao] --align_layer={args.align_layer} (block 0-indexed="
-                f"{align_layer_0based}) nam NGOAI range LoRA [{lora_layer_start}, "
-                f"{lora_layer_end}) -> gradient tu contrastive loss se khong lan truyen qua "
-                f"bat ky tham so LoRA nao. Kiem tra lai --align_layer neu day khong phai chu y."
-            )
+    logger.info(f"Tong so layer = {num_layers}. Align tai layer {args.align_layer} "
+                f"(block 0-indexed {align_layer_0based}). LoRA tren range "
+                f"[{lora_layer_start}, {lora_layer_end}) ({len(layer_indices)} layer).")
+    if align_layer_0based not in layer_indices:
+        logger.warning(f"[canh bao] align layer (block {align_layer_0based}) nam NGOAI range LoRA "
+                       f"[{lora_layer_start}, {lora_layer_end}) -> contrastive loss khong day "
+                       f"gradient vao tham so LoRA nao.")
 
     target_modules = build_lora_target_modules(base_model, layer_indices)
     if not target_modules:
-        raise RuntimeError(
-            "Khong tim thay module (attention/router/experts) nao tai layer da chon. "
-            "Kien truc model co the dat ten khac quy uoc — kiem tra lai regex trong build_lora_target_modules()."
-        )
-    attn_target_names, expert_target_names, router_target_names = categorize_lora_targets(target_modules)
-    # rank_pattern (dieu kien thay doi #2): moi nhom module mang 1 rank LoRA rieng — router
-    # r={args.lora_r_router}, attention r={args.lora_r_attn}, experts r={args.lora_r_expert}.
-    # Cac key trong rank_pattern la ten module DAY DU (khop chinh xac target_modules) nen khong
-    # co rui ro trung khop nham voi module khac ngoai y muon.
-    lora_rank_pattern = {}
-    lora_rank_pattern.update({n: args.lora_r_router for n in router_target_names})
-    lora_rank_pattern.update({n: args.lora_r_attn for n in attn_target_names})
-    lora_rank_pattern.update({n: args.lora_r_expert for n in expert_target_names})
-    if is_main_process:
-        logger.info(f"Tim thay {len(target_modules)} target module cho LoRA "
-                    f"({len(attn_target_names)} attention r={args.lora_r_attn}, "
-                    f"{len(expert_target_names)} experts r={args.lora_r_expert}, "
-                    f"{len(router_target_names)} router r={args.lora_r_router}). "
-                    f"Vi du: {target_modules[:8]}")
+        raise RuntimeError("Khong tim thay module attention/router/experts nao trong range layer. "
+                           "Kiem tra regex trong build_lora_target_modules().")
+    attn_names, expert_names, router_names = categorize_lora_targets(target_modules)
+    rank_pattern = {}
+    rank_pattern.update({n: args.lora_r_router for n in router_names})
+    rank_pattern.update({n: args.lora_r_attn for n in attn_names})
+    rank_pattern.update({n: args.lora_r_expert for n in expert_names})
+    logger.info(f"{len(target_modules)} target module LoRA: {len(attn_names)} attention "
+                f"(r={args.lora_r_attn}), {len(expert_names)} experts (r={args.lora_r_expert}), "
+                f"{len(router_names)} router (r={args.lora_r_router}).")
 
     num_experts, top_k = infer_moe_dims(base_model.config, args)
-
     lb_loss_coef = args.lb_loss_coef
     if lb_loss_coef is None:
         lb_loss_coef = float(getattr(base_model.config, "router_aux_loss_coef", 0.01))
-    if is_main_process:
-        logger.info(f"lb_loss_coef (phu tro task step) = {lb_loss_coef}")
+    args.lb_loss_coef = lb_loss_coef
+    logger.info(f"lb_loss_coef (task step) = {lb_loss_coef}")
 
-    # ---------------------------------------------------------------------------- resume / LoRA
     resume_dir = find_resume_checkpoint(args.output_dir, args.resume_from_checkpoint)
     if resume_dir:
-        if is_main_process:
-            logger.info(f"Resume LoRA adapter tu checkpoint: {resume_dir}")
+        logger.info(f"Resume LoRA adapter tu checkpoint: {resume_dir}")
         model = PeftModel.from_pretrained(base_model, resume_dir, is_trainable=True)
     else:
         lora_config = LoraConfig(
-            r=args.lora_r,  # fallback, khong nen thuc su duoc dung — xem rank_pattern
-            lora_alpha=args.lora_alpha,
-            lora_dropout=args.lora_dropout,
-            bias="none",
-            task_type="CAUSAL_LM",
-            target_modules=target_modules,
-            rank_pattern=lora_rank_pattern,
+            r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout,
+            bias="none", task_type="CAUSAL_LM", target_modules=target_modules,
+            rank_pattern=rank_pattern,
         )
         model = get_peft_model(base_model, lora_config)
-    if is_main_process:
+    if is_main:
         model.print_trainable_parameters()
     model.to(device)
 
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
     if is_distributed:
-        ddp_kwargs = dict(device_ids=[local_rank], output_device=local_rank) if torch.cuda.is_available() else {}
-        # [FIX NCCL Watchdog SIGABRT — nguyen nhan cot loi]
-        # Voi moi token, router chi chon top_k trong so num_experts (vd 4/60) -> o mot step/GPU
-        # bat ky, rat de co (cac) expert dang duoc gan LoRA nhung KHONG nhan duoc token nao,
-        # nen autograd graph cua LoRA A/B thuoc expert do KHONG duoc tao trong forward()
-        # -> KHONG co gradient sau backward(). Truoc day find_unused_parameters=False khien
-        # DDP Reducer gia dinh MOI tham so requires_grad=True deu phai co gradient va CHO VO
-        # HAN gradient con thieu do; sau args.nccl_timeout_minutes phut (mac dinh cua PyTorch
-        # la 10 phut) NCCL Watchdog (ncclCommWatchdog) coi day la deadlock va bien no thanh
-        # SIGABRT (exit code -6), keo theo torchrun SIGTERM cac rank con lai.
-        # find_unused_parameters=True bat DDP tu duyet lai autograd graph SAU MOI forward de
-        # xac dinh chinh xac tham so nao THAT SU tham gia tinh loss cua step do, roi danh dau
-        # ngay cac tham so khong duoc dung la "da san sang" (grad = None/khong cho) thay vi
-        # cho toi vo han -> het treo. Chap nhan chi phi duyet graph them moi forward (LoRA chi
-        # phu 1 range layer hep quanh middle, khong phai toan mang) de doi lay su on dinh bat
-        # buoc voi kien truc MoE
-        # + routing dong (khac nhau moi batch, moi GPU, moi step task/align).
-        model = DDP(model, find_unused_parameters=args.find_unused_parameters, **ddp_kwargs)
-        # [FIX RuntimeError "Expected to mark a variable ready only once"] — xem giai thich
-        # day du ngay phia tren dinh nghia zero_grad_anchor(). PHAI goi truoc forward dau
-        # tien cua toan bo qua trinh train (dat ngay sau khi wrap DDP la dung cho).
-        # An toan de dung dong thoi voi find_unused_parameters=True: static_graph se tu
-        # phat hien unused params trong ~1-2 iteration dau (PyTorch chi in 1 warning noi
-        # find_unused_parameters gio thanh du thua, khong phai loi).
-        model._set_static_graph()
-        if is_main_process:
-            logger.info(
-                f"[DDP] find_unused_parameters={args.find_unused_parameters}, "
-                f"static_graph=True, "
-                f"nccl_timeout_minutes={args.nccl_timeout_minutes} "
-                f"(fix NCCL Watchdog SIGABRT do MoE routing top_k < num_experts, "
-                f"va fix 'marked ready twice' do compute_alignment_step goi model() "
-                f"2 lan/iteration)."
-            )
+        broadcast_trainable_params(trainable_params, src=0)  # dong bo init LoRA (khong con DDP)
 
     router_logits_cache: list = []
-    hooks = register_router_hooks(get_underlying_model(model), router_target_names, router_logits_cache)
+    hooks = register_router_hooks(model, router_names, router_logits_cache)
 
     # ------------------------------------------------------------------------------------ data
-    if is_main_process:
-        logger.info(f"Dang doc bitext {args.eng_key}-other tu {args.data_dir} ({args.data_files}) ...")
+    logger.info(f"Dang doc bitext {args.eng_key}-other tu {args.data_dir} ({args.data_files}) ...")
     pairs = load_bitext_pairs(args.data_dir, args.data_files, args.eng_key,
                                args.max_lang_pairs_per_record, args.seed)
     if args.max_samples:
         random.Random(args.seed).shuffle(pairs)
         pairs = pairs[: args.max_samples]
-    if is_main_process:
-        logger.info(f"Tong so cap bitext sau khi gom du lieu: {len(pairs)}")
-    if len(pairs) == 0:
-        raise RuntimeError("Khong doc duoc cap bitext nao — kiem tra lai --data_dir / --data_files / --eng_key.")
+    if not pairs:
+        raise RuntimeError("Khong doc duoc cap bitext nao — kiem tra --data_dir / --data_files / --eng_key.")
 
-    dataset = BitextPairDataset(pairs)
+    logger.info(f"Dang doc + build pool task ({args.task_datasets}) ...")
+    task_examples, task_lengths, task_stats = build_task_pool(args, tokenizer)
+    if not task_examples:
+        raise RuntimeError("Pool task rong — kiem tra --squad_file / --snli_file / --mmlu_file.")
 
-    # [FIX NCCL Watchdog SIGABRT — bien phap phu] persistent_workers + prefetch_factor giup
-    # worker doc/tokenize truoc nhieu batch hon, giam nguy co DataLoader bi stall khi doc du
-    # lieu tu file-system mang (vd Lustre) — mot nguyen nhan phu co the tao ra trieu chung
-    # treo NCCL giong het truong hop MoE (chenh lech dung 10 phut giua 2 step trong log).
-    extra_loader_kwargs = {}
-    if args.num_workers > 0:
-        extra_loader_kwargs["persistent_workers"] = True
-        extra_loader_kwargs["prefetch_factor"] = args.dataloader_prefetch_factor
+    n_task, n_align = len(task_examples), len(pairs)
+    N, anchor = solve_steps_per_side(n_task, n_align, world_size, args.align_batch_size,
+                                      args.task_batch_size)
+    if n_task // N < world_size:
+        raise RuntimeError(f"Pool task ({n_task}) qua nho cho N={N} step x {world_size} rank "
+                           f"(moi rank can >= 1 sample/step). Giam --task_batch_size / tang du lieu.")
+    if n_align // N < 2 * world_size:
+        raise RuntimeError(f"Pool align ({n_align}) qua nho cho N={N} step x {world_size} rank "
+                           f"(moi rank can >= 2 cap/step cho contrastive).")
+    steps_per_epoch = 2 * N                       # luon chan -> epoch nao cung bat dau bang task step
+    total_steps = steps_per_epoch * args.num_train_epochs
+    logger.info(
+        f"[schedule] anchor={anchor} | n_task={n_task} (SQuAD/SNLI/MMLU) | n_align={n_align} | "
+        f"N={N} task step + {N} align step / epoch (steps_per_epoch={steps_per_epoch}, "
+        f"total_steps={total_steps}) | batch/rank trung binh: task={n_task / (N * world_size):.1f}, "
+        f"align={n_align / (N * world_size):.1f} | moi sample dung 1 lan/epoch."
+    )
 
-    if is_distributed:
-        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=global_rank,
-                                      shuffle=True, seed=args.seed, drop_last=True)
-        dataloader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler,
-                                 collate_fn=collate_bitext, num_workers=args.num_workers,
-                                 drop_last=True, pin_memory=torch.cuda.is_available(),
-                                 **extra_loader_kwargs)
-    else:
-        sampler = RandomSampler(dataset)
-        dataloader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler,
-                                 collate_fn=collate_bitext, num_workers=args.num_workers,
-                                 drop_last=True, pin_memory=torch.cuda.is_available(),
-                                 **extra_loader_kwargs)
+    plan = AlternatePlan(n_task, n_align, task_lengths, N, world_size, rank, args.seed)
 
     # ------------------------------------------------------------------------------- optimizer
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate,
                                    weight_decay=args.weight_decay, foreach=True)
-
-    steps_per_epoch = len(dataloader)
-    total_steps = steps_per_epoch * args.num_train_epochs
     scheduler = get_linear_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=int(total_steps * args.warmup_ratio),
+        optimizer, num_warmup_steps=int(total_steps * args.warmup_ratio),
         num_training_steps=total_steps,
     )
 
     start_epoch, start_step_in_epoch, global_step = 0, 0, 0
-    prev_checkpoint_dir = resume_dir  # checkpoint hien co tren dia (se bi xoa khi luu ban moi)
+    prev_checkpoint_dir = resume_dir
     if resume_dir:
         state_path = os.path.join(resume_dir, "trainer_state.pt")
         if os.path.exists(state_path):
             state = torch.load(state_path, map_location="cpu")
+            if state.get("steps_per_epoch") not in (None, steps_per_epoch):
+                raise RuntimeError(
+                    f"Checkpoint co steps_per_epoch={state['steps_per_epoch']} nhung cau hinh hien "
+                    f"tai cho {steps_per_epoch} (world_size/batch size/du lieu da doi?) -> khong the "
+                    f"resume chinh xac.")
             optimizer.load_state_dict(state["optimizer"])
             for group in optimizer.param_groups:
                 group["foreach"] = True
@@ -1214,123 +1544,113 @@ def main():
             start_epoch = state["epoch"]
             start_step_in_epoch = state["step_in_epoch"] + 1
             global_step = state["global_step"]
-            torch.set_rng_state(state["torch_rng_state"])
-            random.setstate(state["python_rng_state"])
-            if is_main_process:
-                logger.info(f"Da resume: epoch={start_epoch}, step_in_epoch={start_step_in_epoch}, "
-                            f"global_step={global_step}")
+            logger.info(f"Da resume: epoch={start_epoch}, step_in_epoch={start_step_in_epoch}, "
+                        f"global_step={global_step}")
             if start_step_in_epoch >= steps_per_epoch:
                 start_epoch += 1
                 start_step_in_epoch = 0
 
+    # RNG rieng moi rank (dropout LoRA khac nhau giua cac rank)
+    torch.manual_seed(args.seed + 7919 * rank + global_step)
+
     readme_text = build_model_card(args, num_experts, top_k, align_layer_0based, num_layers,
-                                    lora_layer_start, lora_layer_end)
+                                    lora_layer_start, lora_layer_end, n_task, n_align, N,
+                                    task_stats, world_size)
+
+    def _save_and_push(epoch_, step_in_epoch_, final=False):
+        nonlocal prev_checkpoint_dir
+        ckpt = save_checkpoint_and_rotate(
+            args.output_dir, model, optimizer, scheduler, epoch_, step_in_epoch_, global_step,
+            steps_per_epoch, world_size, prev_checkpoint_dir)
+        prev_checkpoint_dir = ckpt
+        plot_all(jsonl_path, plot_path, plot_path_smoothed, args.align_layer, args.smooth_window)
+        logger.info(f"Da luu checkpoint local: {ckpt}")
+        if args.push_to_hub:
+            try:
+                push_to_hub(ckpt, diagnostics_dir, args.hub_model_id, args.hub_private,
+                            readme_text, token=hf_token)
+                logger.info(f"Da push checkpoint len hub: {args.hub_model_id}")
+            except Exception as e:  # khong lam gian doan training
+                logger.error(f"Push len hub that bai (checkpoint local van o {ckpt}): {e}")
 
     # ------------------------------------------------------------------------------ training loop
+    last_done = (start_epoch, start_step_in_epoch - 1)  # (epoch, step_in_epoch) cuoi cung HOAN THANH
     try:
         for epoch in range(start_epoch, args.num_train_epochs):
-            if is_distributed:
-                sampler.set_epoch(epoch)
             step_offset = start_step_in_epoch if epoch == start_epoch else 0
+            task_batches, align_batches = plan.epoch_batches(epoch)
 
-            pbar = tqdm(
-                enumerate(dataloader),
-                total=steps_per_epoch,
-                desc=f"Epoch {epoch + 1}/{args.num_train_epochs}",
-                disable=not is_main_process,
-            )
-            for step_in_epoch, batch in pbar:
-                if step_in_epoch < step_offset:
-                    continue  # dang resume: bo qua nhanh cac batch da xu ly o lan chay truoc
-
-                eng_texts, other_texts, lang_codes = batch
-
+            pbar = tqdm(range(step_offset, steps_per_epoch), total=steps_per_epoch,
+                        initial=step_offset, desc=f"Epoch {epoch + 1}/{args.num_train_epochs}",
+                        disable=not is_main)
+            for step_in_epoch in pbar:
                 model.train()
                 optimizer.zero_grad(set_to_none=True)
 
-                # Alternate Training (dieu kien giu nguyen #1): chan = task step, le = align step
-                step_type = "task" if (global_step % 2 == 0) else "align"
-
-                if step_type == "task":
-                    lm_loss, lb_loss, task_total = compute_task_step(
-                        other_texts, tokenizer, model, args.max_length, device,
-                        router_logits_cache, num_experts, top_k, lb_loss_coef,
-                    )
-                    # Log gia tri loss "sach" (chua cong neo) truoc, roi moi cong neo de backward.
-                    log_kwargs = dict(lm_loss=lm_loss.item(), lb_loss=lb_loss.item(),
-                                       task_total_loss=task_total.item(), align_loss=None)
-                    postfix = {"type": "task", "L_LM": f"{lm_loss.item():.4f}",
-                               "L_LB": f"{lb_loss.item():.4f}"}
-                    # [FIX NCCL Watchdog SIGABRT] cong neo 0.0 * sum(param) — xem zero_grad_anchor().
-                    (task_total + zero_grad_anchor(trainable_params, device)).backward()
+                # Alternate Training: step chan = task, step le = align
+                # (steps_per_epoch chan nen step_in_epoch % 2 == global_step % 2)
+                k = step_in_epoch // 2
+                if step_in_epoch % 2 == 0:
+                    step_type = "task"
+                    r = compute_task_step(
+                        task_batches[k], task_examples, task_lengths, tokenizer, model,
+                        args.task_max_length, args.task_micro_batch_tokens, device,
+                        router_logits_cache, num_experts, top_k, lb_loss_coef)
+                    n_local = len(task_batches[k])
+                    sums = reduce_metrics(
+                        [r["lm"], r["lb"], r["tot"], r["correct"], r["ans"], 1.0, n_local],
+                        device, is_distributed)
+                    nr = sums[5]
+                    log_kwargs = dict(lm_loss=sums[0] / nr, lb_loss=sums[1] / nr,
+                                       task_total_loss=sums[2] / nr,
+                                       token_acc=sums[3] / max(sums[4], 1.0),
+                                       align_loss=None, n_samples=int(sums[6]))
+                    postfix = {"type": "task", "L_LM": f"{log_kwargs['lm_loss']:.4f}",
+                               "L_LB": f"{log_kwargs['lb_loss']:.4f}",
+                               "acc": f"{log_kwargs['token_acc']:.3f}"}
                 else:
+                    step_type = "align"
+                    batch = [pairs[i] for i in align_batches[k]]
+                    eng_texts = [b[0] for b in batch]
+                    other_texts = [b[1] for b in batch]
                     align_loss = compute_alignment_step(
                         eng_texts, other_texts, tokenizer, model, args.align_layer,
-                        args.max_length, device, args.align_temperature, router_logits_cache,
-                    )
-                    log_kwargs = dict(lm_loss=None, lb_loss=None, task_total_loss=None,
-                                       align_loss=align_loss.item())
-                    postfix = {"type": "align", "L_align": f"{align_loss.item():.4f}"}
-                    # [FIX NCCL Watchdog SIGABRT] cong neo 0.0 * sum(param) — xem zero_grad_anchor().
-                    (align_loss + zero_grad_anchor(trainable_params, device)).backward()
+                        args.max_length, device, args.align_temperature, router_logits_cache)
+                    align_loss.backward()
+                    router_logits_cache.clear()
+                    sums = reduce_metrics([align_loss.item(), 1.0, len(batch)], device, is_distributed)
+                    log_kwargs = dict(align_loss=sums[0] / sums[1], n_samples=int(sums[2]))
+                    postfix = {"type": "align", "L_align": f"{log_kwargs['align_loss']:.4f}"}
 
+                if is_distributed:
+                    sync_grads_across_ranks(trainable_params, world_size)
                 torch.nn.utils.clip_grad_norm_(trainable_params, args.gradient_clip_norm)
                 optimizer.step()
                 scheduler.step()
                 global_step += 1
+                last_done = (epoch, step_in_epoch)
 
-                if is_distributed:
-                    # Dam bao MOI GPU da chay xong step nay (forward+backward+optimizer.step)
-                    # truoc khi sang phan checkpoint/push chi danh cho rank 0.
-                    dist.barrier()
-
-                if is_main_process:
+                if is_main:
                     pbar.set_postfix(postfix)
                     log_step_to_jsonl(jsonl_path, global_step, epoch, step_type, **log_kwargs)
-
                     if global_step % args.log_every == 0:
-                        plot_losses(jsonl_path, plot_path, args.align_layer)
-
+                        plot_all(jsonl_path, plot_path, plot_path_smoothed, args.align_layer,
+                                 args.smooth_window)
                     if global_step % args.save_steps == 0:
-                        ckpt_dir = save_checkpoint_and_rotate(
-                            args.output_dir, model, optimizer, scheduler,
-                            epoch, step_in_epoch, global_step, prev_checkpoint_dir,
-                        )
-                        prev_checkpoint_dir = ckpt_dir
-                        plot_losses(jsonl_path, plot_path, args.align_layer)
-                        logger.info(f"Da luu checkpoint local: {ckpt_dir}")
-                        if args.push_to_hub:
-                            push_to_hub(ckpt_dir, diagnostics_dir, args.hub_model_id,
-                                        args.hub_private, readme_text)
-                            logger.info(f"Da push checkpoint len hub: {args.hub_model_id}")
+                        _save_and_push(epoch, step_in_epoch)
+                if is_distributed and global_step % args.save_steps == 0:
+                    dist.barrier()  # cac rank cho rank 0 ghi checkpoint/push xong
 
-                if is_distributed:
-                    # Cac rank khac cho rank 0 ghi checkpoint/push xong roi moi sang step tiep theo.
-                    dist.barrier()
-
-            start_step_in_epoch = 0
-
-        # checkpoint cuoi cung sau khi hoan thanh training
-        if is_main_process:
-            final_ckpt = save_checkpoint_and_rotate(
-                args.output_dir, model, optimizer, scheduler,
-                args.num_train_epochs - 1, steps_per_epoch - 1, global_step, prev_checkpoint_dir,
-            )
-            plot_losses(jsonl_path, plot_path, args.align_layer)
-            if args.push_to_hub:
-                push_to_hub(final_ckpt, diagnostics_dir, args.hub_model_id, args.hub_private, readme_text)
+        if is_main:
+            _save_and_push(args.num_train_epochs - 1, steps_per_epoch - 1, final=True)
             logger.info("Training hoan tat.")
         if is_distributed:
             dist.barrier()
 
     except KeyboardInterrupt:
-        if is_main_process:
-            logger.warning("Nhan KeyboardInterrupt — luu checkpoint khan cap truoc khi thoat ...")
-            save_checkpoint_and_rotate(args.output_dir, model, optimizer, scheduler,
-                                        epoch, step_in_epoch, global_step, prev_checkpoint_dir)
-            plot_losses(jsonl_path, plot_path, args.align_layer)
-        if is_distributed:
-            dist.barrier()
+        logger.warning("Nhan KeyboardInterrupt — luu checkpoint khan cap truoc khi thoat ...")
+        if is_main:
+            _save_and_push(*last_done)
         raise
     finally:
         for h in hooks:
