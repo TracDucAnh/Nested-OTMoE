@@ -159,6 +159,7 @@ ALIGNMENT_DATASET_FILES = {
     "flores": "flores.json",
     "ntrex": "ntrex.json",
     "bible": "bible.json",
+    "ted": "ted.json",      # giong code finetuning: --alignment_data ... ted -> <data_dir>/ted.json
 }
 
 
@@ -195,7 +196,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--alignment_data", type=str, nargs="+",
                     choices=sorted(ALIGNMENT_DATASET_FILES.keys()),
                     default=["flores", "ntrex", "bible"],
-                    help="Nguon du lieu alignment: flores | ntrex | bible (1 hoac nhieu).")
+                    help="Nguon du lieu alignment: flores | ntrex | ted | bible (1 hoac nhieu). Code finetuning dung flores ntrex ted — truyen --alignment_data flores ntrex ted de dung CUNG du lieu voi baseline finetuning.")
     p.add_argument("--data_files", type=str, nargs="+", default=None,
                     help="[Nang cao] Ghi de --alignment_data bang danh sach file JSON trong --data_dir.")
     p.add_argument("--eng_key", type=str, default="eng_Latn")
@@ -404,11 +405,13 @@ def load_bitext_pairs(data_dir: str, data_files: Sequence[str], eng_key: str,
         records = list(data.values()) if isinstance(data, dict) else data
 
         n_before = len(pairs)
+        n_no_eng = 0
         for rec in records:
             if not isinstance(rec, dict):
                 continue
             eng_text = rec.get(eng_key)
             if not isinstance(eng_text, str) or not eng_text.strip():
+                n_no_eng += 1
                 continue
             eng_text = eng_text.strip()
 
@@ -426,6 +429,11 @@ def load_bitext_pairs(data_dir: str, data_files: Sequence[str], eng_key: str,
             rng.shuffle(file_pairs)
             pairs[n_before:] = file_pairs[:max_pairs_per_file]
             logger.info(f"{fname}: cat ngau nhien xuong {max_pairs_per_file} cap (--max_pairs_per_file).")
+        if n_no_eng:
+            ex = next((list(r.keys())[:6] for r in records if isinstance(r, dict)), [])
+            logger.warning(f"{fname}: {n_no_eng}/{len(records)} record KHONG co khoa '{eng_key}' "
+                           f"(hoac rong) -> bi bo qua. Vi du cac khoa cua 1 record: {ex}. Neu ca file "
+                           f"bi bo qua, dung --eng_key de chi dinh dung ten khoa tieng Anh.")
         logger.info(f"{fname}: +{len(pairs) - n_before} cap bitext ({eng_key}-other), "
                     f"tong so record = {len(records)}")
     return pairs
