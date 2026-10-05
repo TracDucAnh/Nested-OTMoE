@@ -76,6 +76,7 @@ Resume:
 import argparse
 import gc
 import glob
+import hashlib
 import json
 import logging
 import os
@@ -248,6 +249,18 @@ def build_argparser() -> argparse.ArgumentParser:
                     help="Layer lay hidden state cho contrastive loss (hidden_states[align_layer]). "
                          "None = TU DONG num_hidden_layers // 2 cua backbone dang load.")
     p.add_argument("--align_temperature", type=float, default=1.5)
+    p.add_argument("--align_global_negatives", dest="align_global_negatives",
+                    action="store_true", default=True,
+                    help="[Mac dinh BAT] all_gather embedding qua tat ca rank de contrastive loss dung "
+                         "batch TOAN CUC (world_size * align_batch_size) thay vi chi batch local. "
+                         "Vd 8 GPU x --align_batch_size 8 = batch contrastive 64 nhu paper.")
+    p.add_argument("--no_align_global_negatives", dest="align_global_negatives", action="store_false")
+    p.add_argument("--mask_false_negatives", dest="mask_false_negatives",
+                    action="store_true", default=True,
+                    help="[Mac dinh BAT] Loai khoi softmax cac 'negative' thuc ra la cung 1 cau Anh "
+                         "(hoac cung 1 cau target) voi positive — hay gap vi du lieu multiway ghep "
+                         "1 cau Anh voi nhieu ngon ngu.")
+    p.add_argument("--no_mask_false_negatives", dest="mask_false_negatives", action="store_false")
 
     # MoE loss (phu tro cho task step)
     p.add_argument("--lb_loss_coef", type=float, default=None,
@@ -282,7 +295,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--diagnostics_dir", type=str, default=None)
     p.add_argument("--log_every", type=int, default=10)
     p.add_argument("--smooth_window", type=int, default=50,
-                    help="So step lien tiep duoc trung binh cho moi diem tren duong *_smoothed.png.")
+                    help="Cua so trung binh truot (so diem cua MOI duong, task va align tinh rieng) cho duong dam tren 2 graph.")
     return p
 
 
@@ -972,25 +985,83 @@ def encode_layer_representation(texts: List[str], tokenizer, model, align_layer:
     return pooled
 
 
+def _text_id(text: str) -> int:
+    """Hash on dinh (khong phu thuoc PYTHONHASHSEED -> giong nhau tren moi rank) cua 1 cau, vua int64."""
+    return int.from_bytes(hashlib.blake2b(text.encode("utf-8"), digest_size=7).digest(), "big")
+
+
+def _gather_ids(ids: List[int], device) -> torch.Tensor:
+    t = torch.tensor(ids, dtype=torch.int64, device=device)
+    if not (dist.is_available() and dist.is_initialized()):
+        return t
+    out = [torch.empty_like(t) for _ in range(dist.get_world_size())]
+    dist.all_gather(out, t)
+    return torch.cat(out, dim=0)
+
+
+def _gather_with_grad(x: torch.Tensor) -> torch.Tensor:
+    """all_gather CO autograd (backward = reduce_scatter) -> [world * b, d], noi theo thu tu rank.
+    Gradient tu loss cua MOI rank deu chay nguoc ve embedding local cua rank so huu."""
+    if not (dist.is_available() and dist.is_initialized()) or dist.get_world_size() == 1:
+        return x
+    from torch.distributed.nn.functional import all_gather as _all_gather_autograd
+    return torch.cat(_all_gather_autograd(x), dim=0)
+
+
 def compute_alignment_step(eng_texts: List[str], other_texts: List[str], tokenizer, model,
                             align_layer: int, max_length: int, device, temperature: float,
-                            router_logits_cache: list):
+                            router_logits_cache: list, global_negatives: bool = True,
+                            mask_false_negatives: bool = True):
+    """Contrastive loss (symmetric InfoNCE, Eq.1 MidAlign) tai align_layer.
+
+    global_negatives=True: all_gather embedding (CO gradient) tu TAT CA rank -> batch contrastive
+      la batch TOAN CUC (world_size * batch_local), vd 8 GPU x 8 cap = 64 cap / 63 negative moi
+      cap, bang batch size 64 cua paper. Moi rank chi tinh loss cho cac dong (query) cua rank do
+      (local) nhung ung vien (key) la toan bo batch. Gradient tham so SAU all-reduce TRUNG BINH
+      qua rank chinh xac bang gradient cua loss tren batch toan cuc (autograd all_gather cong
+      don gradient cua cac rank vao embedding local roi all-reduce chia W).
+    global_negatives=False: moi rank tu tinh tren batch local (hanh vi cu).
+
+    mask_false_negatives=True: voi du lieu multiway, cung 1 cau Anh (hoac cung 1 cau target) co
+      the xuat hien o 2 cap khac nhau trong cung batch -> cap (i, j) nhu vay KHONG phai negative
+      that; loai khoi mau so softmax (logit = -inf). Vi tri duong cheo (positive) luon giu."""
     pooled_eng = encode_layer_representation(eng_texts, tokenizer, model, align_layer,
                                               max_length, device, router_logits_cache)
     pooled_other = encode_layer_representation(other_texts, tokenizer, model, align_layer,
                                                 max_length, device, router_logits_cache)
 
-    a = F.normalize(pooled_eng, dim=-1)
-    b = F.normalize(pooled_other, dim=-1)
-    sim = torch.matmul(a, b.t()) / temperature  # [n, n]
+    a_loc = F.normalize(pooled_eng.float(), dim=-1)     # [b, d]
+    b_loc = F.normalize(pooled_other.float(), dim=-1)   # [b, d]
+    n_loc = a_loc.size(0)
 
-    target = torch.arange(sim.size(0), device=sim.device)
-    # Cong thuc nay tuong duong Eq.1 trong paper (-log softmax cua cap dung), tinh doi
-    # xung ca 2 chieu eng->other va other->eng (chuan InfoNCE), roi lay trung binh.
-    loss_e2o = F.cross_entropy(sim, target)
-    loss_o2e = F.cross_entropy(sim.t(), target)
-    align_loss = (loss_e2o + loss_o2e) / 2.0
-    return align_loss
+    if global_negatives:
+        a_all, b_all = _gather_with_grad(a_loc), _gather_with_grad(b_loc)
+        rank = dist.get_rank() if (dist.is_available() and dist.is_initialized()) else 0
+        offset = rank * n_loc            # rank r giu cac chi so toan cuc [r*b, (r+1)*b)
+    else:
+        a_all, b_all, offset = a_loc, b_loc, 0
+
+    sim_e2o = torch.matmul(a_loc, b_all.t()) / temperature   # [b, B]  query = Anh local
+    sim_o2e = torch.matmul(b_loc, a_all.t()) / temperature   # [b, B]  query = target local
+    target = offset + torch.arange(n_loc, device=sim_e2o.device)
+
+    if mask_false_negatives:
+        eng_ids = [_text_id(t) for t in eng_texts]
+        oth_ids = [_text_id(t) for t in other_texts]
+        if global_negatives:
+            eng_all, oth_all = _gather_ids(eng_ids, device), _gather_ids(oth_ids, device)
+        else:
+            eng_all = torch.tensor(eng_ids, dtype=torch.int64, device=device)
+            oth_all = torch.tensor(oth_ids, dtype=torch.int64, device=device)
+        eng_loc, oth_loc = eng_all[offset:offset + n_loc], oth_all[offset:offset + n_loc]
+        dup = (eng_loc[:, None] == eng_all[None, :]) | (oth_loc[:, None] == oth_all[None, :])
+        dup[torch.arange(n_loc, device=dup.device), target] = False   # giu positive
+        sim_e2o = sim_e2o.masked_fill(dup, float("-inf"))
+        sim_o2e = sim_o2e.masked_fill(dup, float("-inf"))
+
+    loss_e2o = F.cross_entropy(sim_e2o, target)
+    loss_o2e = F.cross_entropy(sim_o2e, target)
+    return (loss_e2o + loss_o2e) / 2.0
 
 
 # ============================================================================================
@@ -1086,8 +1157,16 @@ class AlternatePlan:
             pos += s
             chunk.sort(key=lambda i: self.task_lengths[i])
             task_batches.append(chunk[self.rank::self.W])
+        # Align: moi lat PHAI chia deu cho cac rank (all_gather can cung shape tren moi rank).
+        # Gom thanh `units` khoi, moi khoi W sample; khoi cuoi duoc dem them < W sample lay tu dau
+        # hoan vi (chi toi da W-1 sample/epoch bi dung 2 lan, nam o lat khac nhau), roi chia
+        # units khoi cho N lat. Nho vay moi lat co size = (so khoi) * W, rank nao cung nhan bang nhau.
+        units = -(-self.n_align // self.W)
+        pad = units * self.W - self.n_align
+        a_perm = a_perm + a_perm[:pad]
         pos = 0
-        for s in split_sizes(self.n_align, self.N):
+        for u in split_sizes(units, self.N):
+            s = u * self.W
             chunk = a_perm[pos:pos + s]
             pos += s
             align_batches.append(chunk[self.rank::self.W])
@@ -1236,21 +1315,24 @@ def log_step_to_jsonl(jsonl_path, global_step, epoch, step_type, lm_loss=None, l
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
-def _block_mean(steps: List[int], vals: List[float], window: int):
-    if window <= 1 or len(vals) <= 1:
-        return steps, vals
-    xs, ys = [], []
-    for i in range(0, len(vals), window):
-        blk = vals[i:i + window]
-        xs.append(steps[min(i + window, len(steps)) - 1])
-        ys.append(sum(blk) / len(blk))
-    return xs, ys
+def _moving_avg(vals: List[float], window: int) -> List[float]:
+    """Trung binh truot (trailing) — diem i = mean cua toi da `window` diem ket thuc tai i."""
+    if window <= 1:
+        return list(vals)
+    out, acc = [], 0.0
+    for i, v in enumerate(vals):
+        acc += v
+        if i >= window:
+            acc -= vals[i - window]
+        out.append(acc / min(i + 1, window))
+    return out
 
 
-def plot_losses(jsonl_path, out_png, align_layer, smooth_window: int = 1):
+def _read_step_logs(jsonl_path):
+    task = {"step": [], "lm": [], "lb": [], "tot": [], "acc": []}
+    align = {"step": [], "loss": []}
     if not os.path.exists(jsonl_path):
-        return
-    t_steps, lm, lb, tot, acc, a_steps, al = [], [], [], [], [], [], []
+        return task, align
     with open(jsonl_path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -1258,38 +1340,71 @@ def plot_losses(jsonl_path, out_png, align_layer, smooth_window: int = 1):
                 continue
             rec = json.loads(line)
             if rec["step_type"] == "task":
-                t_steps.append(rec["step"]); lm.append(rec["lm_loss"]); lb.append(rec["lb_loss"])
-                tot.append(rec["task_total_loss"]); acc.append(rec.get("token_acc") or 0.0)
+                task["step"].append(rec["step"])
+                task["lm"].append(rec["lm_loss"])
+                task["lb"].append(rec["lb_loss"])
+                task["tot"].append(rec["task_total_loss"])
+                task["acc"].append(rec.get("token_acc") or 0.0)
             else:
-                a_steps.append(rec["step"]); al.append(rec["align_loss"])
-    if not t_steps and not a_steps:
-        return
+                align["step"].append(rec["step"])
+                align["loss"].append(rec["align_loss"])
+    return task, align
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 9), sharex=True)
-    if t_steps:
-        for name, ys in (("L_LM (task: SQuAD+SNLI+MMLU)", lm), ("L_LB (task, MoE)", lb),
-                         ("L_task_total", tot)):
-            xs, ys2 = _block_mean(t_steps, ys, smooth_window)
-            ax1.plot(xs, ys2, label=name)
-    if a_steps:
-        xs, ys2 = _block_mean(a_steps, al, smooth_window)
-        ax1.plot(xs, ys2, label=f"L_align (contrastive @ layer {align_layer})")
+
+def _line_with_smooth(ax, xs, ys, label, window, color=None):
+    """Duong tho (mo) + duong trung binh truot (dam) cung 1 mau, tren cung 1 truc."""
+    raw, = ax.plot(xs, ys, alpha=0.25, linewidth=0.8, color=color)
+    ax.plot(xs, _moving_avg(ys, window), linewidth=1.8, color=raw.get_color(), label=label)
+
+
+def plot_task_graph(jsonl_path, out_png, smooth_window: int):
+    """GRAPH 1 — chi cac TASK step (step chan): L_LM, L_LB, L_task_total (tren) + token acc (duoi)."""
+    task, _ = _read_step_logs(jsonl_path)
+    if not task["step"]:
+        return
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+    _line_with_smooth(ax1, task["step"], task["lm"], "L_LM (SQuAD+SNLI+MMLU)", smooth_window)
+    _line_with_smooth(ax1, task["step"], task["tot"], "L_task_total = L_LM + coef*L_LB", smooth_window)
     ax1.set_ylabel("Loss")
-    ax1.set_title("MidAlign (Qwen1.5-MoE-A2.7B) — task step (chan) / align step (le)")
-    ax1.legend(); ax1.grid(alpha=0.3)
-    if t_steps:
-        xs, ys2 = _block_mean(t_steps, acc, smooth_window)
-        ax2.plot(xs, ys2, label="token acc tren phan dap an (task step)")
-        ax2.legend()
-    ax2.set_xlabel("Training step"); ax2.set_ylabel("Token acc"); ax2.grid(alpha=0.3)
+    ax1.set_title(f"Task steps (step chan) — dam = trung binh truot {smooth_window} diem, mo = tung step")
+    ax1.grid(alpha=0.3)
+    # L_LB co thang do rieng (~1) nen ve tren truc phai de khong lam det L_LM
+    ax1b = ax1.twinx()
+    raw, = ax1b.plot(task["step"], task["lb"], alpha=0.2, linewidth=0.8, color="tab:green")
+    ax1b.plot(task["step"], _moving_avg(task["lb"], smooth_window), linewidth=1.5,
+              color="tab:green", linestyle="--", label="L_LB (truc phai)")
+    ax1b.set_ylabel("L_LB")
+    # Gop legend cua 2 truc thanh 1 (tranh 2 legend chong len nhau)
+    h1, l1 = ax1.get_legend_handles_labels()
+    h2, l2 = ax1b.get_legend_handles_labels()
+    ax1.legend(h1 + h2, l1 + l2, loc="upper right", framealpha=0.9)
+    _line_with_smooth(ax2, task["step"], task["acc"], "token acc tren phan dap an", smooth_window)
+    ax2.set_xlabel("Global training step"); ax2.set_ylabel("Token acc")
+    ax2.legend(); ax2.grid(alpha=0.3)
     plt.tight_layout()
     plt.savefig(out_png, dpi=150)
     plt.close(fig)
 
 
-def plot_all(jsonl_path, plot_path, plot_path_smoothed, align_layer, smooth_window):
-    plot_losses(jsonl_path, plot_path, align_layer, 1)
-    plot_losses(jsonl_path, plot_path_smoothed, align_layer, smooth_window)
+def plot_align_graph(jsonl_path, out_png, align_layer, smooth_window: int):
+    """GRAPH 2 — chi cac ALIGN step (step le): contrastive loss tai align_layer."""
+    _, align = _read_step_logs(jsonl_path)
+    if not align["step"]:
+        return
+    fig, ax = plt.subplots(1, 1, figsize=(10, 4.5))
+    _line_with_smooth(ax, align["step"], align["loss"],
+                      f"L_align (InfoNCE @ layer {align_layer})", smooth_window, color="tab:red")
+    ax.set_xlabel("Global training step"); ax.set_ylabel("Loss")
+    ax.set_title(f"Align steps (step le) — dam = trung binh truot {smooth_window} diem, mo = tung step")
+    ax.legend(); ax.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=150)
+    plt.close(fig)
+
+
+def plot_all(jsonl_path, task_png, align_png, align_layer, smooth_window):
+    plot_task_graph(jsonl_path, task_png, smooth_window)
+    plot_align_graph(jsonl_path, align_png, align_layer, smooth_window)
 
 
 # ============================================================================================
@@ -1328,6 +1443,7 @@ Training: step chan = task step (LM loss), step le = contrastive align step.
   / {num_layers} layer), temperature = {args.align_temperature}.
 - Moi epoch: {steps_per_side} task step + {steps_per_side} align step; dung het {n_task} sample task
   va {n_align} cap bitext (nguon: {", ".join(args.alignment_data)}), moi sample 1 lan / epoch.
+- Contrastive batch: global_negatives = {args.align_global_negatives} (batch toan cuc = {world_size} x align_batch_size), mask_false_negatives = {args.mask_false_negatives}.
 - world_size = {world_size}, align_batch_size = {args.align_batch_size}, task_batch_size = {args.task_batch_size}
   (None = tinh tu align), task_micro_batch_tokens = {args.task_micro_batch_tokens}.
 
@@ -1338,7 +1454,13 @@ Training: step chan = task step (LM loss), step le = contrastive align step.
 
 ## Training
 - {args.num_train_epochs} epoch, gradient all-reduce thu cong (khong DDP), checkpoint chi giu ban moi nhat.
-- Diagnostics: `diagnostics/loss_log.jsonl`, `loss_curve.png`, `loss_curve_smoothed.png`.
+- Diagnostics (log theo tung step: `diagnostics/loss_log.jsonl`):
+
+### Task steps (L_LM, L_LB, L_task_total, token acc)
+![task loss](diagnostics/task_loss_curve.png)
+
+### Align steps (contrastive loss)
+![align loss](diagnostics/align_loss_curve.png)
 """
 
 
@@ -1402,8 +1524,8 @@ def main():
         os.makedirs(args.output_dir, exist_ok=True)
         os.makedirs(diagnostics_dir, exist_ok=True)
     jsonl_path = os.path.join(diagnostics_dir, "loss_log.jsonl")
-    plot_path = os.path.join(diagnostics_dir, "loss_curve.png")
-    plot_path_smoothed = os.path.join(diagnostics_dir, "loss_curve_smoothed.png")
+    task_plot_path = os.path.join(diagnostics_dir, "task_loss_curve.png")
+    align_plot_path = os.path.join(diagnostics_dir, "align_loss_curve.png")
 
     dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[args.dtype]
 
@@ -1563,7 +1685,7 @@ def main():
             args.output_dir, model, optimizer, scheduler, epoch_, step_in_epoch_, global_step,
             steps_per_epoch, world_size, prev_checkpoint_dir)
         prev_checkpoint_dir = ckpt
-        plot_all(jsonl_path, plot_path, plot_path_smoothed, args.align_layer, args.smooth_window)
+        plot_all(jsonl_path, task_plot_path, align_plot_path, args.align_layer, args.smooth_window)
         logger.info(f"Da luu checkpoint local: {ckpt}")
         if args.push_to_hub:
             try:
@@ -1615,7 +1737,9 @@ def main():
                     other_texts = [b[1] for b in batch]
                     align_loss = compute_alignment_step(
                         eng_texts, other_texts, tokenizer, model, args.align_layer,
-                        args.max_length, device, args.align_temperature, router_logits_cache)
+                        args.max_length, device, args.align_temperature, router_logits_cache,
+                        global_negatives=args.align_global_negatives and is_distributed,
+                        mask_false_negatives=args.mask_false_negatives)
                     align_loss.backward()
                     router_logits_cache.clear()
                     sums = reduce_metrics([align_loss.item(), 1.0, len(batch)], device, is_distributed)
@@ -1634,7 +1758,7 @@ def main():
                     pbar.set_postfix(postfix)
                     log_step_to_jsonl(jsonl_path, global_step, epoch, step_type, **log_kwargs)
                     if global_step % args.log_every == 0:
-                        plot_all(jsonl_path, plot_path, plot_path_smoothed, args.align_layer,
+                        plot_all(jsonl_path, task_plot_path, align_plot_path, args.align_layer,
                                  args.smooth_window)
                     if global_step % args.save_steps == 0:
                         _save_and_push(epoch, step_in_epoch)
