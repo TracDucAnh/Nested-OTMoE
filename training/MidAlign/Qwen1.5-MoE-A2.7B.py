@@ -53,7 +53,7 @@ all-reduce 1 lan duy nhat -> khong con nguy co NCCL watchdog / "marked ready twi
 Cac dieu kien giu nguyen tu ban MidAlign truoc:
   1. LoRA ap dung cho RANGE layer [L/3, 2L/3), tach bach voi layer tinh alignment loss.
      Attention / router / experts moi nhom 1 rank rieng (router 4, attn 16, experts 16).
-  2. Cap ngon ngu english - other, doc tu du lieu multiway-parallel JSON (flores/ntrex/bible).
+  2. Cap ngon ngu english - other, doc tu du lieu multiway-parallel JSON (flores/ntrex/ted).
   3. Checkpoint chi giu ban moi nhat, push len HF Hub, resume tu checkpoint.
 
 Vi du chay (8 GPU):
@@ -158,7 +158,6 @@ def load_hf_token(env_file: Optional[str], cli_token: Optional[str]) -> Optional
 ALIGNMENT_DATASET_FILES = {
     "flores": "flores.json",
     "ntrex": "ntrex.json",
-    "bible": "bible.json",
     "ted": "ted.json",      # giong code finetuning: --alignment_data ... ted -> <data_dir>/ted.json
 }
 
@@ -195,8 +194,8 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--data_dir", type=str, default="data/processed_alignment")
     p.add_argument("--alignment_data", type=str, nargs="+",
                     choices=sorted(ALIGNMENT_DATASET_FILES.keys()),
-                    default=["flores", "ntrex", "bible"],
-                    help="Nguon du lieu alignment: flores | ntrex | ted | bible (1 hoac nhieu). Code finetuning dung flores ntrex ted — truyen --alignment_data flores ntrex ted de dung CUNG du lieu voi baseline finetuning.")
+                    default=["flores", "ntrex", "ted"],
+                    help="Nguon du lieu alignment: flores | ntrex | ted (1 hoac nhieu). Mac dinh flores ntrex ted, CUNG nguon voi code finetuning baseline.")
     p.add_argument("--data_files", type=str, nargs="+", default=None,
                     help="[Nang cao] Ghi de --alignment_data bang danh sach file JSON trong --data_dir.")
     p.add_argument("--eng_key", type=str, default="eng_Latn")
@@ -206,8 +205,8 @@ def build_argparser() -> argparse.ArgumentParser:
                     help="Gioi han so cap bitext alignment (debug), None = dung het.")
     p.add_argument("--max_pairs_per_file", type=int, default=None,
                     help="Gioi han so cap bitext MOI FILE alignment (cat ngau nhien, can bang cac nguon). "
-                         "Huu ich khi 1 file chiem da so (vd bible ~3.2M cap so voi flores ~0.4M, "
-                         "ntrex ~0.25M).")
+                         "Huu ich khi 1 file chiem da so cap (flores ~0.4M, ntrex ~0.25M; xem log "
+                         "'<file>: +N cap bitext' de biet kich thuoc thuc te cua ted).")
 
     # Du lieu TASK (task step, LM loss) — doc giong het cac file finetuning english-task-only
     p.add_argument("--task_datasets", type=str, nargs="+", choices=["squad", "snli", "mmlu"],
@@ -1710,7 +1709,7 @@ def main():
             f"~{task_bs_avg * world_size:.0f}) vi pool align ({n_align}) LON HON NHIEU pool task ({n_task}) "
             f"nen N={N} qua lon. Moi step MoE+LoRA ton thoi gian gan nhu co dinh (nhieu kernel nho) "
             f"-> {total_steps} step se rat lau va gradient task rat nhieu. Giam pool align "
-            f"(--max_pairs_per_file / --max_lang_pairs_per_record / bo bible khoi --alignment_data / "
+            f"(--max_pairs_per_file / --max_lang_pairs_per_record / bo bot nguon khoi --alignment_data / "
             f"--max_samples) hoac tang --align_batch_size / giam --num_train_epochs. Muc tieu: "
             f"n_align ~ n_task x (align_batch_toan_cuc / task_batch_toan_cuc).")
 
