@@ -203,6 +203,10 @@ def build_argparser() -> argparse.ArgumentParser:
                     help="Gioi han so ngon ngu ghep voi eng_key trong 1 record (None = dung het).")
     p.add_argument("--max_samples", type=int, default=None,
                     help="Gioi han so cap bitext alignment (debug), None = dung het.")
+    p.add_argument("--max_pairs_per_file", type=int, default=None,
+                    help="Gioi han so cap bitext MOI FILE alignment (cat ngau nhien, can bang cac nguon). "
+                         "Huu ich khi 1 file chiem da so (vd bible ~3.2M cap so voi flores ~0.4M, "
+                         "ntrex ~0.25M).")
 
     # Du lieu TASK (task step, LM loss) — doc giong het cac file finetuning english-task-only
     p.add_argument("--task_datasets", type=str, nargs="+", choices=["squad", "snli", "mmlu"],
@@ -386,7 +390,8 @@ def get_underlying_model(model):
 # ============================================================================================
 def load_bitext_pairs(data_dir: str, data_files: Sequence[str], eng_key: str,
                        max_lang_pairs_per_record: Optional[int] = None,
-                       seed: int = 42) -> List[Tuple[str, str, str]]:
+                       seed: int = 42,
+                       max_pairs_per_file: Optional[int] = None) -> List[Tuple[str, str, str]]:
     pairs: List[Tuple[str, str, str]] = []
     rng = random.Random(seed)
     for fname in data_files:
@@ -416,6 +421,11 @@ def load_bitext_pairs(data_dir: str, data_files: Sequence[str], eng_key: str,
                 if isinstance(v, str) and v.strip():
                     pairs.append((eng_text, v.strip(), k))
 
+        if max_pairs_per_file is not None and len(pairs) - n_before > max_pairs_per_file:
+            file_pairs = pairs[n_before:]
+            rng.shuffle(file_pairs)
+            pairs[n_before:] = file_pairs[:max_pairs_per_file]
+            logger.info(f"{fname}: cat ngau nhien xuong {max_pairs_per_file} cap (--max_pairs_per_file).")
         logger.info(f"{fname}: +{len(pairs) - n_before} cap bitext ({eng_key}-other), "
                     f"tong so record = {len(records)}")
     return pairs
@@ -969,20 +979,67 @@ def mean_pool_hidden(hidden_states: torch.Tensor, attention_mask: torch.Tensor) 
     return summed / counts
 
 
+class _StopForward(Exception):
+    """Dung forward ngay sau block align_layer (khong chay cac layer sau + norm + lm_head)."""
+
+
+_DECODER_LAYERS_CACHE: Dict[int, torch.nn.ModuleList] = {}
+
+
+def _find_decoder_layers(model, num_layers: int) -> Optional[torch.nn.ModuleList]:
+    key = id(model)
+    if key in _DECODER_LAYERS_CACHE:
+        return _DECODER_LAYERS_CACHE[key]
+    found = None
+    for name, mod in model.named_modules():
+        if name.endswith(".layers") and isinstance(mod, torch.nn.ModuleList) and len(mod) == num_layers:
+            found = mod
+            break
+    _DECODER_LAYERS_CACHE[key] = found
+    return found
+
+
 def encode_layer_representation(texts: List[str], tokenizer, model, align_layer: int,
                                  max_length: int, device, router_logits_cache: list) -> torch.Tensor:
+    """Mean-pooled hidden state tai align_layer. Quy uoc: hidden_states[i] = output SAU decoder block
+    0-based (i-1) (Layer ID 0 = embedding nhu paper MidAlign).
+
+    TOI UU: thay vi chay het 24 layer + lm_head (logits [B, T, 151936] rat ton VRAM/thoi gian,
+    chi de vut di), ta hook output cua block (align_layer-1) roi nem _StopForward de dung forward
+    ngay do. Autograd van dung (graph chi gom cac layer da chay). Gia tri hidden state GIONG HET
+    outputs.hidden_states[align_layer] (voi align_layer < num_layers, do la output tho cua block,
+    chua qua norm cuoi). Neu khong tim thay layer list hoac align_layer == num_layers thi quay ve
+    duong cu (chay day du + output_hidden_states)."""
     enc = tokenizer(texts, padding=True, truncation=True, max_length=max_length, return_tensors="pt")
     input_ids = enc["input_ids"].to(device, non_blocking=True)
     attention_mask = enc["attention_mask"].to(device, non_blocking=True)
 
     router_logits_cache.clear()  # khong dung cho align step, chi de tranh cache tich luy
-    outputs = model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
-    # Quy uoc: hidden_states[0] = embedding output, hidden_states[i] = output SAU decoder
-    # block index 0-based (i-1). vd align_layer=12 -> output sau block thu 12 (0-based=11)
-    # (1-indexed), dung "Layer ID" nhu truc x trong Figure 1/4 cua paper MidAlign.
-    hidden = outputs.hidden_states[align_layer]
-    pooled = mean_pool_hidden(hidden, attention_mask)
-    return pooled
+    num_layers = get_num_layers(get_underlying_model(model).config)
+    layers = _find_decoder_layers(model, num_layers) if align_layer < num_layers else None
+
+    if layers is None:
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask,
+                        output_hidden_states=True, use_cache=False)
+        hidden = outputs.hidden_states[align_layer]
+        return mean_pool_hidden(hidden, attention_mask)
+
+    captured = {}
+
+    def _grab(mod, inp, out):
+        captured["h"] = out[0] if isinstance(out, (tuple, list)) else out
+        raise _StopForward()
+
+    handle = layers[align_layer - 1].register_forward_hook(_grab)
+    try:
+        model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+    except _StopForward:
+        pass
+    finally:
+        handle.remove()
+    if "h" not in captured:
+        raise RuntimeError("Hook tai align layer khong duoc kich hoat — kiem tra --align_layer.")
+    return mean_pool_hidden(captured["h"], attention_mask)
 
 
 def _text_id(text: str) -> int:
@@ -1215,7 +1272,7 @@ def forward_backward_task_micro(sub_examples, tokenizer, model, max_length, devi
         labels[i, :min(len(ids), seq_len)] = -100
 
     router_logits_cache.clear()
-    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+    outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
     logits = outputs.logits
 
     shift_labels = labels[..., 1:]
@@ -1607,7 +1664,8 @@ def main():
     # ------------------------------------------------------------------------------------ data
     logger.info(f"Dang doc bitext {args.eng_key}-other tu {args.data_dir} ({args.data_files}) ...")
     pairs = load_bitext_pairs(args.data_dir, args.data_files, args.eng_key,
-                               args.max_lang_pairs_per_record, args.seed)
+                               args.max_lang_pairs_per_record, args.seed,
+                               max_pairs_per_file=args.max_pairs_per_file)
     if args.max_samples:
         random.Random(args.seed).shuffle(pairs)
         pairs = pairs[: args.max_samples]
@@ -1636,6 +1694,17 @@ def main():
         f"total_steps={total_steps}) | batch/rank trung binh: task={n_task / (N * world_size):.1f}, "
         f"align={n_align / (N * world_size):.1f} | moi sample dung 1 lan/epoch."
     )
+
+    task_bs_avg = n_task / (N * world_size)
+    if task_bs_avg < 8:
+        logger.warning(
+            f"[canh bao] Batch task trung binh chi ~{task_bs_avg:.1f} sample/rank/step (global "
+            f"~{task_bs_avg * world_size:.0f}) vi pool align ({n_align}) LON HON NHIEU pool task ({n_task}) "
+            f"nen N={N} qua lon. Moi step MoE+LoRA ton thoi gian gan nhu co dinh (nhieu kernel nho) "
+            f"-> {total_steps} step se rat lau va gradient task rat nhieu. Giam pool align "
+            f"(--max_pairs_per_file / --max_lang_pairs_per_record / bo bible khoi --alignment_data / "
+            f"--max_samples) hoac tang --align_batch_size / giam --num_train_epochs. Muc tieu: "
+            f"n_align ~ n_task x (align_batch_toan_cuc / task_batch_toan_cuc).")
 
     plan = AlternatePlan(n_task, n_align, task_lengths, N, world_size, rank, args.seed)
 
