@@ -42,6 +42,19 @@ khi optimizer.step() — nen KHONG can OOM-split. Contrastive step khong chia mi
 (can in-batch negatives), nen neu neo theo task ma align batch tinh ra qua lon thi giam
 --task_batch_size de tang N.
 
+THAY DOI SO VOI BAN TRUOC (sua loi "Pool task qua nho cho N=..." + toi uu toc do)
+------------------------------------------------------------------------------------
+  * Loi: pool align (ted ~21.7M cap) >> pool task (~0.72M) nen N = n_align/(align_bs*W) ~ 1.4M step/epoch
+    > n_task -> RuntimeError. Gio N bi ha xuong de batch task/rank >= --min_task_batch_per_rank, va moi
+    epoch chi dung N*W*align_batch_size cap align (lay mau KHONG LAP, can bang theo nguon, khac nhau moi
+    epoch). Neu pool can bang thi hanh vi "dung HET du lieu moi epoch" nhu cu van giu nguyen.
+  * --max_pairs_per_file mac dinh 600000 (chon dong deu, khong tao het 21.7M tuple trong RAM).
+  * Rank 0 build pool align/task 1 lan -> cache (--cache_dir) -> cac rank/lan chay sau doc lai.
+  * Task step: tokenize san 1 lan (cache), chi nhan lm_head tren token dap an, khong .item() moi micro-batch.
+  * Align step: 1 forward cho ca eng + other (thay vi 2). LB loss khong con boolean-index (device sync).
+  * rank_pattern LoRA bang regex (get_peft_model 2 phut -> vai giay), broadcast tham so gop 1 lan,
+    AdamW fused, TF32, load model thang len GPU, khong ve graph moi 10 step (--plot_every).
+
 Dong bo gradient: THAY DDP bang all-reduce gradient thu cong (giong cac file finetuning
 english-task-only). Ly do: task step cong don gradient qua nhieu micro-batch (so micro-batch
 co the khac nhau giua cac rank) va 2 loai step co do thi autograd khac nhau, nen tranh phai
@@ -80,6 +93,7 @@ import hashlib
 import json
 import logging
 import os
+import pickle
 import random
 import re
 import shutil
@@ -88,6 +102,7 @@ import time
 from datetime import timedelta
 from typing import Dict, List, Optional, Sequence, Tuple
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -203,10 +218,16 @@ def build_argparser() -> argparse.ArgumentParser:
                     help="Gioi han so ngon ngu ghep voi eng_key trong 1 record (None = dung het).")
     p.add_argument("--max_samples", type=int, default=None,
                     help="Gioi han so cap bitext alignment (debug), None = dung het.")
-    p.add_argument("--max_pairs_per_file", type=int, default=None,
-                    help="Gioi han so cap bitext MOI FILE alignment (cat ngau nhien, can bang cac nguon). "
-                         "Huu ich khi 1 file chiem da so cap (flores ~0.4M, ntrex ~0.25M; xem log "
-                         "'<file>: +N cap bitext' de biet kich thuoc thuc te cua ted).")
+    p.add_argument("--max_pairs_per_file", type=int, default=600_000,
+                    help="Gioi han so cap bitext MOI FILE alignment (chon ngau nhien DONG DEU, KHONG tao "
+                         "toan bo cap trong RAM). Mac dinh 600000: flores (~0.41M) va ntrex (~0.25M) giu "
+                         "nguyen, ted (~21.7M cap) bi cat xuong 600k. Dat 0 = khong gioi han (CHI nen dung "
+                         "khi RAM rat lon: 22M cap ~ vai chuc GB/rank va moi epoch chi dung 1 phan nho).")
+    p.add_argument("--align_source_sampling", type=str, default="balanced",
+                    choices=["balanced", "proportional"],
+                    help="Khi moi epoch chi dung 1 PHAN pool align (xem --min_task_batch_per_rank): "
+                         "'balanced' = chia deu quota giua cac file nguon (flores/ntrex/ted), "
+                         "'proportional' = lay ngau nhien deu tren ca pool (ted se chiem da so).")
 
     # Du lieu TASK (task step, LM loss) — doc giong het cac file finetuning english-task-only
     p.add_argument("--task_datasets", type=str, nargs="+", choices=["squad", "snli", "mmlu"],
@@ -232,6 +253,11 @@ def build_argparser() -> argparse.ArgumentParser:
                     help="Batch size align per-rank (so cap bitext / rank / align step). Mac dinh la "
                          "ANCHOR quyet dinh N = so task step = so align step moi epoch. Bi bo qua "
                          "(tinh lai) neu truyen --task_batch_size.")
+    p.add_argument("--min_task_batch_per_rank", type=int, default=16,
+                    help="Chi dung khi anchor = align (khong truyen --task_batch_size). Neu N tinh tu pool "
+                         "align lam batch task trung binh < gia tri nay (vd pool align >> pool task), N tu "
+                         "dong bi ha xuong de batch task/rank >= gia tri nay; khi do moi epoch chi dung "
+                         "N*world_size*align_batch_size cap align (lay mau lai moi epoch).")
     p.add_argument("--task_batch_size", type=int, default=None,
                     help="Neu truyen: dung lam ANCHOR (per-rank) thay cho --align_batch_size; batch "
                          "size align khi do se TU DONG TINH de dung het du lieu alignment.")
@@ -297,7 +323,16 @@ def build_argparser() -> argparse.ArgumentParser:
                     help="Chi dung khi CHAY DON PROCESS (khong qua torchrun)")
     p.add_argument("--trust_remote_code", action="store_true", default=True)
     p.add_argument("--diagnostics_dir", type=str, default=None)
-    p.add_argument("--log_every", type=int, default=10)
+    p.add_argument("--log_every", type=int, default=10,
+                    help="Cap nhat postfix cua thanh tien do moi N step.")
+    p.add_argument("--plot_every", type=int, default=0,
+                    help="Ve lai 2 graph moi N step (0 = chi ve khi luu checkpoint / ket thuc). Ve graph "
+                         "doc lai TOAN BO loss_log.jsonl + luu 2 PNG nen rank 0 bi cham, ca cac rank khac "
+                         "phai cho o all-reduce -> khong nen de nho.")
+    p.add_argument("--cache_dir", type=str, default=None,
+                    help="Thu muc cache pool alignment/task da build (mac dinh <output_dir>/cache). "
+                         "Rank 0 build 1 lan, cac rank khac + cac lan chay sau doc lai.")
+    p.add_argument("--no_cache", action="store_true", help="Bo qua cache, build lai du lieu tu dau.")
     p.add_argument("--smooth_window", type=int, default=50,
                     help="Cua so trung binh truot (so diem cua MOI duong, task va align tinh rieng) cho duong dam tren 2 graph.")
     return p
@@ -325,8 +360,16 @@ def sync_grads_across_ranks(trainable_params: List[torch.Tensor], world_size: in
 
 def broadcast_trainable_params(trainable_params: List[torch.Tensor], src: int = 0):
     """Dong bo gia tri khoi tao LoRA tu rank 0 (khong con DDP tu broadcast luc khoi tao)."""
+    from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
+    by_dtype: Dict[torch.dtype, List[torch.Tensor]] = {}
     for p in trainable_params:
-        dist.broadcast(p.data, src=src)
+        by_dtype.setdefault(p.dtype, []).append(p)
+    for ps in by_dtype.values():
+        datas = [p.data for p in ps]
+        flat = _flatten_dense_tensors(datas)
+        dist.broadcast(flat, src=src)
+        for d, synced in zip(datas, _unflatten_dense_tensors(flat, datas)):
+            d.copy_(synced)
 
 
 
@@ -385,16 +428,93 @@ def get_underlying_model(model):
     return model.module if hasattr(model, "module") else model
 
 
+_BACKBONE_CACHE: Dict[int, Tuple] = {}
+
+
+def get_backbone_and_head(model):
+    """(backbone, lm_head) cua CausalLM goc ben duoi PeftModel -> chay backbone roi CHI nhan lm_head
+    tren cac vi tri co nhan (phan dap an). (None, None) neu khong tim thay (se quay ve forward day du)."""
+    key = id(model)
+    if key not in _BACKBONE_CACHE:
+        m = get_underlying_model(model)
+        if hasattr(m, "get_base_model"):
+            m = m.get_base_model()
+        backbone, head = getattr(m, "model", None), getattr(m, "lm_head", None)
+        _BACKBONE_CACHE[key] = (backbone, head) if (backbone is not None and head is not None) else (None, None)
+    return _BACKBONE_CACHE[key]
+
+
+def transformers_at_least(ver: str) -> bool:
+    import transformers
+    from packaging.version import Version
+    return Version(transformers.__version__.split("+")[0]) >= Version(ver)
+
+
+def file_signature(paths: Sequence[str]) -> List:
+    sig = []
+    for p in paths:
+        try:
+            st = os.stat(p)
+            sig.append([os.path.abspath(p), st.st_size, int(st.st_mtime)])
+        except OSError:
+            sig.append([os.path.abspath(p), None, None])
+    return sig
+
+
+def cached_build(cache_path: Optional[str], build_fn, is_main: bool, is_distributed: bool):
+    """Rank 0 build (hoac doc cache neu co), luu cache, roi cac rank khac doc lai tu cache.
+    Tranh viec MOI rank tu doc json 22M cap + tokenize 700k sample (log cu: 2 rank lam trung nhau
+    ~4 phut + gap doi RAM). cache_path=None -> khong cache (moi rank tu build, nhu cu)."""
+    def _load():
+        with open(cache_path, "rb") as f:
+            return pickle.load(f)
+
+    if cache_path is None:
+        return build_fn()
+    if os.path.exists(cache_path):
+        if is_main:
+            logger.info(f"Dung cache: {cache_path}")
+        return _load()
+
+    obj, err = None, None
+    if is_main:
+        try:
+            obj = build_fn()
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            tmp = cache_path + ".tmp"
+            with open(tmp, "wb") as f:
+                pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(tmp, cache_path)
+            logger.info(f"Da luu cache: {cache_path}")
+        except BaseException as e:  # van phai toi barrier de cac rank khac khong treo toi timeout
+            err = e
+    if is_distributed:
+        dist.barrier()
+    if err is not None:
+        raise err
+    if not is_main:
+        if not os.path.exists(cache_path):
+            raise RuntimeError(f"Rank 0 build du lieu that bai (khong co {cache_path}).")
+        obj = _load()
+    return obj
+
+
 # ============================================================================================
 # Du lieu ALIGNMENT: bitext english-other tu JSON multiway-parallel
 # ============================================================================================
 def load_bitext_pairs(data_dir: str, data_files: Sequence[str], eng_key: str,
                        max_lang_pairs_per_record: Optional[int] = None,
                        seed: int = 42,
-                       max_pairs_per_file: Optional[int] = None) -> List[Tuple[str, str, str]]:
+                       max_pairs_per_file: Optional[int] = None):
+    """Tra ve (pairs, src_ids): pairs = [(eng, other, lang)], src_ids = np.uint8 (chi so file nguon).
+
+    --max_pairs_per_file duoc ap dung bang 2 PASS: pass 1 chi DEM cac cap hop le (luu danh sach
+    khoa ngon ngu cua tung record, khong tao tuple chuoi), roi chon dong deu K chi so cap; pass 2
+    chi tao K tuple do. Nho vay ted.json (~21.7M cap) khong bao gio bi nhan ban thanh 21.7M tuple."""
     pairs: List[Tuple[str, str, str]] = []
+    src_ids: List[int] = []
     rng = random.Random(seed)
-    for fname in data_files:
+    for fi, fname in enumerate(data_files):
         path = os.path.join(data_dir, fname)
         if not os.path.exists(path):
             logger.warning(f"Khong tim thay file {path}, bo qua.")
@@ -402,9 +522,12 @@ def load_bitext_pairs(data_dir: str, data_files: Sequence[str], eng_key: str,
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         records = list(data.values()) if isinstance(data, dict) else data
+        del data
 
-        n_before = len(pairs)
+        # ---- pass 1: dem
         n_no_eng = 0
+        kept: List[Tuple[str, List[str]]] = []     # (eng_text, [other_keys hop le])
+        total = 0
         for rec in records:
             if not isinstance(rec, dict):
                 continue
@@ -412,22 +535,40 @@ def load_bitext_pairs(data_dir: str, data_files: Sequence[str], eng_key: str,
             if not isinstance(eng_text, str) or not eng_text.strip():
                 n_no_eng += 1
                 continue
-            eng_text = eng_text.strip()
-
             other_keys = [k for k in rec.keys() if k not in ("id", eng_key)]
             if max_lang_pairs_per_record is not None and len(other_keys) > max_lang_pairs_per_record:
                 other_keys = rng.sample(other_keys, max_lang_pairs_per_record)
+            other_keys = [k for k in other_keys if isinstance(rec.get(k), str) and rec[k].strip()]
+            if other_keys:
+                kept.append((rec, eng_text.strip(), other_keys))
+                total += len(other_keys)
 
-            for k in other_keys:
-                v = rec.get(k)
-                if isinstance(v, str) and v.strip():
-                    pairs.append((eng_text, v.strip(), k))
+        cap = max_pairs_per_file if (max_pairs_per_file and max_pairs_per_file > 0) else None
+        if cap is not None and total > cap:
+            chosen = sorted(rng.sample(range(total), cap))
+            logger.info(f"{fname}: chon ngau nhien {cap}/{total} cap (--max_pairs_per_file).")
+        else:
+            chosen = None
 
-        if max_pairs_per_file is not None and len(pairs) - n_before > max_pairs_per_file:
-            file_pairs = pairs[n_before:]
-            rng.shuffle(file_pairs)
-            pairs[n_before:] = file_pairs[:max_pairs_per_file]
-            logger.info(f"{fname}: cat ngau nhien xuong {max_pairs_per_file} cap (--max_pairs_per_file).")
+        # ---- pass 2: tao tuple (chi cac cap duoc chon)
+        n_before = len(pairs)
+        flat_pos, ci = 0, 0
+        n_chosen = len(chosen) if chosen is not None else total
+        for rec, eng_text, other_keys in kept:
+            nk = len(other_keys)
+            if chosen is None:
+                for k in other_keys:
+                    pairs.append((eng_text, rec[k].strip(), k))
+            else:
+                while ci < n_chosen and chosen[ci] < flat_pos + nk:
+                    k = other_keys[chosen[ci] - flat_pos]
+                    pairs.append((eng_text, rec[k].strip(), k))
+                    ci += 1
+            flat_pos += nk
+            if chosen is not None and ci >= n_chosen:
+                break
+        src_ids.extend([fi] * (len(pairs) - n_before))
+
         if n_no_eng:
             ex = next((list(r.keys())[:6] for r in records if isinstance(r, dict)), [])
             logger.warning(f"{fname}: {n_no_eng}/{len(records)} record KHONG co khoa '{eng_key}' "
@@ -435,7 +576,9 @@ def load_bitext_pairs(data_dir: str, data_files: Sequence[str], eng_key: str,
                            f"bi bo qua, dung --eng_key de chi dinh dung ten khoa tieng Anh.")
         logger.info(f"{fname}: +{len(pairs) - n_before} cap bitext ({eng_key}-other), "
                     f"tong so record = {len(records)}")
-    return pairs
+        del records, kept
+        gc.collect()
+    return pairs, np.asarray(src_ids, dtype=np.uint8)
 
 
 # ============================================================================================
@@ -544,17 +687,22 @@ def select_context_window(context: str, answer_start: int, answer_text: str,
     """Khi full_text vuot qua --max_length, KHONG truncate tho tu tokenizer (se cat mat phan
     'Answer: ...' nam o cuoi chuoi), ma chon 1 CUA SO cac TU trong context BAO QUANH vi tri
     cua answer (dua vao answer_start), roi mo rong dan sang trai/phai (giu nguyen tung tu) cho
-    toi khi vua sat ngan sach max_context_tokens. Nho vay context van luon chua answer."""
+    toi khi vua sat ngan sach max_context_tokens. Nho vay context van luon chua answer.
+
+    TOI UU: ban cu tokenize lai ca cua so sau MOI lan mo rong 1 tu (O(so_tu) lan goi tokenizer /
+    sample, ~50 giay cho 213 sample SQuAD). Gio: tokenize tung tu 1 lan (batch) -> tong tich luy ->
+    mo rong bang uoc luong O(1); roi KIEM TRA lai bang tokenizer that va thu hep neu uoc luong
+    thap hon thuc te, nen ket qua van dam bao <= max_context_tokens."""
     spans = [m.span() for m in WORD_SPAN_PATTERN.finditer(context)]
     if not spans:
         return context
 
     answer_end = answer_start + len(answer_text)
     left_idx, right_idx = None, None
-    for i, (s, e) in enumerate(spans):
-        if e > answer_start and left_idx is None:
+    for i, (s_, e_) in enumerate(spans):
+        if e_ > answer_start and left_idx is None:
             left_idx = i
-        if s < answer_end:
+        if s_ < answer_end:
             right_idx = i
     if left_idx is None or right_idx is None:
         left_idx, right_idx = 0, 0
@@ -563,8 +711,8 @@ def select_context_window(context: str, answer_start: int, answer_text: str,
     def window_text(lo, hi):
         return context[spans[lo][0]: spans[hi][1]]
 
-    def token_len(s: str) -> int:
-        return len(tokenizer(s, add_special_tokens=False)["input_ids"])
+    def token_len(t: str) -> int:
+        return len(tokenizer(t, add_special_tokens=False)["input_ids"])
 
     cur_text = window_text(lo, hi)
     if token_len(cur_text) > max_context_tokens:
@@ -572,32 +720,45 @@ def select_context_window(context: str, answer_start: int, answer_text: str,
         # nguyen trang, ham goi se tu phat hien full_text van qua dai va skip sample nay.
         return cur_text
 
+    words = [" " + context[a_:b_] for a_, b_ in spans]
+    wl = tokenizer(words, add_special_tokens=False)["input_ids"]
+    cum = [0]
+    for ids in wl:
+        cum.append(cum[-1] + len(ids))
+
+    def est(lo, hi):
+        return cum[hi + 1] - cum[lo]
+
     while True:
         moved = False
-        if lo > 0:
-            candidate = window_text(lo - 1, hi)
-            if token_len(candidate) <= max_context_tokens:
-                lo -= 1
-                cur_text = candidate
-                moved = True
-        if hi < len(spans) - 1:
-            candidate = window_text(lo, hi + 1)
-            if token_len(candidate) <= max_context_tokens:
-                hi += 1
-                cur_text = candidate
-                moved = True
+        if lo > 0 and est(lo - 1, hi) <= max_context_tokens:
+            lo -= 1
+            moved = True
+        if hi < len(spans) - 1 and est(lo, hi + 1) <= max_context_tokens:
+            hi += 1
+            moved = True
         if not moved:
             break
-    return cur_text
+
+    # Kiem tra bang tokenizer that (uoc luong theo tung tu co the lech vai token); thu hep neu can.
+    while (lo, hi) != (left_idx, right_idx) and token_len(window_text(lo, hi)) > max_context_tokens:
+        if lo < left_idx and (hi == right_idx or (left_idx - lo) >= (hi - right_idx)):
+            lo += 1
+        else:
+            hi -= 1
+    return window_text(lo, hi)
 
 
-def compute_lengths(tokenizer, texts: Sequence[str], chunk_size: int = 1000) -> List[int]:
-    lengths: List[int] = []
-    for i in tqdm(range(0, len(texts), chunk_size), desc="Tinh do dai token cho toan bo sample"):
-        chunk = texts[i:i + chunk_size]
-        enc = tokenizer(chunk, add_special_tokens=True)
-        lengths.extend(len(ids) for ids in enc["input_ids"])
-    return lengths
+def compute_token_ids(tokenizer, texts: Sequence[str], chunk_size: int = 4000,
+                       desc: str = "Tokenize") -> List[np.ndarray]:
+    """Tokenize batch (fast tokenizer) -> list np.int32. GIU LAI ids (khong chi do dai) de luc train
+    khong phai tokenize lai tung step. Khong tao attention_mask / token_type_ids (khong dung)."""
+    out: List[np.ndarray] = []
+    for i in tqdm(range(0, len(texts), chunk_size), desc=desc):
+        enc = tokenizer(list(texts[i:i + chunk_size]), add_special_tokens=True,
+                        return_attention_mask=False)["input_ids"]
+        out.extend(np.asarray(x, dtype=np.int32) for x in enc)
+    return out
 
 
 def squad_build_examples(records: List[Dict], tokenizer, eos_token: str, max_length: int) -> Tuple[List[Dict], List[int]]:
@@ -618,7 +779,9 @@ def squad_build_examples(records: List[Dict], tokenizer, eos_token: str, max_len
             "question": rec["question"],
             "answer_start": rec["answer_start"],
         })
-    naive_lengths = compute_lengths(tokenizer, [ex["full_text"] for ex in naive_examples])
+    naive_ids = compute_token_ids(tokenizer, [ex["full_text"] for ex in naive_examples],
+                                  desc="SQuAD: tokenize")
+    naive_lengths = [len(x) for x in naive_ids]
 
     # Buoc 2: chi ap dung windowing (co the cham hon, goi tokenizer nhieu lan) cho phan THIEU SO
     # sample vuot qua max_length — da so sample SQuAD se vua trong 1 lan, khong can qua buoc nay.
@@ -626,10 +789,9 @@ def squad_build_examples(records: List[Dict], tokenizer, eos_token: str, max_len
     lengths: List[int] = []
     n_windowed = 0
     n_dropped_too_long = 0
-    for ex, naive_len in tqdm(list(zip(naive_examples, naive_lengths)),
-                               desc="Kiem tra/loc do dai (windowing context qua dai neu can)"):
+    for ex, naive_len, naive_id in zip(naive_examples, naive_lengths, naive_ids):
         if naive_len <= max_length:
-            examples.append({"prompt": ex["prompt"], "full_text": ex["full_text"]})
+            examples.append({"prompt": ex["prompt"], "full_text": ex["full_text"], "ids": naive_id})
             lengths.append(naive_len)
             continue
 
@@ -647,12 +809,13 @@ def squad_build_examples(records: List[Dict], tokenizer, eos_token: str, max_len
             ex["context"], ex["answer_start"], ex["answer_text"], tokenizer, max_context_tokens
         )
         new_prompt, new_full_text = squad_build_full_text(windowed_context, ex["question"], ex["answer_text"], eos_token)
-        new_len = len(tokenizer(new_full_text, add_special_tokens=True)["input_ids"])
+        new_ids = np.asarray(tokenizer(new_full_text, add_special_tokens=True)["input_ids"], dtype=np.int32)
+        new_len = len(new_ids)
         if new_len > max_length:
             n_dropped_too_long += 1
             continue
 
-        examples.append({"prompt": new_prompt, "full_text": new_full_text})
+        examples.append({"prompt": new_prompt, "full_text": new_full_text, "ids": new_ids})
         lengths.append(new_len)
         n_windowed += 1
 
@@ -820,17 +983,17 @@ def mmlu_build_examples(records: List[Dict], tokenizer, eos_token: str, max_leng
         prompts.append(prompt)
         full_texts.append(full_text)
 
-    lengths_all = compute_lengths(tokenizer, full_texts)
+    ids_all = compute_token_ids(tokenizer, full_texts, desc="MMLU: tokenize")
 
     examples: List[Dict] = []
     lengths: List[int] = []
     n_dropped_too_long = 0
-    for prompt, full_text, length in zip(prompts, full_texts, lengths_all):
-        if length > max_length:
+    for prompt, full_text, ids in zip(prompts, full_texts, ids_all):
+        if len(ids) > max_length:
             n_dropped_too_long += 1
             continue
-        examples.append({"prompt": prompt, "full_text": full_text})
-        lengths.append(length)
+        examples.append({"prompt": prompt, "full_text": full_text, "ids": ids})
+        lengths.append(len(ids))
 
     logger.info(
         f"mmlu_build_examples: {len(examples)} sample giu lai, bo qua {n_dropped_too_long} sample "
@@ -884,6 +1047,21 @@ def build_lora_target_modules(model, layer_indices: set) -> List[str]:
         if is_attn or is_expert or is_router:
             targets.append(name)
     return targets
+
+
+def build_rank_pattern(attn_names, expert_names, router_names, r_attn, r_expert, r_router) -> Dict[str, int]:
+    """rank_pattern gon bang REGEX (vai key) thay vi 1480 ten day du.
+    PEFT tra rank cho tung module bang re.match voi MOI key cua rank_pattern (khong cache duoc vi
+    >512 pattern khac nhau) -> O(n_target^2) ~ 1.1M lan bien dich regex ~ 2 PHUT khoi tao LoRA (log:
+    04:03:14 -> 04:05:08). Gom cac ten thanh vai pattern 'layers\\.\\d+\\.mlp\\.experts\\.\\d+\\.gate_proj'..."""
+    def pat(name: str) -> str:
+        parts = (name.split(".", 1)[1] if "." in name else name).split(".")
+        return r"\.".join(r"\d+" if p.isdigit() else re.escape(p) for p in parts)
+    rp: Dict[str, int] = {}
+    for names, r in ((router_names, r_router), (attn_names, r_attn), (expert_names, r_expert)):
+        for n in names:
+            rp[pat(n)] = r
+    return rp
 
 
 def categorize_lora_targets(target_modules: Sequence[str]) -> Tuple[List[str], List[str], List[str]]:
@@ -946,31 +1124,30 @@ def infer_moe_dims(config, args):
 
 def compute_load_balancing_loss(router_logits_list: List[torch.Tensor], attention_mask: torch.Tensor,
                                  num_experts: int, top_k: int):
-    """attention_mask: [batch, seq_len] (1 = token that, 0 = padding). Phai loai bo vi tri
-    padding truoc khi tinh bat ky thong ke nao, tuong tu cach L_LM loai padding qua
-    ignore_index=-100."""
-    mask_flat = attention_mask.reshape(-1).bool()
+    """attention_mask: [batch, seq_len] (1 = token that, 0 = padding). Padding bi loai bang TRONG SO
+    (0/1) thay vi boolean-index logits[mask] (cach cu moi lan goi gay 1 device sync / layer). Ket qua
+    bang het: mean tren cac token that cua [so token chon expert] va [xac suat router]."""
+    w_full = attention_mask.reshape(-1).to(torch.float32)
 
     losses = []
     for logits in router_logits_list:
-        logits = logits.reshape(-1, logits.shape[-1])
-        if logits.shape[0] == mask_flat.shape[0]:
-            logits = logits[mask_flat]
+        logits = logits.reshape(-1, logits.shape[-1]).float()
+        if logits.shape[0] == w_full.shape[0]:
+            w = w_full
         else:
             logger.warning(
                 "compute_load_balancing_loss: kich thuoc router logits "
-                f"({logits.shape[0]}) khong khop attention_mask ({mask_flat.shape[0]}) -> "
+                f"({logits.shape[0]}) khong khop attention_mask ({w_full.shape[0]}) -> "
                 "bo qua loc padding cho lan tinh nay."
             )
-        if logits.shape[0] == 0:
-            continue
+            w = torch.ones(logits.shape[0], device=logits.device, dtype=torch.float32)
+        n_valid = w.sum().clamp(min=1.0)
         routing_weights = F.softmax(logits, dim=-1)
         _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
-        expert_mask = F.one_hot(selected_experts, num_experts).float()
-        tokens_per_expert = expert_mask.sum(dim=1).mean(dim=0)
-        avg_prob_per_expert = routing_weights.mean(dim=0)
-        loss = num_experts * torch.sum(tokens_per_expert * avg_prob_per_expert)
-        losses.append(loss)
+        expert_mask = torch.zeros_like(routing_weights).scatter_(1, selected_experts, 1.0)   # [T, E]
+        tokens_per_expert = (expert_mask * w[:, None]).sum(dim=0) / n_valid
+        avg_prob_per_expert = (routing_weights * w[:, None]).sum(dim=0) / n_valid
+        losses.append(num_experts * torch.sum(tokens_per_expert * avg_prob_per_expert))
     if not losses:
         return torch.tensor(0.0, device=attention_mask.device)
     return torch.stack(losses).mean()
@@ -1089,10 +1266,13 @@ def compute_alignment_step(eng_texts: List[str], other_texts: List[str], tokeniz
     mask_false_negatives=True: voi du lieu multiway, cung 1 cau Anh (hoac cung 1 cau target) co
       the xuat hien o 2 cap khac nhau trong cung batch -> cap (i, j) nhu vay KHONG phai negative
       that; loai khoi mau so softmax (logit = -inf). Vi tri duong cheo (positive) luon giu."""
-    pooled_eng = encode_layer_representation(eng_texts, tokenizer, model, align_layer,
-                                              max_length, device, router_logits_cache)
-    pooled_other = encode_layer_representation(other_texts, tokenizer, model, align_layer,
-                                                max_length, device, router_logits_cache)
+    # TOI UU: gop eng + other thanh 1 batch 2b -> 1 forward thay vi 2 (MoE+LoRA bi gioi han boi so
+    # kernel launch, nen gan nhu giam nua thoi gian align step). Padding phai (causal) + mean-pool co
+    # mask nen gia tri tung cau khong doi so voi 2 forward rieng.
+    n_pair = len(eng_texts)
+    pooled = encode_layer_representation(list(eng_texts) + list(other_texts), tokenizer, model,
+                                          align_layer, max_length, device, router_logits_cache)
+    pooled_eng, pooled_other = pooled[:n_pair], pooled[n_pair:]
 
     a_loc = F.normalize(pooled_eng.float(), dim=-1)     # [b, d]
     b_loc = F.normalize(pooled_other.float(), dim=-1)   # [b, d]
@@ -1132,7 +1312,7 @@ def compute_alignment_step(eng_texts: List[str], other_texts: List[str], tokeniz
 # Task pool: gop SQuAD + SNLI + MMLU thanh 1 danh sach example duy nhat {"prompt","full_text","src"}
 # (doc/build prompt/windowing/loc do dai bang CHINH cac ham cua cac file finetuning goc)
 # ============================================================================================
-def build_task_pool(args, tokenizer) -> Tuple[List[Dict], List[int], Dict[str, Dict[str, int]]]:
+def build_task_pool(args, tokenizer) -> Dict:
     eos = tokenizer.eos_token
     rng = random.Random(args.seed)
     examples: List[Dict] = []
@@ -1146,10 +1326,13 @@ def build_task_pool(args, tokenizer) -> Tuple[List[Dict], List[int], Dict[str, D
             records = records[: args.max_task_samples]
         return records
 
+    src_order: List[str] = []
+
     def _add(src: str, exs: List[Dict], lens: List[int], n_loaded: int):
         for ex, ln in zip(exs, lens):
-            examples.append({"prompt": ex["prompt"], "full_text": ex["full_text"], "src": src})
+            examples.append({"prompt": ex["prompt"], "ids": ex["ids"], "src": len(src_order)})
             lengths.append(ln)
+        src_order.append(src)
         stats[src] = {"loaded": n_loaded, "kept": len(exs), "dropped": n_loaded - len(exs)}
 
     if "squad" in args.task_datasets:
@@ -1159,9 +1342,13 @@ def build_task_pool(args, tokenizer) -> Tuple[List[Dict], List[int], Dict[str, D
     if "snli" in args.task_datasets:
         recs = _cap(load_snli_records(args.snli_file))
         all_exs = snli_build_examples(recs, eos)
-        all_lens = compute_lengths(tokenizer, [e["full_text"] for e in all_exs])
-        keep = [(e, l) for e, l in zip(all_exs, all_lens) if l <= args.task_max_length]
-        _add("snli", [k[0] for k in keep], [k[1] for k in keep], len(recs))
+        all_ids = compute_token_ids(tokenizer, [e["full_text"] for e in all_exs], desc="SNLI: tokenize")
+        keep = []
+        for e, ids in zip(all_exs, all_ids):
+            if len(ids) <= args.task_max_length:
+                e["ids"] = ids
+                keep.append(e)
+        _add("snli", keep, [len(e["ids"]) for e in keep], len(recs))
     if "mmlu" in args.task_datasets:
         recs = _cap(load_mmlu_records(args.mmlu_file))
         exs, lens = mmlu_build_examples(recs, tokenizer, eos, args.task_max_length)
@@ -1170,20 +1357,53 @@ def build_task_pool(args, tokenizer) -> Tuple[List[Dict], List[int], Dict[str, D
     for src, st in stats.items():
         logger.info(f"[task pool] {src}: doc {st['loaded']}, giu {st['kept']}, "
                     f"bo (qua dai khong the cat) {st['dropped']}")
-    return examples, lengths, stats
+
+    # Dong goi: 1 mang phang int32 + offsets (gon, pickle nhanh) + do dai PROMPT (de mask nhan).
+    # prompt_len = so token cua prompt tokenize RIENG (dung quy uoc cu: mask prompt = -100).
+    # Tinh 1 lan o day (duoc cache) thay vi tokenize lai prompt cua tung sample moi step.
+    prompt_ids = compute_token_ids(tokenizer, [e["prompt"] for e in examples], desc="Tokenize prompt")
+    prompt_len = np.asarray([len(x) for x in prompt_ids], dtype=np.int32)
+    del prompt_ids
+    lens_np = np.asarray(lengths, dtype=np.int64)
+    offs = np.zeros(len(examples) + 1, dtype=np.int64)
+    np.cumsum(lens_np, out=offs[1:])
+    flat = np.empty(int(offs[-1]), dtype=np.int32)
+    for i, e in enumerate(examples):
+        flat[offs[i]:offs[i + 1]] = e["ids"]
+    pool = {
+        "flat": flat, "offs": offs, "lengths": lens_np.astype(np.int32),
+        "prompt_len": np.minimum(prompt_len, lens_np.astype(np.int32)),
+        "src": np.asarray([e["src"] for e in examples], dtype=np.uint8),
+        "src_names": src_order, "stats": stats,
+    }
+    return pool
 
 
 # ============================================================================================
 # Lich xen ke task/align + chia du lieu: moi epoch = N task step + N align step, dung HET data
 # ============================================================================================
-def solve_steps_per_side(n_task: int, n_align: int, world_size: int, align_batch_size: int,
-                          task_batch_size: Optional[int]) -> Tuple[int, str]:
-    """Tra ve (N, anchor). N = so task step = so align step moi epoch."""
-    if task_batch_size is None:
-        n = int(n_align / (align_batch_size * world_size) + 0.5)
-        return max(1, n), "align"
-    n = int(n_task / (task_batch_size * world_size) + 0.5)
-    return max(1, n), "task"
+def solve_schedule(n_task: int, n_align: int, world_size: int, align_batch_size: int,
+                    task_batch_size: Optional[int], min_task_batch_per_rank: int) -> Tuple[int, str, int]:
+    """Tra ve (N, anchor, n_align_per_epoch). N = so task step = so align step moi epoch.
+
+    - anchor "task" (co --task_batch_size): N = round(n_task / (task_bs * W)).
+    - anchor "align" (mac dinh): N = round(n_align / (align_bs * W)). NEU N do lam batch task/rank
+      trung binh < min_task_batch_per_rank (pool align >> pool task, vd 22M vs 0.7M) thi ha N xuong
+      de batch task/rank = min_task_batch_per_rank -> anchor "align->task".
+    n_align_per_epoch = so cap align dung MOI epoch:
+      anchor "align" khong bi ha: dung HET n_align (nhu cu).
+      anchor "task" / "align->task": min(n_align, N * W * align_bs) -> batch align/rank = align_bs
+      co dinh (KHONG de batch contrastive phinh to), lay mau lai khac nhau moi epoch."""
+    W = world_size
+    if task_batch_size is not None:
+        N, anchor = max(1, int(n_task / (task_batch_size * W) + 0.5)), "task"
+    else:
+        N, anchor = max(1, int(n_align / (align_batch_size * W) + 0.5)), "align"
+        cap = max(1, n_task // (W * max(1, min_task_batch_per_rank)))
+        if N > cap:
+            N, anchor = cap, "align->task"
+    n_epoch = n_align if anchor == "align" else min(n_align, N * W * align_batch_size)
+    return N, anchor, n_epoch
 
 
 def split_sizes(total: int, parts: int) -> List[int]:
@@ -1192,47 +1412,84 @@ def split_sizes(total: int, parts: int) -> List[int]:
     return [base + 1 if i < rem else base for i in range(parts)]
 
 
+def balanced_quotas(sizes: Sequence[int], total: int) -> List[int]:
+    """Chia `total` cho cac nguon deu nhau; nguon nao nho hon phan chia thi lay het, phan du chia
+    tiep cho cac nguon con lai (water-filling)."""
+    q = [0] * len(sizes)
+    remaining, active = total, [i for i, sz in enumerate(sizes) if sz > 0]
+    while remaining > 0 and active:
+        share, extra = divmod(remaining, len(active))
+        nxt, progressed = [], False
+        for j, i in enumerate(active):
+            take = min(share + (1 if j < extra else 0), sizes[i] - q[i])
+            q[i] += take
+            remaining -= take
+            progressed = progressed or take > 0
+            if q[i] < sizes[i]:
+                nxt.append(i)
+        if not progressed:
+            break
+        active = nxt
+    return q
+
+
 class AlternatePlan:
-    """Moi epoch: shuffle (seed + epoch) pool task va pool align, cat thanh N lat theo
-    split_sizes -> MOI sample xuat hien DUNG 1 LAN / epoch. Moi lat chia tiep cho cac rank
-    (rank r lay phan tu r, r+W, r+2W, ...). Lat task duoc sort theo do dai TRUOC khi chia rank
-    de moi rank co phan phoi do dai nhu nhau (can bang tai) va batch cua rank da sap xep tang
-    dan (thuan loi cho micro-batching theo token). Xac dinh hoan toan theo (seed, epoch) nen
-    resume giua epoch cho ra dung cac batch nhu lan chay truoc."""
+    """Moi epoch: hoan vi (seed, epoch) pool task -> cat N lat (split_sizes) -> MOI sample task
+    xuat hien DUNG 1 LAN / epoch. Lat task duoc sort theo do dai TRUOC khi chia rank (can bang tai +
+    thuan loi cho micro-batching theo token). Pool align: chon n_align_epoch cap (het pool, hoac 1
+    mau KHONG LAP lai khac nhau moi epoch, can bang theo nguon neu 'balanced'), roi chia N lat.
+    Xac dinh hoan toan theo (seed, epoch) nen resume giua epoch cho ra dung cac batch cu.
+    Dung numpy (hoan vi 22M phan tu bang random.shuffle ton ~30s + vai GB moi epoch)."""
 
-    def __init__(self, n_task, n_align, task_lengths, steps_per_side, world_size, rank, seed):
+    def __init__(self, n_task, n_align, task_lengths, steps_per_side, world_size, rank, seed,
+                 n_align_epoch=None, align_src=None, align_sampling="balanced"):
         self.n_task, self.n_align = n_task, n_align
-        self.task_lengths = task_lengths
+        self.task_lengths = np.asarray(task_lengths)
         self.N, self.W, self.rank, self.seed = steps_per_side, world_size, rank, seed
+        self.n_align_epoch = min(n_align, n_align_epoch or n_align)
+        self.align_src = None if align_src is None else np.asarray(align_src)
+        self.align_sampling = align_sampling
 
-    def _perm(self, n: int, epoch: int, salt: int) -> List[int]:
-        rng = random.Random(self.seed * 1_000_003 + epoch * 101 + salt)
-        perm = list(range(n))
-        rng.shuffle(perm)
-        return perm
+    def _rng(self, epoch: int, salt: int):
+        return np.random.default_rng([self.seed, epoch, salt])
 
-    def epoch_batches(self, epoch: int) -> Tuple[List[List[int]], List[List[int]]]:
-        t_perm = self._perm(self.n_task, epoch, 1)
-        a_perm = self._perm(self.n_align, epoch, 2)
+    def _align_indices(self, epoch: int) -> np.ndarray:
+        rng = self._rng(epoch, 2)
+        k = self.n_align_epoch
+        if k >= self.n_align:
+            return rng.permutation(self.n_align)
+        if self.align_sampling == "balanced" and self.align_src is not None:
+            groups = [np.flatnonzero(self.align_src == g) for g in np.unique(self.align_src)]
+            quotas = balanced_quotas([len(g) for g in groups], k)
+            idx = np.concatenate([rng.choice(g, size=q, replace=False) for g, q in zip(groups, quotas)])
+            rng.shuffle(idx)
+            return idx
+        return rng.choice(self.n_align, size=k, replace=False)
+
+    def epoch_batches(self, epoch: int) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+        t_perm = self._rng(epoch, 1).permutation(self.n_task)
         task_batches, align_batches = [], []
         pos = 0
-        for s in split_sizes(self.n_task, self.N):
-            chunk = t_perm[pos:pos + s]
-            pos += s
-            chunk.sort(key=lambda i: self.task_lengths[i])
+        for sz in split_sizes(self.n_task, self.N):
+            chunk = t_perm[pos:pos + sz]
+            pos += sz
+            chunk = chunk[np.argsort(self.task_lengths[chunk], kind="stable")]
             task_batches.append(chunk[self.rank::self.W])
         # Align: moi lat PHAI chia deu cho cac rank (all_gather can cung shape tren moi rank).
         # Gom thanh `units` khoi, moi khoi W sample; khoi cuoi duoc dem them < W sample lay tu dau
         # hoan vi (chi toi da W-1 sample/epoch bi dung 2 lan, nam o lat khac nhau), roi chia
         # units khoi cho N lat. Nho vay moi lat co size = (so khoi) * W, rank nao cung nhan bang nhau.
-        units = -(-self.n_align // self.W)
-        pad = units * self.W - self.n_align
-        a_perm = a_perm + a_perm[:pad]
+        a_perm = self._align_indices(epoch)
+        n_a = len(a_perm)
+        units = -(-n_a // self.W)
+        pad = units * self.W - n_a
+        if pad:
+            a_perm = np.concatenate([a_perm, a_perm[:pad]])
         pos = 0
         for u in split_sizes(units, self.N):
-            s = u * self.W
-            chunk = a_perm[pos:pos + s]
-            pos += s
+            sz = u * self.W
+            chunk = a_perm[pos:pos + sz]
+            pos += sz
             align_batches.append(chunk[self.rank::self.W])
         return task_batches, align_batches
 
@@ -1246,7 +1503,7 @@ def make_micro_batches(sorted_idx: List[int], lengths: List[int], token_budget: 
     kich thuoc padded cua micro-batch = so_sample * do_dai_sample_moi."""
     micro, cur = [], []
     for i in sorted_idx:
-        if cur and (len(cur) + 1) * lengths[i] > token_budget:
+        if cur and (len(cur) + 1) * int(lengths[i]) > token_budget:
             micro.append(cur)
             cur = []
         cur.append(i)
@@ -1255,41 +1512,57 @@ def make_micro_batches(sorted_idx: List[int], lengths: List[int], token_budget: 
     return micro
 
 
-def forward_backward_task_micro(sub_examples, tokenizer, model, max_length, device,
+def collate_task_micro(pool: Dict, idx: List[int], pad_id: int):
+    """Ghep micro-batch tu ids DA TOKENIZE SAN (pool["flat"]/["offs"]) bang numpy — khong con goi
+    tokenizer 2 lan/sample moi step. Right-pad bang pad_id; nhan = token cua phan dap an
+    (prompt + padding = -100) — giong het cach mask cu."""
+    flat, offs, plen, lens_all = pool["flat"], pool["offs"], pool["prompt_len"], pool["lengths"]
+    lens = lens_all[idx]
+    B, T = len(idx), int(lens.max())
+    ids = np.full((B, T), pad_id, dtype=np.int64)
+    att = np.zeros((B, T), dtype=np.int64)
+    lab = np.full((B, T), -100, dtype=np.int64)
+    for r, i in enumerate(idx):
+        L, st, pl = int(lens[r]), int(offs[i]), int(plen[i])
+        row = flat[st:st + L]
+        ids[r, :L] = row
+        att[r, :L] = 1
+        lab[r, pl:L] = row[pl:]
+    return torch.from_numpy(ids), torch.from_numpy(att), torch.from_numpy(lab)
+
+
+def forward_backward_task_micro(ids_cpu, att_cpu, lab_cpu, model, device,
                                  router_logits_cache, num_experts, top_k, lb_loss_coef,
                                  loss_weight):
-    """Tokenize + forward + backward cho 1 micro-batch. L_LM = cross-entropy CHI tren token
-    cua phan dap an ("<answer|label|letter><eos>"); prompt + padding bi mask -100 (giong cac
-    file finetuning goc). Cross-entropy chi tinh tren cac vi tri co nhan (tuong duong
-    ignore_index=-100 nhung khong phai copy ca tensor [B, T, V] logits).
-    Tra ve (lm, lb, total, n_correct_tokens, n_answer_tokens)."""
-    full_texts = [ex["full_text"] for ex in sub_examples]
-    prompts = [ex["prompt"] for ex in sub_examples]
+    """Forward + backward cho 1 micro-batch. L_LM = cross-entropy CHI tren token cua phan dap an
+    ("<answer|label|letter><eos>"); prompt + padding bi mask -100 (giong cac file finetuning goc).
 
-    enc = tokenizer(full_texts, padding=True, truncation=True, max_length=max_length,
-                     return_tensors="pt")
-    input_ids = enc["input_ids"].to(device, non_blocking=True)
-    attention_mask = enc["attention_mask"].to(device, non_blocking=True)
-    labels = input_ids.clone()
-    labels[attention_mask == 0] = -100
+    TOI UU: chay BACKBONE roi chi nhan lm_head tren cac vi tri co nhan (~1-5% token) thay vi tinh
+    logits [B, T, 151936] cho TOAN BO token (~5 GB bf16 / 16k token + them ~5 GB cho grad) roi moi
+    chon. Gia tri loss giong het (lm_head la ham theo tung vi tri). Cac chi so vi tri duoc tinh tren CPU
+    nen khong co device sync. Tra ve (stats[lm, lb, total, n_correct] tensor float64, n_answer_tokens)."""
+    input_ids = ids_cpu.to(device, non_blocking=True)
+    attention_mask = att_cpu.to(device, non_blocking=True)
 
-    seq_len = labels.shape[1]
-    for i, p in enumerate(prompts):
-        ids = tokenizer(p, add_special_tokens=True, truncation=True, max_length=max_length)["input_ids"]
-        labels[i, :min(len(ids), seq_len)] = -100
+    shift_cpu = lab_cpu[:, 1:]
+    rows, cols = (shift_cpu != -100).nonzero(as_tuple=True)       # tren CPU
+    n_ans = int(rows.numel())
+    sel_labels = shift_cpu[rows, cols].to(device, non_blocking=True)
+    rows_d, cols_d = rows.to(device, non_blocking=True), cols.to(device, non_blocking=True)
 
     router_logits_cache.clear()
-    outputs = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
-    logits = outputs.logits
+    backbone, lm_head = get_backbone_and_head(model)
+    if backbone is not None:
+        hidden = backbone(input_ids=input_ids, attention_mask=attention_mask,
+                          use_cache=False).last_hidden_state            # [B, T, H]
+        sel_logits = lm_head(hidden[:, :-1][rows_d, cols_d]) if n_ans else None   # [n_ans, V]
+        anchor = hidden.sum() * 0.0
+    else:                                                               # fallback: forward day du
+        logits = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
+        sel_logits = logits[:, :-1][rows_d, cols_d] if n_ans else None
+        anchor = logits.sum() * 0.0
 
-    shift_labels = labels[..., 1:]
-    ans_mask = shift_labels != -100
-    sel_logits = logits[..., :-1, :][ans_mask]          # [n_answer_tokens, V]
-    sel_labels = shift_labels[ans_mask]
-    if sel_labels.numel() > 0:
-        lm_loss = F.cross_entropy(sel_logits, sel_labels)
-    else:
-        lm_loss = logits.sum() * 0.0
+    lm_loss = F.cross_entropy(sel_logits.float(), sel_labels) if n_ans else anchor
 
     if router_logits_cache and num_experts and top_k:
         lb_loss = compute_load_balancing_loss(router_logits_cache, attention_mask, num_experts, top_k)
@@ -1301,30 +1574,29 @@ def forward_backward_task_micro(sub_examples, tokenizer, model, max_length, devi
     (total_loss * loss_weight).backward()
 
     with torch.no_grad():
-        n_ans = int(sel_labels.numel())
-        n_correct = int((sel_logits.argmax(dim=-1) == sel_labels).sum().item()) if n_ans else 0
+        n_correct = (sel_logits.argmax(dim=-1) == sel_labels).sum().to(torch.float64) if n_ans \
+            else torch.zeros((), dtype=torch.float64, device=lm_loss.device)
+        stats = torch.stack([lm_loss.detach().double(), lb_loss.detach().double(),
+                             total_loss.detach().double(), n_correct])
     router_logits_cache.clear()
-    return lm_loss.item(), lb_loss.item(), total_loss.item(), n_correct, n_ans
+    return stats, n_ans
 
 
-def compute_task_step(batch_idx: List[int], task_examples: List[Dict], task_lengths: List[int],
-                       tokenizer, model, max_length: int, token_budget: int, device,
+def compute_task_step(batch_idx: List[int], pool: Dict, pad_id: int, model, token_budget: int, device,
                        router_logits_cache: list, num_experts, top_k, lb_loss_coef: float) -> dict:
     n = len(batch_idx)
-    agg = {"lm": 0.0, "lb": 0.0, "tot": 0.0, "correct": 0, "ans": 0}
-    for mb in make_micro_batches(batch_idx, task_lengths, token_budget):
-        sub = [task_examples[i] for i in mb]
-        lm, lb, tot, corr, cnt = forward_backward_task_micro(
-            sub, tokenizer, model, max_length, device, router_logits_cache,
-            num_experts, top_k, lb_loss_coef, loss_weight=len(mb) / n,
-        )
-        agg["lm"] += lm * len(mb)
-        agg["lb"] += lb * len(mb)
-        agg["tot"] += tot * len(mb)
-        agg["correct"] += corr
-        agg["ans"] += cnt
-    return {"lm": agg["lm"] / n, "lb": agg["lb"] / n, "tot": agg["tot"] / n,
-            "correct": agg["correct"], "ans": agg["ans"]}
+    acc = torch.zeros(4, dtype=torch.float64, device=device)     # cong don tren GPU, 1 lan .tolist() cuoi step
+    n_ans_total = 0
+    for mb in make_micro_batches(batch_idx, pool["lengths"], token_budget):
+        ids, att, lab = collate_task_micro(pool, mb, pad_id)
+        st, cnt = forward_backward_task_micro(
+            ids, att, lab, model, device, router_logits_cache,
+            num_experts, top_k, lb_loss_coef, loss_weight=len(mb) / n)
+        w = len(mb)
+        acc += st * torch.tensor([w, w, w, 1.0], dtype=torch.float64, device=device)
+        n_ans_total += cnt
+    lm, lb, tot, correct = acc.tolist()
+    return {"lm": lm / n, "lb": lb / n, "tot": tot / n, "correct": correct, "ans": n_ans_total}
 
 
 def reduce_metrics(vals: List[float], device, is_distributed: bool) -> List[float]:
@@ -1367,7 +1639,7 @@ def save_checkpoint_and_rotate(output_dir, model, optimizer, scheduler, epoch, s
 # ============================================================================================
 # Diagnostics: jsonl + plot (tach task loss va align loss vi 2 loai step khac nhau)
 # ============================================================================================
-def log_step_to_jsonl(jsonl_path, global_step, epoch, step_type, lm_loss=None, lb_loss=None,
+def log_step_to_jsonl(jsonl_f, global_step, epoch, step_type, lm_loss=None, lb_loss=None,
                        task_total_loss=None, token_acc=None, align_loss=None, n_samples=None):
     rec = {
         "step": global_step, "epoch": epoch, "step_type": step_type,
@@ -1375,8 +1647,7 @@ def log_step_to_jsonl(jsonl_path, global_step, epoch, step_type, lm_loss=None, l
         "token_acc": token_acc, "align_loss": align_loss, "n_samples": n_samples,
         "timestamp": time.time(),
     }
-    with open(jsonl_path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    jsonl_f.write(json.dumps(rec, ensure_ascii=False) + "\n")     # handle mo san, line-buffered
 
 
 def _moving_avg(vals: List[float], window: int) -> List[float]:
@@ -1572,6 +1843,10 @@ def find_resume_checkpoint(output_dir, resume_arg: Optional[str]) -> Optional[st
 def main():
     args = build_argparser().parse_args()
     set_seed(args.seed)
+    # LoRA adapter giu fp32 (PEFT autocast_adapter_dtype) -> ~3000 matmul LoRA chay fp32; TF32 nhanh hon
+    # nhieu tren Ampere+ va khong anh huong bf16 cua backbone.
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
     is_distributed, local_rank, rank, world_size, device = setup_distributed(args)
     is_main = (rank == 0)
@@ -1601,9 +1876,19 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
-    base_model = AutoModelForCausalLM.from_pretrained(
-        args.model_name_or_path, torch_dtype=dtype, trust_remote_code=args.trust_remote_code
-    )
+    load_kwargs = dict(trust_remote_code=args.trust_remote_code)
+    load_kwargs["dtype" if transformers_at_least("4.56.0") else "torch_dtype"] = dtype
+    base_model = None
+    if device.type == "cuda":
+        # Load thang len GPU cua rank (khong qua RAM CPU: 2 rank x ~29GB bf16 neu qua CPU roi .to()).
+        dev_idx = device.index if device.index is not None else torch.cuda.current_device()
+        try:
+            base_model = AutoModelForCausalLM.from_pretrained(
+                args.model_name_or_path, device_map={"": dev_idx}, **load_kwargs)
+        except (ImportError, ValueError) as e:
+            logger.warning(f"Khong load truc tiep len GPU duoc ({e}) -> load qua CPU roi .to(device).")
+    if base_model is None:
+        base_model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, **load_kwargs)
     base_model.to(device)
 
     num_layers = get_num_layers(base_model.config)
@@ -1631,10 +1916,9 @@ def main():
         raise RuntimeError("Khong tim thay module attention/router/experts nao trong range layer. "
                            "Kiem tra regex trong build_lora_target_modules().")
     attn_names, expert_names, router_names = categorize_lora_targets(target_modules)
-    rank_pattern = {}
-    rank_pattern.update({n: args.lora_r_router for n in router_names})
-    rank_pattern.update({n: args.lora_r_attn for n in attn_names})
-    rank_pattern.update({n: args.lora_r_expert for n in expert_names})
+    rank_pattern = build_rank_pattern(attn_names, expert_names, router_names,
+                                       args.lora_r_attn, args.lora_r_expert, args.lora_r_router)
+    logger.info(f"rank_pattern ({len(rank_pattern)} key regex): {rank_pattern}")
     logger.info(f"{len(target_modules)} target module LoRA: {len(attn_names)} attention "
                 f"(r={args.lora_r_attn}), {len(expert_names)} experts (r={args.lora_r_expert}), "
                 f"{len(router_names)} router (r={args.lora_r_router}).")
@@ -1669,55 +1953,84 @@ def main():
     hooks = register_router_hooks(model, router_names, router_logits_cache)
 
     # ------------------------------------------------------------------------------------ data
-    logger.info(f"Dang doc bitext {args.eng_key}-other tu {args.data_dir} ({args.data_files}) ...")
-    pairs = load_bitext_pairs(args.data_dir, args.data_files, args.eng_key,
-                               args.max_lang_pairs_per_record, args.seed,
-                               max_pairs_per_file=args.max_pairs_per_file)
-    if args.max_samples:
-        random.Random(args.seed).shuffle(pairs)
-        pairs = pairs[: args.max_samples]
-    if not pairs:
-        raise RuntimeError("Khong doc duoc cap bitext nao — kiem tra --data_dir / --data_files / --eng_key.")
+    cache_dir = None if args.no_cache else (args.cache_dir or os.path.join(args.output_dir, "cache"))
 
-    logger.info(f"Dang doc + build pool task ({args.task_datasets}) ...")
-    task_examples, task_lengths, task_stats = build_task_pool(args, tokenizer)
-    if not task_examples:
-        raise RuntimeError("Pool task rong — kiem tra --squad_file / --snli_file / --mmlu_file.")
+    def _cache_path(prefix: str, sig: dict) -> Optional[str]:
+        if cache_dir is None:
+            return None
+        h = hashlib.md5(json.dumps(sig, sort_keys=True, default=str).encode()).hexdigest()[:12]
+        return os.path.join(cache_dir, f"{prefix}_{h}.pkl")
 
-    n_task, n_align = len(task_examples), len(pairs)
-    N, anchor = solve_steps_per_side(n_task, n_align, world_size, args.align_batch_size,
-                                      args.task_batch_size)
+    def _build_align():
+        logger.info(f"Dang doc bitext {args.eng_key}-other tu {args.data_dir} ({args.data_files}) ...")
+        prs, src = load_bitext_pairs(args.data_dir, args.data_files, args.eng_key,
+                                      args.max_lang_pairs_per_record, args.seed,
+                                      max_pairs_per_file=args.max_pairs_per_file)
+        if args.max_samples and len(prs) > args.max_samples:
+            sel = np.random.default_rng(args.seed).permutation(len(prs))[: args.max_samples]
+            prs, src = [prs[i] for i in sel], src[sel]
+        if not prs:
+            raise RuntimeError("Khong doc duoc cap bitext nao — kiem tra --data_dir / --data_files / --eng_key.")
+        return {"pairs": prs, "src": src}
+
+    align_sig = {"v": 2, "files": file_signature([os.path.join(args.data_dir, f) for f in args.data_files]),
+                 "eng_key": args.eng_key, "mlp": args.max_lang_pairs_per_record, "seed": args.seed,
+                 "cap": args.max_pairs_per_file, "max_samples": args.max_samples}
+    align_data = cached_build(_cache_path("align", align_sig), _build_align, is_main, is_distributed)
+    pairs, align_src = align_data["pairs"], align_data["src"]
+    del align_data
+
+    def _build_task():
+        logger.info(f"Dang doc + build pool task ({args.task_datasets}) ...")
+        pl = build_task_pool(args, tokenizer)
+        if len(pl["lengths"]) == 0:
+            raise RuntimeError("Pool task rong — kiem tra --squad_file / --snli_file / --mmlu_file.")
+        return pl
+
+    task_sig = {"v": 2, "files": file_signature([args.squad_file, args.snli_file, args.mmlu_file]),
+                "ds": args.task_datasets, "max_len": args.task_max_length, "mts": args.max_task_samples,
+                "seed": args.seed, "tok": [tokenizer.name_or_path, len(tokenizer), tokenizer.eos_token]}
+    pool = cached_build(_cache_path("task", task_sig), _build_task, is_main, is_distributed)
+    task_lengths, task_stats = pool["lengths"], pool["stats"]
+    pad_id = int(tokenizer.pad_token_id)
+
+    n_task, n_align = len(task_lengths), len(pairs)
+    N, anchor, n_align_epoch = solve_schedule(n_task, n_align, world_size, args.align_batch_size,
+                                              args.task_batch_size, args.min_task_batch_per_rank)
     if n_task // N < world_size:
         raise RuntimeError(f"Pool task ({n_task}) qua nho cho N={N} step x {world_size} rank "
-                           f"(moi rank can >= 1 sample/step). Giam --task_batch_size / tang du lieu.")
-    if n_align // N < 2 * world_size:
-        raise RuntimeError(f"Pool align ({n_align}) qua nho cho N={N} step x {world_size} rank "
-                           f"(moi rank can >= 2 cap/step cho contrastive).")
+                           f"(moi rank can >= 1 sample/step). Giam --task_batch_size.")
+    if n_align_epoch // N < 2 * world_size:
+        raise RuntimeError(f"Pool align ({n_align_epoch} cap/epoch) qua nho cho N={N} step x {world_size} "
+                           f"rank (moi rank can >= 2 cap/step cho contrastive). Giam --task_batch_size "
+                           f"hoac tang du lieu align (--max_pairs_per_file).")
     steps_per_epoch = 2 * N                       # luon chan -> epoch nao cung bat dau bang task step
     total_steps = steps_per_epoch * args.num_train_epochs
     logger.info(
-        f"[schedule] anchor={anchor} | n_task={n_task} (SQuAD/SNLI/MMLU) | n_align={n_align} | "
-        f"N={N} task step + {N} align step / epoch (steps_per_epoch={steps_per_epoch}, "
-        f"total_steps={total_steps}) | batch/rank trung binh: task={n_task / (N * world_size):.1f}, "
-        f"align={n_align / (N * world_size):.1f} | moi sample dung 1 lan/epoch."
+        f"[schedule] anchor={anchor} | n_task={n_task} (SQuAD/SNLI/MMLU) | n_align_pool={n_align} "
+        f"(dung {n_align_epoch}/epoch, {args.align_source_sampling}) | N={N} task step + {N} align step / "
+        f"epoch (steps_per_epoch={steps_per_epoch}, total_steps={total_steps}) | batch/rank trung binh: "
+        f"task={n_task / (N * world_size):.1f}, align={n_align_epoch / (N * world_size):.1f} | "
+        f"moi sample task dung 1 lan/epoch."
     )
 
     task_bs_avg = n_task / (N * world_size)
     if task_bs_avg < 8:
         logger.warning(
             f"[canh bao] Batch task trung binh chi ~{task_bs_avg:.1f} sample/rank/step (global "
-            f"~{task_bs_avg * world_size:.0f}) vi pool align ({n_align}) LON HON NHIEU pool task ({n_task}) "
-            f"nen N={N} qua lon. Moi step MoE+LoRA ton thoi gian gan nhu co dinh (nhieu kernel nho) "
-            f"-> {total_steps} step se rat lau va gradient task rat nhieu. Giam pool align "
-            f"(--max_pairs_per_file / --max_lang_pairs_per_record / bo bot nguon khoi --alignment_data / "
-            f"--max_samples) hoac tang --align_batch_size / giam --num_train_epochs. Muc tieu: "
-            f"n_align ~ n_task x (align_batch_toan_cuc / task_batch_toan_cuc).")
+            f"~{task_bs_avg * world_size:.0f}). Moi step MoE+LoRA ton thoi gian gan nhu co dinh "
+            f"(nhieu kernel nho) -> {total_steps} step se rat lau va gradient task rat nhieu. "
+            f"Tang --task_batch_size.")
 
-    plan = AlternatePlan(n_task, n_align, task_lengths, N, world_size, rank, args.seed)
+    plan = AlternatePlan(n_task, n_align, task_lengths, N, world_size, rank, args.seed,
+                         n_align_epoch=n_align_epoch, align_src=align_src,
+                         align_sampling=args.align_source_sampling)
 
     # ------------------------------------------------------------------------------- optimizer
+    use_fused = device.type == "cuda"
     optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate,
-                                   weight_decay=args.weight_decay, foreach=True)
+                                   weight_decay=args.weight_decay,
+                                   fused=True if use_fused else None, foreach=None if use_fused else True)
     scheduler = get_linear_schedule_with_warmup(
         optimizer, num_warmup_steps=int(total_steps * args.warmup_ratio),
         num_training_steps=total_steps,
@@ -1728,15 +2041,19 @@ def main():
     if resume_dir:
         state_path = os.path.join(resume_dir, "trainer_state.pt")
         if os.path.exists(state_path):
-            state = torch.load(state_path, map_location="cpu")
+            try:
+                state = torch.load(state_path, map_location="cpu", weights_only=False)
+            except TypeError:                      # torch cu khong co weights_only
+                state = torch.load(state_path, map_location="cpu")
             if state.get("steps_per_epoch") not in (None, steps_per_epoch):
                 raise RuntimeError(
                     f"Checkpoint co steps_per_epoch={state['steps_per_epoch']} nhung cau hinh hien "
                     f"tai cho {steps_per_epoch} (world_size/batch size/du lieu da doi?) -> khong the "
                     f"resume chinh xac.")
             optimizer.load_state_dict(state["optimizer"])
-            for group in optimizer.param_groups:
-                group["foreach"] = True
+            for group in optimizer.param_groups:   # load_state_dict ghi de co fused/foreach cua checkpoint cu
+                group["fused"] = True if use_fused else None
+                group["foreach"] = None if use_fused else True
             if state.get("scheduler"):
                 scheduler.load_state_dict(state["scheduler"])
             start_epoch = state["epoch"]
@@ -1773,6 +2090,7 @@ def main():
 
     # ------------------------------------------------------------------------------ training loop
     last_done = (start_epoch, start_step_in_epoch - 1)  # (epoch, step_in_epoch) cuoi cung HOAN THANH
+    jsonl_f = open(jsonl_path, "a", buffering=1, encoding="utf-8") if is_main else None
     try:
         for epoch in range(start_epoch, args.num_train_epochs):
             step_offset = start_step_in_epoch if epoch == start_epoch else 0
@@ -1791,8 +2109,8 @@ def main():
                 if step_in_epoch % 2 == 0:
                     step_type = "task"
                     r = compute_task_step(
-                        task_batches[k], task_examples, task_lengths, tokenizer, model,
-                        args.task_max_length, args.task_micro_batch_tokens, device,
+                        task_batches[k].tolist(), pool, pad_id, model,
+                        args.task_micro_batch_tokens, device,
                         router_logits_cache, num_experts, top_k, lb_loss_coef)
                     n_local = len(task_batches[k])
                     sums = reduce_metrics(
@@ -1808,7 +2126,7 @@ def main():
                                "acc": f"{log_kwargs['token_acc']:.3f}"}
                 else:
                     step_type = "align"
-                    batch = [pairs[i] for i in align_batches[k]]
+                    batch = [pairs[i] for i in align_batches[k].tolist()]
                     eng_texts = [b[0] for b in batch]
                     other_texts = [b[1] for b in batch]
                     align_loss = compute_alignment_step(
@@ -1831,9 +2149,10 @@ def main():
                 last_done = (epoch, step_in_epoch)
 
                 if is_main:
-                    pbar.set_postfix(postfix)
-                    log_step_to_jsonl(jsonl_path, global_step, epoch, step_type, **log_kwargs)
                     if global_step % args.log_every == 0:
+                        pbar.set_postfix(postfix)
+                    log_step_to_jsonl(jsonl_f, global_step, epoch, step_type, **log_kwargs)
+                    if args.plot_every and global_step % args.plot_every == 0:
                         plot_all(jsonl_path, task_plot_path, align_plot_path, args.align_layer,
                                  args.smooth_window)
                     if global_step % args.save_steps == 0:
@@ -1853,6 +2172,8 @@ def main():
             _save_and_push(*last_done)
         raise
     finally:
+        if jsonl_f is not None:
+            jsonl_f.close()
         for h in hooks:
             h.remove()
         cleanup_distributed(is_distributed)
