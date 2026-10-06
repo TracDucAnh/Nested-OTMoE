@@ -21,6 +21,23 @@ step CHI toi uu MOT trong hai objective, xen ke theo step:
         tieng Anh va cau target (cap english-other), tai DUNG 1 layer (--align_layer, mac dinh
         TU DONG = num_hidden_layers // 2 cua backbone dang load).
 
+PHIEN BAN "PAPER-FAITHFUL" (tai hien co che cot loi cua MidAlign, Liu & Niehues 2025)
+------------------------------------------------------------------------------------
+So voi ban truoc, ban nay chinh lai cho DUNG setup trong paper (Sec. 3, 4.3, Appendix D.1):
+  * Align loss = Eq.(1) MOT CHIEU: -log exp(sim(h_s,h_t)) / sum_{v in B} exp(sim(h_s,h_v)), sim = cosine,
+    chia temperature (mac dinh 1.5 cho Qwen). --align_loss symmetric de quay lai InfoNCE doi xung.
+  * Batch: effective batch = 128 cho CA HAI objective (--align_batch_size / --task_batch_size, per-rank),
+    nhung contrastive chi dung MINI-BATCH 32 (--align_micro_batch_size): negative CHI nam trong mini-batch
+    32 cap, gradient cong don qua 4 mini-batch roi moi optimizer.step() (footnote 11 paper: batch contrastive
+    lon hon khong cai thien on dinh). Mac dinh khong gather negative qua GPU (--align_global_negatives de bat).
+  * LoRA: r=8, alpha=16, dropout=0.1 cho MOI attention + linear projection (q,k,v,o + gate/up/down cua
+    experts va shared expert + router), NHUNG van gioi han o range layer [L/3, 2L/3) theo yeu cau.
+  * Toi uu: LR 5e-4, lich inverse-sqrt, warmup 0.03 (paper Appendix D.1).
+  * Du lieu align cua cac ngon ngu duoc RESAMPLE ve phan phoi xap xi DEU (--no_align_lang_balance de tat):
+    moi epoch giu nguyen tong n_align cap nhung moi ngon ngu chiem ~1/L (ngon ngu it du lieu bi lap, ngon ngu
+    nhieu du lieu bi lay mau con). Khi bat, "moi cap dung >= 1 lan/epoch" cua ban truoc KHONG con dung.
+  * Khong co early stopping (khong co dev set trong pipeline nay); dung --save_steps/--num_train_epochs.
+
 RANG BUOC "ALIGN LA GOC: DUNG HET ALIGNMENT DATA, TASK DATA DUOC PHEP LAP LAI"
 -------------------------------------------------------------------------------
 Step chan/le xen ke deu nhau: moi epoch co N task step va N align step (tong 2N step;
@@ -116,7 +133,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from tqdm.auto import tqdm
 
-from transformers import AutoModelForCausalLM, AutoTokenizer, get_linear_schedule_with_warmup
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import LoraConfig, get_peft_model, PeftModel
 
 try:
@@ -248,14 +265,18 @@ def build_argparser() -> argparse.ArgumentParser:
     # Training schedule + batch (xem docstring dau file ve cach tinh so step)
     p.add_argument("--num_train_epochs", type=int, default=3)
     p.add_argument("--align_batch_size", type=int, default=128,
-                    help="Batch size align per-rank (so cap bitext / rank / align step). ALIGN LA ANCHOR: "
+                    help="EFFECTIVE batch size align per-rank (paper: 128). Duoc chia thanh mini-batch "
+                         "--align_micro_batch_size de tinh contrastive loss + cong don gradient. ALIGN LA ANCHOR: "
                          "N = round(n_align / (align_batch_size * world_size)) = so align step = so task "
                          "step moi epoch; MOI epoch dung HET pool alignment.")
-    p.add_argument("--task_batch_size", type=int, default=16,
+    p.add_argument("--task_batch_size", type=int, default=128,
                     help="Batch size task per-rank (so sample task / rank / task step). Moi epoch lay "
                          "N * world_size * task_batch_size sample task tu pool task; neu lon hon n_task thi "
                          "sample task bi lap lai (cho phep), neu nho hon thi moi epoch chi thay 1 phan pool "
                          "(dong hoan vi lien tuc giua cac epoch nen van phu deu pool qua cac epoch).")
+    p.add_argument("--align_micro_batch_size", type=int, default=32,
+                    help="Kich thuoc MINI-BATCH contrastive (paper: 32). Negative chi nam trong mini-batch; "
+                         "gradient cong don qua cac mini-batch cua 1 align step. 0 = khong chia.")
     p.add_argument("--task_micro_batch_tokens", type=int, default=16384,
                     help="Ngan sach token (so sample * do dai da padding) cho 1 micro-batch cua task "
                          "step. Giam neu OOM, tang neu con du VRAM.")
@@ -264,7 +285,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--task_max_length", type=int, default=512,
                     help="max_length cho sample task (SQuAD can 512; sample SQuAD dai hon duoc "
                          "windowing, MMLU/SNLI dai hon bi bo).")
-    p.add_argument("--learning_rate", type=float, default=2e-4)
+    p.add_argument("--learning_rate", type=float, default=5e-4)
     p.add_argument("--weight_decay", type=float, default=0.0)
     p.add_argument("--warmup_ratio", type=float, default=0.03)
     p.add_argument("--gradient_clip_norm", type=float, default=1.0)
@@ -273,13 +294,20 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--align_layer", type=int, default=None,
                     help="Layer lay hidden state cho contrastive loss (hidden_states[align_layer]). "
                          "None = TU DONG num_hidden_layers // 2 cua backbone dang load.")
-    p.add_argument("--align_temperature", type=float, default=1.5)
+    p.add_argument("--align_temperature", type=float, default=1.5,
+                    help="tau (paper: tim trong {0.1,1.0,1.5,2.0}; Qwen dung 1.5, Llama 0.1).")
+    p.add_argument("--align_loss", type=str, default="oneway", choices=["oneway", "symmetric"],
+                    help="oneway = Eq.(1) paper (query = cau Anh, key = cau target trong mini-batch); "
+                         "symmetric = trung binh 2 chieu (khong co trong paper).")
     p.add_argument("--align_global_negatives", dest="align_global_negatives",
-                    action="store_true", default=True,
-                    help="[Mac dinh BAT] all_gather embedding qua tat ca rank de contrastive loss dung "
-                         "batch TOAN CUC (world_size * align_batch_size) thay vi chi batch local. "
-                         "Vd 8 GPU x --align_batch_size 8 = batch contrastive 64 nhu paper.")
+                    action="store_true", default=False,
+                    help="[Mac dinh TAT, dung paper] all_gather embedding qua cac rank de negative la "
+                         "mini-batch TOAN CUC (world_size * align_micro_batch_size) thay vi mini-batch local.")
     p.add_argument("--no_align_global_negatives", dest="align_global_negatives", action="store_false")
+    p.add_argument("--align_lang_balance", dest="align_lang_balance", action="store_true", default=True,
+                    help="[Mac dinh BAT, dung paper] resample du lieu align moi epoch ve phan phoi xap xi "
+                         "deu giua cac ngon ngu (tong so cap/epoch khong doi).")
+    p.add_argument("--no_align_lang_balance", dest="align_lang_balance", action="store_false")
     p.add_argument("--mask_false_negatives", dest="mask_false_negatives",
                     action="store_true", default=True,
                     help="[Mac dinh BAT] Loai khoi softmax cac 'negative' thuc ra la cung 1 cau Anh "
@@ -295,12 +323,13 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--num_experts_per_tok", type=int, default=None)
 
     # LoRA
-    p.add_argument("--lora_r", type=int, default=16, help="Rank fallback (khong nen duoc dung).")
-    p.add_argument("--lora_r_router", type=int, default=4)
-    p.add_argument("--lora_r_attn", type=int, default=16)
-    p.add_argument("--lora_r_expert", type=int, default=16)
-    p.add_argument("--lora_alpha", type=int, default=32)
-    p.add_argument("--lora_dropout", type=float, default=0.05)
+    p.add_argument("--lora_r", type=int, default=8, help="Rank fallback (paper: 8).")
+    p.add_argument("--lora_r_router", type=int, default=8)
+    p.add_argument("--lora_r_attn", type=int, default=8)
+    p.add_argument("--lora_r_expert", type=int, default=8,
+                    help="Rank cho gate/up/down_proj cua experts VA shared_expert.")
+    p.add_argument("--lora_alpha", type=int, default=16)
+    p.add_argument("--lora_dropout", type=float, default=0.1)
 
     # Checkpoint / resume
     p.add_argument("--save_steps", type=int, default=200)
@@ -992,7 +1021,14 @@ def infer_middle_layer(num_layers: int) -> int:
 
 def is_router_leaf_name(name: str) -> bool:
     leaf = name.split(".")[-1]
-    return leaf in ("gate", "router", "gating") and ".experts." not in name
+    return leaf in ("gate", "router", "gating") and not is_expert_name(name)
+
+
+def is_expert_name(name: str) -> bool:
+    """Linear projection cua routed experts (mlp.experts.N.*) HOAC shared expert (mlp.shared_expert.*).
+    (ban truoc chi bat '.experts.'/'.expert.' nen BO SOT shared_expert cua Qwen1.5-MoE.)"""
+    return (".experts." in name or ".expert." in name or ".shared_expert." in name
+            or ".shared_experts." in name)
 
 
 def build_lora_target_modules(model, layer_indices: set) -> List[str]:
@@ -1007,7 +1043,7 @@ def build_lora_target_modules(model, layer_indices: set) -> List[str]:
         if idx not in layer_indices:
             continue
         is_attn = bool(re.search(r"(self_attn|attention|attn)\.", name))
-        is_expert = ".experts." in name or ".expert." in name
+        is_expert = is_expert_name(name)
         is_router = is_router_leaf_name(name)
         if is_attn or is_expert or is_router:
             targets.append(name)
@@ -1038,7 +1074,7 @@ def categorize_lora_targets(target_modules: Sequence[str]) -> Tuple[List[str], L
     for name in target_modules:
         if is_router_leaf_name(name):
             router_names.append(name)
-        elif ".experts." in name or ".expert." in name:
+        elif is_expert_name(name):
             expert_names.append(name)
         elif re.search(r"(self_attn|attention|attn)\.", name):
             attn_names.append(name)
@@ -1216,9 +1252,9 @@ def _gather_with_grad(x: torch.Tensor) -> torch.Tensor:
 
 def compute_alignment_step(eng_texts: List[str], other_texts: List[str], tokenizer, model,
                             align_layer: int, max_length: int, device, temperature: float,
-                            router_logits_cache: list, global_negatives: bool = True,
-                            mask_false_negatives: bool = True):
-    """Contrastive loss (symmetric InfoNCE, Eq.1 MidAlign) tai align_layer.
+                            router_logits_cache: list, global_negatives: bool = False,
+                            mask_false_negatives: bool = True, symmetric: bool = False):
+    """Contrastive loss Eq.(1) MidAlign (mac dinh MOT CHIEU Anh->target; symmetric=True: 2 chieu) tai align_layer.
 
     global_negatives=True: all_gather embedding (CO gradient) tu TAT CA rank -> batch contrastive
       la batch TOAN CUC (world_size * batch_local), vd 8 GPU x 8 cap = 64 cap / 63 negative moi
@@ -1251,7 +1287,7 @@ def compute_alignment_step(eng_texts: List[str], other_texts: List[str], tokeniz
         a_all, b_all, offset = a_loc, b_loc, 0
 
     sim_e2o = torch.matmul(a_loc, b_all.t()) / temperature   # [b, B]  query = Anh local
-    sim_o2e = torch.matmul(b_loc, a_all.t()) / temperature   # [b, B]  query = target local
+    sim_o2e = torch.matmul(b_loc, a_all.t()) / temperature if symmetric else None   # query = target local
     target = offset + torch.arange(n_loc, device=sim_e2o.device)
 
     if mask_false_negatives:
@@ -1266,11 +1302,37 @@ def compute_alignment_step(eng_texts: List[str], other_texts: List[str], tokeniz
         dup = (eng_loc[:, None] == eng_all[None, :]) | (oth_loc[:, None] == oth_all[None, :])
         dup[torch.arange(n_loc, device=dup.device), target] = False   # giu positive
         sim_e2o = sim_e2o.masked_fill(dup, float("-inf"))
-        sim_o2e = sim_o2e.masked_fill(dup, float("-inf"))
+        if sim_o2e is not None:
+            sim_o2e = sim_o2e.masked_fill(dup, float("-inf"))
 
-    loss_e2o = F.cross_entropy(sim_e2o, target)
-    loss_o2e = F.cross_entropy(sim_o2e, target)
-    return (loss_e2o + loss_o2e) / 2.0
+    loss_e2o = F.cross_entropy(sim_e2o, target)   # Eq.(1) paper: s = Anh, mau so = sum_v exp(sim(h_s, h_t^v))
+    if sim_o2e is None:
+        return loss_e2o
+    return (loss_e2o + F.cross_entropy(sim_o2e, target)) / 2.0
+
+
+def align_step_accumulate(eng_texts: List[str], other_texts: List[str], tokenizer, model,
+                           align_layer: int, max_length: int, device, temperature: float,
+                           router_logits_cache: list, micro_bs: int, global_negatives: bool,
+                           mask_false_negatives: bool, symmetric: bool) -> float:
+    """1 align step = effective batch (vd 128 cap) chia thanh cac MINI-BATCH contrastive (paper: 32);
+    negative CHI nam trong mini-batch; backward tung mini-batch (loss nhan ty le size/n) de cong don
+    gradient — bo nho chi phu thuoc kich thuoc mini-batch. Tra ve loss trung binh (float)."""
+    n = len(eng_texts)
+    n_mb = 1 if (micro_bs is None or micro_bs <= 0 or n <= micro_bs) else -(-n // micro_bs)
+    sizes = split_sizes(n, n_mb)          # deu nhau (chenh <= 1) -> khong sinh mini-batch 1 cap
+    total, pos = 0.0, 0
+    for sz in sizes:
+        loss = compute_alignment_step(
+            eng_texts[pos:pos + sz], other_texts[pos:pos + sz], tokenizer, model, align_layer,
+            max_length, device, temperature, router_logits_cache,
+            global_negatives=global_negatives, mask_false_negatives=mask_false_negatives,
+            symmetric=symmetric)
+        (loss * (sz / n)).backward()
+        total += float(loss.detach()) * (sz / n)
+        pos += sz
+        router_logits_cache.clear()
+    return total
 
 
 # ============================================================================================
@@ -1377,8 +1439,14 @@ class AlternatePlan:
     sample, sort theo do dai TRUOC khi chia rank (can bang tai + thuan loi cho micro-batching theo token)."""
 
     def __init__(self, n_task, n_align, task_lengths, steps_per_side, world_size, rank, seed,
-                 task_batch_size):
+                 task_batch_size, lang_ids=None):
         self.n_task, self.n_align = n_task, n_align
+        self.lang_ids = None if lang_ids is None else np.asarray(lang_ids)
+        self._lang_groups = None
+        if self.lang_ids is not None:
+            order = np.argsort(self.lang_ids, kind="stable")
+            _, starts = np.unique(self.lang_ids[order], return_index=True)
+            self._lang_groups = np.split(order, starts[1:])
         self.task_lengths = np.asarray(task_lengths)
         self.N, self.W, self.rank, self.seed = steps_per_side, world_size, rank, seed
         self.task_per_step = task_batch_size * world_size            # so sample task TOAN CUC / task step
@@ -1395,6 +1463,23 @@ class AlternatePlan:
             pos += take
         return np.concatenate(out)
 
+    def _align_epoch_perm(self, epoch: int) -> np.ndarray:
+        """Hoan vi cac chi so align cua 1 epoch (do dai n_align). Neu co lang_ids: RESAMPLE ve xap xi
+        phan phoi DEU giua cac ngon ngu (paper 4.3): moi ngon ngu nhan ~n_align/L cap/epoch; ngon ngu it
+        du lieu duoc lap lai (cac hoan vi noi tiep), ngon ngu nhieu du lieu duoc lay mau con."""
+        rng = np.random.default_rng([self.seed, epoch, 2])
+        if self._lang_groups is None:
+            return rng.permutation(self.n_align)
+        L = len(self._lang_groups)
+        quota = split_sizes(self.n_align, L)
+        rng.shuffle(quota)                           # ngon ngu nao nhan phan du thay doi theo epoch
+        parts = []
+        for g, q in zip(self._lang_groups, quota):
+            reps = -(-q // len(g))
+            idx = np.concatenate([rng.permutation(g) for _ in range(reps)])[:q]
+            parts.append(idx)
+        return rng.permutation(np.concatenate(parts))
+
     def epoch_batches(self, epoch: int) -> Tuple[List[np.ndarray], List[np.ndarray]]:
         # ---- task: doan [epoch*T, (epoch+1)*T) cua dong hoan vi, N lat bang nhau
         t_stream = self._task_stream(epoch * self.task_per_epoch, self.task_per_epoch)
@@ -1404,7 +1489,7 @@ class AlternatePlan:
             chunk = chunk[np.argsort(self.task_lengths[chunk], kind="stable")]
             task_batches.append(chunk[self.rank::self.W])
         # ---- align: DUNG HET pool
-        a_perm = np.random.default_rng([self.seed, epoch, 2]).permutation(self.n_align)
+        a_perm = self._align_epoch_perm(epoch)
         n_a = len(a_perm)
         units = -(-n_a // self.W)
         pad = units * self.W - n_a
@@ -1698,18 +1783,18 @@ Training: step chan = task step (LM loss), step le = contrastive align step.
   (prompt bi mask), tren pool gop cua cac tap: {", ".join(args.task_datasets)}.
 {task_lines}
   - `lb_loss_coef` = {args.lb_loss_coef}, `num_experts` = {num_experts}, `top_k` = {top_k}
-- **Align step (le)**: symmetric InfoNCE (in-batch negatives) giua mean-pooled hidden state cau
+- **Align step (le)**: contrastive Eq.(1) MidAlign ({args.align_loss}, negative trong mini-batch {args.align_micro_batch_size}) giua mean-pooled hidden state cau
   tieng Anh va cau target tai layer {args.align_layer} (block 0-indexed = {align_layer_0based}
   / {num_layers} layer), temperature = {args.align_temperature}.
 - Moi epoch: {steps_per_side} task step + {steps_per_side} align step. ALIGN la anchor: dung HET {n_align} cap
   bitext (nguon: {", ".join(args.alignment_data)}) moi epoch. Task data duoc phep lap lai: moi epoch lay
   {steps_per_side * world_size * args.task_batch_size} sample task tu pool {n_task} sample (doc nhu dong hoan vi noi tiep nhau).
-- Contrastive batch: global_negatives = {args.align_global_negatives} (batch toan cuc = {world_size} x align_batch_size), mask_false_negatives = {args.mask_false_negatives}.
+- Contrastive: effective batch {args.align_batch_size}/rank, mini-batch {args.align_micro_batch_size}, global_negatives = {args.align_global_negatives}, mask_false_negatives = {args.mask_false_negatives}, lang_balance = {args.align_lang_balance}.
 - world_size = {world_size}, align_batch_size = {args.align_batch_size} (per-rank, anchor),
   task_batch_size = {args.task_batch_size} (per-rank), task_micro_batch_tokens = {args.task_micro_batch_tokens}.
 
 ## LoRA
-- Range layer `[{lora_layer_start}, {lora_layer_end})` (0-indexed), attention / router / experts.
+- Range layer `[{lora_layer_start}, {lora_layer_end})` (0-indexed), attention / router / experts + shared expert.
 - Rank: attention {args.lora_r_attn}, router {args.lora_r_router}, experts {args.lora_r_expert};
   alpha = {args.lora_alpha}, dropout = {args.lora_dropout}.
 
@@ -1947,17 +2032,29 @@ def main():
             f"(~{task_cover * args.num_train_epochs:.1f} lan trong {args.num_train_epochs} epoch) -> co nguy co "
             f"overfit task. Giam --task_batch_size (hien {task_bs}) hoac giam so epoch neu can.")
 
-    plan = AlternatePlan(n_task, n_align, task_lengths, N, world_size, rank, args.seed, task_bs)
+    lang_ids = None
+    if args.align_lang_balance:
+        lang_names = sorted({p[2] for p in pairs})
+        lmap = {l: i for i, l in enumerate(lang_names)}
+        lang_ids = np.fromiter((lmap[p[2]] for p in pairs), dtype=np.int32, count=len(pairs))
+        cnt = np.bincount(lang_ids, minlength=len(lang_names))
+        logger.info(f"[align] resample DEU {len(lang_names)} ngon ngu: ~{n_align // len(lang_names)} cap/ngon ngu/epoch "
+                    f"(goc: min={int(cnt.min())}, max={int(cnt.max())} cap/ngon ngu).")
+    plan = AlternatePlan(n_task, n_align, task_lengths, N, world_size, rank, args.seed, task_bs, lang_ids)
 
     # ------------------------------------------------------------------------------- optimizer
     use_fused = device.type == "cuda"
     optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate,
                                    weight_decay=args.weight_decay,
                                    fused=True if use_fused else None, foreach=None if use_fused else True)
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer, num_warmup_steps=int(total_steps * args.warmup_ratio),
-        num_training_steps=total_steps,
-    )
+    warmup_steps = max(1, int(total_steps * args.warmup_ratio))
+
+    def _inv_sqrt(step: int) -> float:
+        # paper: inverse square root schedule, warmup tuyen tinh -> lr_max, sau do lr_max * sqrt(warmup / step)
+        step = step + 1
+        return step / warmup_steps if step < warmup_steps else (warmup_steps / step) ** 0.5
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _inv_sqrt)
 
     start_epoch, start_step_in_epoch, global_step = 0, 0, 0
     prev_checkpoint_dir = resume_dir
@@ -2052,14 +2149,15 @@ def main():
                     batch = [pairs[i] for i in align_batches[k].tolist()]
                     eng_texts = [b[0] for b in batch]
                     other_texts = [b[1] for b in batch]
-                    align_loss = compute_alignment_step(
+                    align_loss_val = align_step_accumulate(
                         eng_texts, other_texts, tokenizer, model, args.align_layer,
                         args.max_length, device, args.align_temperature, router_logits_cache,
+                        micro_bs=args.align_micro_batch_size,
                         global_negatives=args.align_global_negatives and is_distributed,
-                        mask_false_negatives=args.mask_false_negatives)
-                    align_loss.backward()
+                        mask_false_negatives=args.mask_false_negatives,
+                        symmetric=(args.align_loss == "symmetric"))
                     router_logits_cache.clear()
-                    sums = reduce_metrics([align_loss.item(), 1.0, len(batch)], device, is_distributed)
+                    sums = reduce_metrics([align_loss_val, 1.0, len(batch)], device, is_distributed)
                     log_kwargs = dict(align_loss=sums[0] / sums[1], n_samples=int(sums[2]))
                     postfix = {"type": "align", "L_align": f"{log_kwargs['align_loss']:.4f}"}
 
