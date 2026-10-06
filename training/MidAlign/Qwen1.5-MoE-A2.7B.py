@@ -1,6 +1,6 @@
 """
 MidAlign baseline cho mo hinh Mixture-of-Experts Qwen/Qwen1.5-MoE-A2.7B
-(kien truc Qwen2MoeForCausalLM) — phien ban TASK STEP = LM loss tren SQuAD + SNLI + MMLU.
+(kien truc Qwen2MoeForCausalLM) — TASK STEP = LM loss tren SQuAD + SNLI + MMLU (English-only).
 
 Adapt tu "Middle-Layer Representation Alignment for Cross-Lingual Transfer in Fine-Tuned
 LLMs" (Liu & Niehues, 2025), dung Alternate Training (Figure 2 trong paper): moi optimizer
@@ -14,97 +14,69 @@ step CHI toi uu MOT trong hai objective, xen ke theo step:
                   SQuAD: "Context: ...\nQuestion: ...\nAnswer: <answer><eos>" (co context windowing)
                   SNLI : "Premise/Hypothesis/Question/Answer: <entailment|neutral|contradiction><eos>"
                   MMLU : "The following are multiple choice questions ... Answer: <letter><eos>"
-        Ba tap duoc GOP THANH 1 POOL DUY NHAT, moi task step lay 1 batch ngau nhien tu pool nay
-        (tron lan 3 task trong cung 1 batch).
+        Ba tap duoc GOP THANH 1 POOL DUY NHAT, moi task step lay 1 batch tu pool nay.
   - step LE (1, 3, 5, ...) = ALIGN (contrastive) step:
-        L_align = symmetric InfoNCE (in-batch negatives) giua mean-pooled hidden state cua cau
-        tieng Anh va cau target (cap english-other), tai DUNG 1 layer (--align_layer, mac dinh
-        TU DONG = num_hidden_layers // 2 cua backbone dang load).
+        L_align = Eq.(1) paper (MOT CHIEU) giua mean-pooled hidden state cua cau tieng Anh va cau
+        target (cap english-other), tai DUNG 1 layer (--align_layer, mac dinh TU DONG
+        = num_hidden_layers // 2 cua backbone dang load).
 
-PHIEN BAN "PAPER-FAITHFUL" (tai hien co che cot loi cua MidAlign, Liu & Niehues 2025)
-------------------------------------------------------------------------------------
-So voi ban truoc, ban nay chinh lai cho DUNG setup trong paper (Sec. 3, 4.3, Appendix D.1):
+VAI TRO DATA (DUNG NHU PAPER): TASK LA ANCHOR, ALIGNMENT DATA NHO VA LAP LAI
+-----------------------------------------------------------------------------
+Paper: task data quyet dinh do dai training (toi da 5 epoch tren task data); alignment data chi la
+"vai tram cau song song" / ngon ngu (Javanese 264, Swahili 371, Welsh 823 — Appendix B) va duoc
+LAP LAI de bat kip so task step. Ban nay lam dung nhu vay:
+
+  * TASK = anchor. N = ceil(n_task / (task_batch_size * world_size)) = so task step MOI epoch.
+    Moi epoch la 1 hoan vi (seed, epoch) cua TOAN BO pool task -> MOI sample task duoc dung >= 1 lan /
+    epoch (chi toi da task_batch_size*world_size - 1 sample bi dem them 1 lan de du batch cuoi).
+  * ALIGN = pool NHO, lay NGAU NHIEN theo --seed (42): doc het flores + opus + ted (mac dinh), voi MOI
+    ngon ngu gom tat ca cap eng-other tu ca 3 tap roi boc ngau nhien dung --align_pairs_per_lang cap
+    (mac dinh 500 — cung bac "vai tram" cua paper; ngon ngu co it hon thi lay het) bang reservoir
+    sampling seed co dinh -> pool tai lap duoc 100%.
+  * Moi epoch co N align step xen ke voi N task step; moi align step can align_batch_size * world_size
+    cap -> moi epoch can N * world_size * align_batch_size cap align, lay tu pool nho bang cach LAP LAI
+    pool (nhieu luot hoan vi noi tiep). Neu --align_lang_balance (mac dinh bat, paper 4.3) thi moi ngon
+    ngu nhan ~1/L tong so mau moi epoch (resample ve phan phoi xap xi deu).
+  * Ke hoach batch xac dinh hoan toan theo (seed, epoch) nen resume giua epoch ra dung cac batch cu.
+
+CAC DIEU CHINH KHAC SO VOI PAPER (giu nguyen tu ban truoc)
+----------------------------------------------------------
   * Align loss = Eq.(1) MOT CHIEU: -log exp(sim(h_s,h_t)) / sum_{v in B} exp(sim(h_s,h_v)), sim = cosine,
     chia temperature (mac dinh 1.5 cho Qwen). --align_loss symmetric de quay lai InfoNCE doi xung.
-  * Batch: effective batch = 128 cho CA HAI objective (--align_batch_size / --task_batch_size, per-rank),
-    nhung contrastive chi dung MINI-BATCH 32 (--align_micro_batch_size): negative CHI nam trong mini-batch
-    32 cap, gradient cong don qua 4 mini-batch roi moi optimizer.step() (footnote 11 paper: batch contrastive
-    lon hon khong cai thien on dinh). Mac dinh khong gather negative qua GPU (--align_global_negatives de bat).
-  * LoRA: r=8, alpha=16, dropout=0.1 cho MOI attention + linear projection (q,k,v,o + gate/up/down cua
-    experts va shared expert + router), NHUNG van gioi han o range layer [L/3, 2L/3) theo yeu cau.
+  * Batch: --align_batch_size / --task_batch_size la PER-RANK (mac dinh 128); contrastive chi dung
+    MINI-BATCH 32 (--align_micro_batch_size): negative CHI nam trong mini-batch 32 cap, gradient cong don
+    qua 4 mini-batch roi moi optimizer.step() (footnote 11 paper). Voi world_size > 1 effective batch =
+    128 * world_size (paper: 128 tong) — giam --*_batch_size neu muon khop effective batch cua paper.
+  * LoRA: r=8, alpha=16, dropout=0.1, nhung van gioi han o range layer [L/3, 2L/3) theo yeu cau.
   * Toi uu: LR 5e-4, lich inverse-sqrt, warmup 0.03 (paper Appendix D.1).
-  * Du lieu align cua cac ngon ngu duoc RESAMPLE ve phan phoi xap xi DEU (--no_align_lang_balance de tat):
-    moi epoch giu nguyen tong n_align cap nhung moi ngon ngu chiem ~1/L (ngon ngu it du lieu bi lap, ngon ngu
-    nhieu du lieu bi lay mau con). Khi bat, "moi cap dung >= 1 lan/epoch" cua ban truoc KHONG con dung.
   * Khong co early stopping (khong co dev set trong pipeline nay); dung --save_steps/--num_train_epochs.
 
-RANG BUOC "ALIGN LA GOC: DUNG HET ALIGNMENT DATA, TASK DATA DUOC PHEP LAP LAI"
--------------------------------------------------------------------------------
-Step chan/le xen ke deu nhau: moi epoch co N task step va N align step (tong 2N step;
-steps_per_epoch luon CHAN nen epoch nao cung bat dau bang task step). ALIGNMENT DATA LA ANCHOR:
-
-    N = max(1, round(n_align / (align_batch_size * world_size)))
-
-  * N align step tieu thu DUNG HET n_align cap bitext cua pool alignment (da load) MOI epoch:
-    hoan vi ngau nhien theo (seed, epoch) toan bo pool, chia deu cho N step va cac rank. Moi cap
-    duoc dung it nhat 1 lan / epoch (chi toi da world_size-1 cap bi dem them 1 lan de moi rank nhan
-    so cap bang nhau — can cho all_gather cua contrastive loss).
-  * N task step, moi step lay world_size * task_batch_size sample (--task_batch_size la per-rank,
-    mac dinh 16) -> moi epoch can T = N * world_size * task_batch_size sample task. Task data KHONG bi
-    rang buoc phai dung dung 1 lan: pool task (SQuAD + SNLI + MMLU gop chung) duoc doc nhu 1 DONG VO
-    HAN cac hoan vi ngau nhien noi tiep nhau (hoan vi thu b dung seed (seed, b)); epoch e lay doan
-    [e*T, (e+1)*T) cua dong do. Neu T > n_task thi sample task bi LAP LAI (deu nhau: moi sample xuat
-    hien floor hoac ceil(T / n_task) lan / epoch); neu T < n_task thi moi epoch chi thay 1 phan pool
-    nhung dong lien tuc giua cac epoch nen toan pool van duoc dung deu qua cac epoch.
-  * Khong bao gio phai bo bot align hay giam N vi task. Ke hoach batch xac dinh hoan toan theo
-    (seed, epoch) nen resume giua epoch cho ra dung cac batch cu.
-
-Pool alignment = TOAN BO cap bitext hop le trong cac file --data_files (khong co gioi han so cap
-luc load; muon giam du lieu thi loc file truoc, hoac dung --max_samples de debug). Toan bo pool
-do duoc dung HET moi epoch.
-
-Batch task cua moi rank van tu dong chia thanh nhieu micro-batch (theo ngan sach token
+Batch task cua moi rank tu dong chia thanh nhieu micro-batch (theo ngan sach token
 --task_micro_batch_tokens, sort theo do dai de giam padding) va cong don gradient truoc
-optimizer.step() — nen KHONG can OOM-split. Contrastive step khong chia micro-batch duoc (can
-in-batch negatives): batch align per-rank trung binh = n_align / (N * world_size) ~ --align_batch_size.
+optimizer.step(). Contrastive step khong chia micro-batch duoc ngoai mini-batch (can in-batch negatives).
 
-THAY DOI SO VOI BAN TRUOC (sua loi "Pool task qua nho cho N=..." + toi uu toc do)
-------------------------------------------------------------------------------------
-  * [PHIEN BAN NAY] Doi anchor: ALIGN la goc (N tinh tu n_align), dung HET alignment data moi epoch;
-    task data duoc phep lap lai (dong hoan vi vo han, xem tren) de du N task step xen ke. Bo cac co
-    --min_task_batch_per_rank / --align_source_sampling (khong con epoch nao chi dung 1 phan align)
-    va bo che do neo theo task cu. Checkpoint tao boi phien ban truoc KHONG resume duoc chinh xac.
-  * Rank 0 build pool align/task 1 lan -> cache (--cache_dir) -> cac rank/lan chay sau doc lai.
-  * Task step: tokenize san 1 lan (cache), chi nhan lm_head tren token dap an, khong .item() moi micro-batch.
-  * Align step: 1 forward cho ca eng + other (thay vi 2). LB loss khong con boolean-index (device sync).
-  * rank_pattern LoRA bang regex (get_peft_model 2 phut -> vai giay), broadcast tham so gop 1 lan,
-    AdamW fused, TF32, load model thang len GPU, khong ve graph moi 10 step (--plot_every).
-
-Dong bo gradient: THAY DDP bang all-reduce gradient thu cong (giong cac file finetuning
-english-task-only). Ly do: task step cong don gradient qua nhieu micro-batch (so micro-batch
-co the khac nhau giua cac rank) va 2 loai step co do thi autograd khac nhau, nen tranh phai
-phu thuoc vao hanh vi cua DDP Reducer / static_graph. Sau backward, MOI tham so trainable
+Dong bo gradient: all-reduce gradient thu cong (khong DDP). Sau backward, MOI tham so trainable
 (ke ca LoRA cua expert khong nhan token nao trong step do -> grad None) deu duoc dien 0 roi
 all-reduce 1 lan duy nhat -> khong con nguy co NCCL watchdog / "marked ready twice".
-(Do do cac co --find_unused_parameters / zero_grad_anchor / _set_static_graph da bo.)
 
 Cac dieu kien giu nguyen tu ban MidAlign truoc:
   1. LoRA ap dung cho RANGE layer [L/3, 2L/3), tach bach voi layer tinh alignment loss.
-     Attention / router / experts moi nhom 1 rank rieng (router 4, attn 16, experts 16).
-  2. Cap ngon ngu english - other, doc tu du lieu multiway-parallel JSON (flores/ntrex/ted).
+     Attention / router / experts moi nhom 1 rank rieng.
+  2. Cap ngon ngu english - other, doc tu du lieu multiway-parallel JSON (flores/opus/ntrex/ted).
   3. Checkpoint chi giu ban moi nhat, push len HF Hub, resume tu checkpoint.
 
 Vi du chay (8 GPU):
     torchrun --standalone --nproc_per_node=8 Qwen1.5-MoE-A2.7B.py \\
         --model_name_or_path Qwen/Qwen1.5-MoE-A2.7B \\
-        --data_dir data/processed_alignment \\
+        --data_dir data/processed_alignment --alignment_data flores opus ted \\
+        --align_pairs_per_lang 500 --seed 42 \\
         --squad_file data/english_task/squad/train.json \\
         --snli_file data/english_task/snli/train.json \\
         --mmlu_file data/english_task/mmlu/auxiliary_train.json \\
         --push_to_hub
 
 Smoke test (1 GPU, du lieu nho):
-    python Qwen1.5-MoE-A2.7B.py --max_samples 20000 --max_task_samples 5000 --no_push_to_hub
+    python Qwen1.5-MoE-A2.7B.py --max_task_samples 5000 --align_pairs_per_lang 50 --no_push_to_hub
 
 Resume:
     torchrun --standalone --nproc_per_node=8 Qwen1.5-MoE-A2.7B.py --resume_from_checkpoint auto
@@ -198,6 +170,7 @@ def load_hf_token(env_file: Optional[str], cli_token: Optional[str]) -> Optional
 ALIGNMENT_DATASET_FILES = {
     "flores": "flores.json",
     "ntrex": "ntrex.json",
+    "opus": "opus.json",
     "ted": "ted.json",      # giong code finetuning: --alignment_data ... ted -> <data_dir>/ted.json
 }
 
@@ -234,19 +207,26 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--data_dir", type=str, default="data/processed_alignment")
     p.add_argument("--alignment_data", type=str, nargs="+",
                     choices=sorted(ALIGNMENT_DATASET_FILES.keys()),
-                    default=["flores", "ntrex", "ted"],
-                    help="Nguon du lieu alignment: flores | ntrex | ted (1 hoac nhieu). Mac dinh flores ntrex ted, CUNG nguon voi code finetuning baseline.")
+                    default=["flores", "opus", "ted"],
+                    help="Nguon du lieu alignment: flores | opus | ntrex | ted (1 hoac nhieu). Mac dinh flores opus ted "
+                         "(doc <data_dir>/flores.json, opus.json, ted.json).")
     p.add_argument("--data_files", type=str, nargs="+", default=None,
                     help="[Nang cao] Ghi de --alignment_data bang danh sach file JSON trong --data_dir.")
     p.add_argument("--eng_key", type=str, default="eng_Latn")
     p.add_argument("--max_lang_pairs_per_record", type=int, default=None,
                     help="Gioi han so ngon ngu ghep voi eng_key trong 1 record (None = dung het).")
-    p.add_argument("--ted_pairs_per_record", type=int, default=1,
+    p.add_argument("--ted_pairs_per_record", type=int, default=0,
                     help="RIENG cho file TED (ten file bat dau bang 'ted'): moi record chi lay NGAU NHIEN "
-                         "N cap eng-other (mac dinh 1) thay vi to hop het cac ngon ngu. Ap dung thay cho "
-                         "--max_lang_pairs_per_record doi voi TED. 0 hoac am = lay het (nhu cac file khac).")
+                         "N cap eng-other thay vi to hop het cac ngon ngu. MAC DINH 0 = lay het (de buoc "
+                         "boc mau theo --align_pairs_per_lang la dong deu tren moi cap hop le cua 3 tap).")
+    p.add_argument("--align_pairs_per_lang", type=int, default=500,
+                    help="So cap eng-other lay NGAU NHIEN (seed = --seed, reservoir sampling) cho MOI ngon ngu "
+                         "tu HOP cua tat ca file alignment. Paper chi dung vai tram cau song song / ngon ngu "
+                         "(Javanese 264, Swahili 371, Welsh 823) nen mac dinh 500. Ngon ngu co it cap hon thi "
+                         "lay het. <= 0 = khong gioi han (dung het, KHONG khuyen dung — trai paper).")
     p.add_argument("--max_samples", type=int, default=None,
-                    help="Gioi han so cap bitext alignment (debug), None = dung het.")
+                    help="[Debug] Gioi han TONG so cap bitext sau khi da boc --align_pairs_per_lang, "
+                         "None = dung het.")
 
     # Du lieu TASK (task step, LM loss) — doc giong het cac file finetuning english-task-only
     p.add_argument("--task_datasets", type=str, nargs="+", choices=["squad", "snli", "mmlu"],
@@ -270,14 +250,13 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--num_train_epochs", type=int, default=3)
     p.add_argument("--align_batch_size", type=int, default=128,
                     help="EFFECTIVE batch size align per-rank (paper: 128). Duoc chia thanh mini-batch "
-                         "--align_micro_batch_size de tinh contrastive loss + cong don gradient. ALIGN LA ANCHOR: "
-                         "N = round(n_align / (align_batch_size * world_size)) = so align step = so task "
-                         "step moi epoch; MOI epoch dung HET pool alignment.")
+                         "--align_micro_batch_size de tinh contrastive loss + cong don gradient. Moi epoch "
+                         "can N * world_size * align_batch_size cap align (N tinh tu TASK); pool align nho "
+                         "duoc LAP LAI de du so cap nay (dung nhu paper).")
     p.add_argument("--task_batch_size", type=int, default=128,
-                    help="Batch size task per-rank (so sample task / rank / task step). Moi epoch lay "
-                         "N * world_size * task_batch_size sample task tu pool task; neu lon hon n_task thi "
-                         "sample task bi lap lai (cho phep), neu nho hon thi moi epoch chi thay 1 phan pool "
-                         "(dong hoan vi lien tuc giua cac epoch nen van phu deu pool qua cac epoch).")
+                    help="Batch size task per-rank (so sample task / rank / task step). TASK LA ANCHOR: "
+                         "N = ceil(n_task / (task_batch_size * world_size)) = so task step = so align step "
+                         "moi epoch; MOI sample task duoc dung >= 1 lan / epoch.")
     p.add_argument("--align_micro_batch_size", type=int, default=32,
                     help="Kich thuoc MINI-BATCH contrastive (paper: 32). Negative chi nam trong mini-batch; "
                          "gradient cong don qua cac mini-batch cua 1 align step. 0 = khong chia.")
@@ -532,12 +511,23 @@ def cached_build(cache_path: Optional[str], build_fn, is_main: bool, is_distribu
 # ============================================================================================
 def load_bitext_pairs(data_dir: str, data_files: Sequence[str], eng_key: str,
                        max_lang_pairs_per_record: Optional[int] = None,
-                       seed: int = 42, ted_pairs_per_record: Optional[int] = None):
+                       seed: int = 42, ted_pairs_per_record: Optional[int] = None,
+                       pairs_per_lang: Optional[int] = None):
     """Tra ve (pairs, src_ids): pairs = [(eng, other, lang)], src_ids = np.uint8 (chi so file nguon).
-    Doc TOAN BO cap hop le cua moi file (khong co gioi han so cap / file)."""
+
+    pairs_per_lang > 0 (mac dinh cua CLI: 500, nhu paper — "vai tram cau" / ngon ngu): voi MOI ngon ngu,
+      gom TAT CA cap eng-other hop le tu HOP cua cac file roi boc NGAU NHIEN dung pairs_per_lang cap bang
+      reservoir sampling (Algorithm R) voi random.Random(seed) -> moi cap hop le co cung xac suat duoc chon,
+      ket qua tai lap duoc 100% theo (seed, noi dung file, thu tu file). Bo nho ~ O(so_ngon_ngu * pairs_per_lang)
+      thay vi giu hang chuc trieu cap. Ngon ngu co it cap hon pairs_per_lang -> lay het.
+    pairs_per_lang None/<=0: doc TOAN BO cap hop le (hanh vi cu, trai paper)."""
+    use_res = bool(pairs_per_lang) and pairs_per_lang > 0
     pairs: List[Tuple[str, str, str]] = []
     src_ids: List[int] = []
-    rng = random.Random(seed)
+    res: Dict[str, List[Tuple[str, str, int]]] = {}    # lang -> reservoir [(eng, other, file_idx)]
+    seen: Dict[str, int] = {}                          # lang -> tong so cap hop le da duyet
+    rng = random.Random(seed)        # chon cap/record (TED, max_lang_pairs_per_record)
+    rng_res = random.Random(seed)    # reservoir sampling (--seed 42)
     for fi, fname in enumerate(data_files):
         path = os.path.join(data_dir, fname)
         if not os.path.exists(path):
@@ -550,7 +540,7 @@ def load_bitext_pairs(data_dir: str, data_files: Sequence[str], eng_key: str,
 
         is_ted = os.path.basename(fname).lower().startswith("ted")
         n_no_eng = 0
-        n_before = len(pairs)
+        n_valid = 0
         for rec in records:
             if not isinstance(rec, dict):
                 continue
@@ -568,19 +558,46 @@ def load_bitext_pairs(data_dir: str, data_files: Sequence[str], eng_key: str,
                 other_keys = rng.sample(other_keys, max_lang_pairs_per_record)
             for k in other_keys:
                 v = rec.get(k)
-                if isinstance(v, str) and v.strip():
-                    pairs.append((eng_text, v.strip(), k))
-        src_ids.extend([fi] * (len(pairs) - n_before))
+                if not (isinstance(v, str) and v.strip()):
+                    continue
+                v = v.strip()
+                n_valid += 1
+                if use_res:
+                    n_seen = seen.get(k, 0) + 1
+                    seen[k] = n_seen
+                    bucket = res.setdefault(k, [])
+                    if len(bucket) < pairs_per_lang:
+                        bucket.append((eng_text, v, fi))
+                    else:
+                        j = rng_res.randrange(n_seen)
+                        if j < pairs_per_lang:
+                            bucket[j] = (eng_text, v, fi)
+                else:
+                    pairs.append((eng_text, v, k))
+                    src_ids.append(fi)
 
         if n_no_eng:
             ex = next((list(r.keys())[:6] for r in records if isinstance(r, dict)), [])
             logger.warning(f"{fname}: {n_no_eng}/{len(records)} record KHONG co khoa '{eng_key}' "
                            f"(hoac rong) -> bi bo qua. Vi du cac khoa cua 1 record: {ex}. Neu ca file "
                            f"bi bo qua, dung --eng_key de chi dinh dung ten khoa tieng Anh.")
-        logger.info(f"{fname}: +{len(pairs) - n_before} cap bitext ({eng_key}-other), "
+        logger.info(f"{fname}: {n_valid} cap bitext hop le ({eng_key}-other), "
                     f"tong so record = {len(records)}")
         del records
         gc.collect()
+
+    if use_res:
+        for lang in sorted(res):
+            for e, o, fi in res[lang]:
+                pairs.append((e, o, lang))
+                src_ids.append(fi)
+        n_short = {l: seen[l] for l in res if seen[l] < pairs_per_lang}
+        logger.info(f"[align] boc NGAU NHIEN (seed={seed}) toi da {pairs_per_lang} cap / ngon ngu tu "
+                    f"{sum(seen.values())} cap hop le cua {len(res)} ngon ngu -> pool align = {len(pairs)} cap.")
+        if n_short:
+            logger.info(f"[align] {len(n_short)} ngon ngu co < {pairs_per_lang} cap nen lay het: "
+                        f"{dict(sorted(n_short.items(), key=lambda kv: kv[1])[:10])}"
+                        f"{' ...' if len(n_short) > 10 else ''}")
     return pairs, np.asarray(src_ids, dtype=np.uint8)
 
 
@@ -1419,12 +1436,12 @@ def build_task_pool(args, tokenizer) -> Dict:
 # Lich xen ke task/align: ALIGN la anchor — moi epoch = N align step dung HET pool align + N task step
 # (task data duoc phep lap lai)
 # ============================================================================================
-def solve_schedule(n_align: int, world_size: int, align_batch_size: int) -> int:
-    """Tra ve N = so align step = so task step MOI epoch. ALIGN la anchor:
-        N = max(1, round(n_align / (align_batch_size * world_size)))
-    -> N align step dung HET n_align cap (batch align per-rank trung binh ~ align_batch_size).
-    Task data khong tham gia vao viec chon N (task duoc phep lap lai de du N task step)."""
-    return max(1, int(n_align / (align_batch_size * world_size) + 0.5))
+def solve_schedule(n_task: int, world_size: int, task_batch_size: int) -> int:
+    """Tra ve N = so task step = so align step MOI epoch. TASK la anchor (dung nhu paper):
+        N = max(1, ceil(n_task / (task_batch_size * world_size)))
+    -> moi sample task duoc dung >= 1 lan / epoch. Align data (pool nho) khong tham gia chon N;
+    no duoc LAP LAI de du N align step."""
+    return max(1, -(-int(n_task) // (int(task_batch_size) * int(world_size))))
 
 
 def split_sizes(total: int, parts: int) -> List[int]:
@@ -1435,20 +1452,24 @@ def split_sizes(total: int, parts: int) -> List[int]:
 
 class AlternatePlan:
     """Ke hoach batch cho 1 epoch (xac dinh hoan toan theo (seed, epoch) -> resume giua epoch ra dung
-    cac batch cu). Dung numpy (hoan vi 22M phan tu bang random.shuffle ton ~30s + vai GB moi epoch).
+    cac batch cu). Dung numpy.
 
-    ALIGN (anchor): hoan vi (seed, epoch) TOAN BO n_align cap -> chia N lat -> MOI cap xuat hien it nhat
-    1 lan / epoch. Moi lat PHAI chia deu cho cac rank (all_gather can cung shape tren moi rank): gom
-    thanh `units` khoi, moi khoi W sample; khoi cuoi duoc dem them < W sample lay tu dau hoan vi (chi toi
-    da W-1 sample/epoch bi dung 2 lan, nam o lat khac nhau), roi chia units khoi cho N lat.
+    TASK (anchor): hoan vi (seed, epoch) TOAN BO n_task sample, cat thanh N lat, moi lat
+    W * task_batch_size sample (phan thieu o lat cuoi, < 1 step, duoc lap vong tu dau hoan vi) -> MOI sample
+    task xuat hien >= 1 lan / epoch. Moi lat sort theo do dai TRUOC khi chia rank (can bang tai + thuan loi
+    cho micro-batching theo token).
 
-    TASK (duoc phep lap lai): moi epoch can task_per_epoch = N * W * task_batch_size sample. Pool task duoc
-    coi nhu DONG VO HAN cac hoan vi noi tiep nhau (hoan vi thu b dung seed (seed, b)); epoch e lay doan
-    [e * task_per_epoch, (e + 1) * task_per_epoch) cua dong do, cat thanh N lat, moi lat W * task_batch_size
-    sample, sort theo do dai TRUOC khi chia rank (can bang tai + thuan loi cho micro-batching theo token)."""
+    ALIGN (pool nho, lap lai nhu paper): moi epoch can align_per_epoch = N * W * align_batch_size cap. Luong cap
+    nay duoc sinh tu pool n_align (nho) bang cach lap lai pool:
+      - align_lang_balance (lang_ids != None, paper 4.3): moi ngon ngu nhan ~align_per_epoch / L cap, trong ngon
+        ngu do cac cap duoc quay vong qua nhieu hoan vi noi tiep (deu nhau: moi cap xuat hien floor hoac
+        ceil lan) -> phan phoi ngon ngu xap xi DEU;
+      - nguoc lai: nhieu hoan vi noi tiep cua ca pool.
+    Moi lat align = W * align_batch_size cap, chia rank theo buoc W -> moi rank dung align_batch_size cap
+    (all_gather cua contrastive loss can cung shape tren moi rank)."""
 
     def __init__(self, n_task, n_align, task_lengths, steps_per_side, world_size, rank, seed,
-                 task_batch_size, lang_ids=None):
+                 task_batch_size, align_batch_size, lang_ids=None):
         self.n_task, self.n_align = n_task, n_align
         self.lang_ids = None if lang_ids is None else np.asarray(lang_ids)
         self._lang_groups = None
@@ -1458,57 +1479,40 @@ class AlternatePlan:
             self._lang_groups = np.split(order, starts[1:])
         self.task_lengths = np.asarray(task_lengths)
         self.N, self.W, self.rank, self.seed = steps_per_side, world_size, rank, seed
-        self.task_per_step = task_batch_size * world_size            # so sample task TOAN CUC / task step
-        self.task_per_epoch = self.task_per_step * steps_per_side    # T
+        self.task_per_step = task_batch_size * world_size              # sample task TOAN CUC / task step
+        self.task_per_epoch = self.task_per_step * steps_per_side
+        self.align_per_step = align_batch_size * world_size            # cap align TOAN CUC / align step
+        self.align_per_epoch = self.align_per_step * steps_per_side    # M
 
-    def _task_stream(self, start: int, length: int) -> np.ndarray:
-        """Cac vi tri [start, start + length) cua dong task vo han (cac hoan vi noi tiep nhau)."""
-        out, pos, end = [], start, start + length
-        while pos < end:
-            block, off = divmod(pos, self.n_task)
-            perm = np.random.default_rng([self.seed, block, 1]).permutation(self.n_task)
-            take = min(end - pos, self.n_task - off)
-            out.append(perm[off:off + take])
-            pos += take
-        return np.concatenate(out)
-
-    def _align_epoch_perm(self, epoch: int) -> np.ndarray:
-        """Hoan vi cac chi so align cua 1 epoch (do dai n_align). Neu co lang_ids: RESAMPLE ve xap xi
-        phan phoi DEU giua cac ngon ngu (paper 4.3): moi ngon ngu nhan ~n_align/L cap/epoch; ngon ngu it
-        du lieu duoc lap lai (cac hoan vi noi tiep), ngon ngu nhieu du lieu duoc lay mau con."""
+    def _align_epoch_stream(self, epoch: int) -> np.ndarray:
+        """Day M = align_per_epoch chi so align (lap lai pool nho). Co lang_ids: phan phoi DEU giua cac ngon ngu."""
+        M = self.align_per_epoch
         rng = np.random.default_rng([self.seed, epoch, 2])
         if self._lang_groups is None:
-            return rng.permutation(self.n_align)
+            reps = -(-M // self.n_align)
+            return np.concatenate([rng.permutation(self.n_align) for _ in range(reps)])[:M]
         L = len(self._lang_groups)
-        quota = split_sizes(self.n_align, L)
+        quota = split_sizes(M, L)
         rng.shuffle(quota)                           # ngon ngu nao nhan phan du thay doi theo epoch
         parts = []
         for g, q in zip(self._lang_groups, quota):
             reps = -(-q // len(g))
-            idx = np.concatenate([rng.permutation(g) for _ in range(reps)])[:q]
-            parts.append(idx)
+            parts.append(np.concatenate([rng.permutation(g) for _ in range(reps)])[:q])
         return rng.permutation(np.concatenate(parts))
 
     def epoch_batches(self, epoch: int) -> Tuple[List[np.ndarray], List[np.ndarray]]:
-        # ---- task: doan [epoch*T, (epoch+1)*T) cua dong hoan vi, N lat bang nhau
-        t_stream = self._task_stream(epoch * self.task_per_epoch, self.task_per_epoch)
+        # ---- task (anchor): 1 hoan vi cua TOAN BO pool, N lat bang nhau
+        t_perm = np.random.default_rng([self.seed, epoch, 1]).permutation(self.n_task)
+        t_perm = np.resize(t_perm, self.task_per_epoch)      # lap vong phan thieu (< 1 task step)
         task_batches, align_batches = [], []
         for k in range(self.N):
-            chunk = t_stream[k * self.task_per_step:(k + 1) * self.task_per_step]
+            chunk = t_perm[k * self.task_per_step:(k + 1) * self.task_per_step]
             chunk = chunk[np.argsort(self.task_lengths[chunk], kind="stable")]
             task_batches.append(chunk[self.rank::self.W])
-        # ---- align: DUNG HET pool
-        a_perm = self._align_epoch_perm(epoch)
-        n_a = len(a_perm)
-        units = -(-n_a // self.W)
-        pad = units * self.W - n_a
-        if pad:
-            a_perm = np.concatenate([a_perm, a_perm[:pad]])
-        pos = 0
-        for u in split_sizes(units, self.N):
-            sz = u * self.W
-            chunk = a_perm[pos:pos + sz]
-            pos += sz
+        # ---- align: pool nho, lap lai de du N align step
+        a_stream = self._align_epoch_stream(epoch)
+        for k in range(self.N):
+            chunk = a_stream[k * self.align_per_step:(k + 1) * self.align_per_step]
             align_batches.append(chunk[self.rank::self.W])
         return task_batches, align_batches
 
@@ -1795,9 +1799,10 @@ Training: step chan = task step (LM loss), step le = contrastive align step.
 - **Align step (le)**: contrastive Eq.(1) MidAlign ({args.align_loss}, negative trong mini-batch {args.align_micro_batch_size}) giua mean-pooled hidden state cau
   tieng Anh va cau target tai layer {args.align_layer} (block 0-indexed = {align_layer_0based}
   / {num_layers} layer), temperature = {args.align_temperature}.
-- Moi epoch: {steps_per_side} task step + {steps_per_side} align step. ALIGN la anchor: dung HET {n_align} cap
-  bitext (nguon: {", ".join(args.alignment_data)}) moi epoch. Task data duoc phep lap lai: moi epoch lay
-  {steps_per_side * world_size * args.task_batch_size} sample task tu pool {n_task} sample (doc nhu dong hoan vi noi tiep nhau).
+- Moi epoch: {steps_per_side} task step + {steps_per_side} align step. TASK la anchor: moi epoch dung HET {n_task} sample
+  task (SQuAD/SNLI/MMLU, English-only) >= 1 lan. Align = pool nho {n_align} cap (nguon: {", ".join(args.alignment_data)};
+  {args.align_pairs_per_lang} cap/ngon ngu, boc ngau nhien seed {args.seed}), lap lai de du
+  {steps_per_side * world_size * args.align_batch_size} cap align / epoch (dung nhu paper).
 - Contrastive: effective batch {args.align_batch_size}/rank, mini-batch {args.align_micro_batch_size}, global_negatives = {args.align_global_negatives}, mask_false_negatives = {args.mask_false_negatives}, lang_balance = {args.align_lang_balance}.
 - world_size = {world_size}, align_batch_size = {args.align_batch_size} (per-rank, anchor),
   task_batch_size = {args.task_batch_size} (per-rank), task_micro_batch_tokens = {args.task_micro_batch_tokens}.
@@ -1985,7 +1990,7 @@ def main():
         logger.info(f"Dang doc bitext {args.eng_key}-other tu {args.data_dir} ({args.data_files}) ...")
         prs, src = load_bitext_pairs(args.data_dir, args.data_files, args.eng_key,
                                       args.max_lang_pairs_per_record, args.seed,
-                                      args.ted_pairs_per_record)
+                                      args.ted_pairs_per_record, args.align_pairs_per_lang)
         if args.max_samples and len(prs) > args.max_samples:
             sel = np.random.default_rng(args.seed).permutation(len(prs))[: args.max_samples]
             prs, src = [prs[i] for i in sel], src[sel]
@@ -1993,7 +1998,7 @@ def main():
             raise RuntimeError("Khong doc duoc cap bitext nao — kiem tra --data_dir / --data_files / --eng_key.")
         return {"pairs": prs, "src": src}
 
-    align_sig = {"v": 4, "ted_ppr": args.ted_pairs_per_record, "files": file_signature([os.path.join(args.data_dir, f) for f in args.data_files]),
+    align_sig = {"v": 5, "ppl": args.align_pairs_per_lang, "ted_ppr": args.ted_pairs_per_record, "files": file_signature([os.path.join(args.data_dir, f) for f in args.data_files]),
                  "eng_key": args.eng_key, "mlp": args.max_lang_pairs_per_record, "seed": args.seed,
                  "max_samples": args.max_samples}
     align_data = cached_build(_cache_path("align", align_sig), _build_align, is_main, is_distributed)
@@ -2015,32 +2020,31 @@ def main():
     pad_id = int(tokenizer.pad_token_id)
 
     n_task, n_align = len(task_lengths), len(pairs)
-    task_bs = int(args.task_batch_size)
+    task_bs, align_bs = int(args.task_batch_size), int(args.align_batch_size)
     if task_bs < 1:
         raise ValueError(f"--task_batch_size phai >= 1 (nhan duoc {args.task_batch_size}).")
-    N = solve_schedule(n_align, world_size, args.align_batch_size)       # ALIGN la anchor
-    if n_align // N < 2 * world_size:
-        raise RuntimeError(f"Pool align ({n_align} cap) qua nho cho N={N} step x {world_size} rank "
-                           f"(moi rank can >= 2 cap/step cho contrastive). Giam --align_batch_size "
-                           f"hoac tang du lieu align.")
+    if align_bs < 2:
+        raise ValueError(f"--align_batch_size phai >= 2 (contrastive can >= 2 cap/rank; nhan duoc {align_bs}).")
+    N = solve_schedule(n_task, world_size, task_bs)                      # TASK la anchor
     steps_per_epoch = 2 * N                       # luon chan -> epoch nao cung bat dau bang task step
     total_steps = steps_per_epoch * args.num_train_epochs
-    task_per_epoch = N * world_size * task_bs     # T: so sample task moi epoch (co the > n_task -> lap lai)
-    task_cover = task_per_epoch / n_task
+    task_per_epoch = N * world_size * task_bs     # >= n_task (dem them < 1 task step)
+    align_per_epoch = N * world_size * align_bs   # cap align can moi epoch (lap lai pool nho)
+    align_cover = align_per_epoch / n_align
     src_counts = np.bincount(align_src.astype(np.int64)).tolist() if len(align_src) else []
     logger.info(
-        f"[schedule] ANCHOR = ALIGN | n_align={n_align} cap (theo file {args.data_files}: {src_counts}) "
-        f"-> dung HET moi epoch | N={N} align step + {N} task step / epoch "
-        f"(steps_per_epoch={steps_per_epoch}, total_steps={total_steps}) | batch/rank: "
-        f"align~{n_align / (N * world_size):.1f}, task={task_bs} | task: {task_per_epoch} sample/epoch "
-        f"tu pool {n_task} (SQuAD/SNLI/MMLU) = {task_cover:.2f}x pool/epoch "
-        f"({'LAP LAI, deu nhau' if task_cover > 1 else 'chi 1 phan pool/epoch, phu deu qua cac epoch'})."
+        f"[schedule] ANCHOR = TASK | n_task={n_task} (SQuAD/SNLI/MMLU) -> moi sample dung >= 1 lan/epoch | "
+        f"N={N} task step + {N} align step / epoch (steps_per_epoch={steps_per_epoch}, "
+        f"total_steps={total_steps}) | batch/rank: task={task_bs}, align={align_bs} | "
+        f"align: pool nho {n_align} cap (seed={args.seed}, {args.align_pairs_per_lang}/ngon ngu; theo file "
+        f"{args.data_files}: {src_counts}), moi epoch can {align_per_epoch} cap = {align_cover:.1f}x pool "
+        f"(LAP LAI, dung nhu paper)."
     )
-    if task_cover > 5:
+    if align_cover > 100:
         logger.warning(
-            f"[canh bao] Moi sample task bi lap ~{task_cover:.1f} lan / epoch "
-            f"(~{task_cover * args.num_train_epochs:.1f} lan trong {args.num_train_epochs} epoch) -> co nguy co "
-            f"overfit task. Giam --task_batch_size (hien {task_bs}) hoac giam so epoch neu can.")
+            f"[canh bao] Moi cap align bi lap ~{align_cover:.0f} lan / epoch (~{align_cover * args.num_train_epochs:.0f} "
+            f"lan trong {args.num_train_epochs} epoch). Paper cung lap pool nho nhieu lan, nhung neu thay align "
+            f"loss ve ~0 som (overfit) hay giam --num_train_epochs hoac tang --align_pairs_per_lang.")
 
     lang_ids = None
     if args.align_lang_balance:
@@ -2048,9 +2052,10 @@ def main():
         lmap = {l: i for i, l in enumerate(lang_names)}
         lang_ids = np.fromiter((lmap[p[2]] for p in pairs), dtype=np.int32, count=len(pairs))
         cnt = np.bincount(lang_ids, minlength=len(lang_names))
-        logger.info(f"[align] resample DEU {len(lang_names)} ngon ngu: ~{n_align // len(lang_names)} cap/ngon ngu/epoch "
-                    f"(goc: min={int(cnt.min())}, max={int(cnt.max())} cap/ngon ngu).")
-    plan = AlternatePlan(n_task, n_align, task_lengths, N, world_size, rank, args.seed, task_bs, lang_ids)
+        logger.info(f"[align] resample DEU {len(lang_names)} ngon ngu: ~{align_per_epoch // len(lang_names)} "
+                    f"cap/ngon ngu/epoch (pool: min={int(cnt.min())}, max={int(cnt.max())} cap/ngon ngu).")
+    plan = AlternatePlan(n_task, n_align, task_lengths, N, world_size, rank, args.seed, task_bs, align_bs,
+                         lang_ids)
 
     # ------------------------------------------------------------------------------- optimizer
     use_fused = device.type == "cuda"
