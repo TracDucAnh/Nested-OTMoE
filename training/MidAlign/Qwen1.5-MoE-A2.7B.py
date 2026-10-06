@@ -241,6 +241,10 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--eng_key", type=str, default="eng_Latn")
     p.add_argument("--max_lang_pairs_per_record", type=int, default=None,
                     help="Gioi han so ngon ngu ghep voi eng_key trong 1 record (None = dung het).")
+    p.add_argument("--ted_pairs_per_record", type=int, default=1,
+                    help="RIENG cho file TED (ten file bat dau bang 'ted'): moi record chi lay NGAU NHIEN "
+                         "N cap eng-other (mac dinh 1) thay vi to hop het cac ngon ngu. Ap dung thay cho "
+                         "--max_lang_pairs_per_record doi voi TED. 0 hoac am = lay het (nhu cac file khac).")
     p.add_argument("--max_samples", type=int, default=None,
                     help="Gioi han so cap bitext alignment (debug), None = dung het.")
 
@@ -528,7 +532,7 @@ def cached_build(cache_path: Optional[str], build_fn, is_main: bool, is_distribu
 # ============================================================================================
 def load_bitext_pairs(data_dir: str, data_files: Sequence[str], eng_key: str,
                        max_lang_pairs_per_record: Optional[int] = None,
-                       seed: int = 42):
+                       seed: int = 42, ted_pairs_per_record: Optional[int] = None):
     """Tra ve (pairs, src_ids): pairs = [(eng, other, lang)], src_ids = np.uint8 (chi so file nguon).
     Doc TOAN BO cap hop le cua moi file (khong co gioi han so cap / file)."""
     pairs: List[Tuple[str, str, str]] = []
@@ -544,6 +548,7 @@ def load_bitext_pairs(data_dir: str, data_files: Sequence[str], eng_key: str,
         records = list(data.values()) if isinstance(data, dict) else data
         del data
 
+        is_ted = os.path.basename(fname).lower().startswith("ted")
         n_no_eng = 0
         n_before = len(pairs)
         for rec in records:
@@ -555,7 +560,11 @@ def load_bitext_pairs(data_dir: str, data_files: Sequence[str], eng_key: str,
                 continue
             eng_text = eng_text.strip()
             other_keys = [k for k in rec.keys() if k not in ("id", eng_key)]
-            if max_lang_pairs_per_record is not None and len(other_keys) > max_lang_pairs_per_record:
+            if is_ted and ted_pairs_per_record and ted_pairs_per_record > 0:
+                # TED: chon ngau nhien trong cac ngon ngu CO cau hop le (khong boc trung khoa rong)
+                valid = [k for k in other_keys if isinstance(rec.get(k), str) and rec[k].strip()]
+                other_keys = rng.sample(valid, min(ted_pairs_per_record, len(valid)))
+            elif max_lang_pairs_per_record is not None and len(other_keys) > max_lang_pairs_per_record:
                 other_keys = rng.sample(other_keys, max_lang_pairs_per_record)
             for k in other_keys:
                 v = rec.get(k)
@@ -1975,7 +1984,8 @@ def main():
     def _build_align():
         logger.info(f"Dang doc bitext {args.eng_key}-other tu {args.data_dir} ({args.data_files}) ...")
         prs, src = load_bitext_pairs(args.data_dir, args.data_files, args.eng_key,
-                                      args.max_lang_pairs_per_record, args.seed)
+                                      args.max_lang_pairs_per_record, args.seed,
+                                      args.ted_pairs_per_record)
         if args.max_samples and len(prs) > args.max_samples:
             sel = np.random.default_rng(args.seed).permutation(len(prs))[: args.max_samples]
             prs, src = [prs[i] for i in sel], src[sel]
@@ -1983,7 +1993,7 @@ def main():
             raise RuntimeError("Khong doc duoc cap bitext nao — kiem tra --data_dir / --data_files / --eng_key.")
         return {"pairs": prs, "src": src}
 
-    align_sig = {"v": 3, "files": file_signature([os.path.join(args.data_dir, f) for f in args.data_files]),
+    align_sig = {"v": 4, "ted_ppr": args.ted_pairs_per_record, "files": file_signature([os.path.join(args.data_dir, f) for f in args.data_files]),
                  "eng_key": args.eng_key, "mlp": args.max_lang_pairs_per_record, "seed": args.seed,
                  "max_samples": args.max_samples}
     align_data = cached_build(_cache_path("align", align_sig), _build_align, is_main, is_distributed)
