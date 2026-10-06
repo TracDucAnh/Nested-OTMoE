@@ -1,26 +1,12 @@
 """
 Zero-shot MMMLU (Multilingual MMLU) evaluation for the MidAlign baseline (LoRA)
-of Qwen1.5-MoE-A2.7B via log-likelihood scoring.
+of Qwen1.5-MoE-A2.7B via log-likelihood scoring -- TRAINING-PROMPT VERSION.
 
-This is the MidAlign-baseline counterpart of `eval/Qwen1.5-MoE-A2.7B/MMMLU_eval.py`
-(base model) and a sibling of the plain-Finetuning version at
-`eval/finetuning/Qwen1.5-MoE-A2.7B/MMMLU_eval.py`. The
-scoring method, OOM-safe dynamic batching and resume/checkpoint behavior are IDENTICAL
-to that script -- the only differences are:
+This is the MidAlign MMMLU eval with ONE change: the prompt is now EXACTLY the one used by
+the task step of `training/MidAlign/Qwen1.5-MoE-A2.7B.py` (`mmlu_build_prompt` there),
+i.e. with the "The following are multiple choice questions ..." header:
 
-  1. Model loading: we load the base model `Qwen/Qwen1.5-MoE-A2.7B` and then attach the
-     LoRA adapter checkpoint that was pushed to the Hugging Face Hub by
-     `training/MidAlign/Qwen1.5-MoE-A2.7B.py` (default repo id
-     "ducanhdinh/Qwen1.5-MoE-A2.7B-MidAlign", same default as `--hub_model_id` in that
-     training script).
-  2. This file lives one level deeper (`eval/MidAlign/Qwen1.5-MoE-A2.7B/`), so the
-     default `--output_dir` points at `eval/MidAlign/Qwen1.5-MoE-A2.7B/results` and
-     result filenames get a `_lora` suffix (`mmmlu_results_lora.json`, etc.), so a
-     base-model run and a LoRA run never overwrite each other's output / checkpoint.
-
-Method
-------
-Standard MMLU zero-shot prompt:
+    The following are multiple choice questions (with answers) about {subject}.
 
     {Question}
     A. {A}
@@ -29,31 +15,37 @@ Standard MMLU zero-shot prompt:
     D. {D}
     Answer:
 
-We score the 4 single-letter continuations " A", " B", " C", " D" with
-teacher-forced log-likelihood (no free generation) and take the argmax as
-the prediction, compared against the gold `Answer` field.
+`{subject}` is the per-example `Subject` field with "_" replaced by " ". If a `Subject` is
+missing/empty, the subject-less header "The following are multiple choice questions (with
+answers)." is used, exactly as `mmlu_build_prompt` does. Pass `--mmlu_header generic` to
+always use the subject-less header (useful if the MMLU auxiliary_train file used for
+training had no `subject` values, so the model only ever saw that form); results of that
+mode are written to a `generic_header/` sub-folder of `--output_dir` so the two modes never
+mix in the resume checkpoint.
+
+We score the 4 single-letter continuations " A", " B", " C", " D" (same " <letter>" form as
+the training target " <letter><eos>") with teacher-forced log-likelihood (no free
+generation) and take the argmax as the prediction, compared against the gold `Answer`
+field. Model loading, OOM-safe dynamic batching, resume/checkpoint behavior and metrics are
+unchanged.
+
+NOTE: because the prompt differs from the base-model / original-prompt scripts, these
+numbers are NOT directly comparable with runs of those scripts. Result filenames get a
+`_lora_trainprompt` suffix (`mmmlu_results_lora_trainprompt.json`, etc.) so they never
+overwrite -- or resume from -- the original-prompt LoRA results.
 
 Only `test.json` is used for every language folder under
 `data/downstream/mmmlu/<LANG>/` (e.g. AR_XY, DE_DE, ZH_CN, ...).
 
 OOM-safe dynamic batching
 --------------------------
-Every chunk of data is first attempted at the full `--batch_size`. If a
-chunk raises a CUDA/CPU out-of-memory error, we:
-  1. free whatever memory we can (gc.collect + torch.cuda.empty_cache) --
-     this only works because we've already exited the `except` block by
-     that point, so the exception's traceback (which would otherwise pin
-     the failed batch's GPU tensors in memory) has been released,
-  2. split the offending chunk in half and retry each half recursively
-     (halving again if needed).
-This shrinking is purely local to the chunk that OOM'd: it does NOT lower
-the starting size for the next chunk of data. Each new chunk always starts
-fresh at the full `--batch_size` again, since GPU memory is freed between
-chunks. If a single example (batch size 1) still OOMs, that example is
-skipped (logged and marked in the output) instead of crashing the whole
-run.
+Every chunk of data is first attempted at the full `--batch_size`. If a chunk raises a
+CUDA/CPU out-of-memory error, it is split in half and each half retried recursively (after
+freeing memory outside the `except` block). The shrinking is local to that chunk; the next
+chunk starts again at the full `--batch_size`. If a single example still OOMs it is skipped
+(logged and marked in the output) instead of crashing the run.
 
-Usage
+Usage (run from the repo root)
 -----
     python MMMLU_eval.py \
         --model_name_or_path Qwen/Qwen1.5-MoE-A2.7B \
@@ -62,31 +54,22 @@ Usage
         --batch_size 8 \
         --output_dir eval/MidAlign/Qwen1.5-MoE-A2.7B/results
 
-(run from the repo root, same convention as `eval/Qwen1.5-MoE-A2.7B/MMMLU_eval.py`)
-
-Besides per-language + overall accuracy (same convention as XNLI_eval.py),
-this script also dumps a per-subject breakdown (aggregated across all
-languages) to `mmmlu_subject_results_lora.csv`, since MMLU-style benchmarks are
-commonly reported both by language and by subject.
+Besides per-language + overall accuracy, this script also dumps a per-subject breakdown
+(aggregated across all languages) to `mmmlu_subject_results_lora_trainprompt.csv`.
 
 Resume support
 --------------
-`mmmlu_results_lora.json` in `--output_dir` doubles as a checkpoint. As soon as a
-language finishes, its result (accuracy + a per-subject breakdown) is
-written into that file immediately (atomically, via a temp file + rename,
-so a crash mid-write never corrupts it). On the next run, any language
-already present in that file is skipped automatically, and evaluation
-resumes with the next language that has no result yet. Pass --overwrite to
-ignore the checkpoint and re-evaluate every language from scratch.
+`mmmlu_results_lora_trainprompt.json` in `--output_dir` doubles as a checkpoint. As soon as a
+language finishes, its result (accuracy + per-subject breakdown) is written there
+atomically (temp file + rename). On the next run, languages already present in that file
+are skipped. Pass --overwrite to re-evaluate every language from scratch.
 
 LoRA notes
 ----------
 - `--lora_model_id` / `--lora_revision` select which Hub repo/commit the adapter is
   pulled from. If the repo is private, pass `--hf_token` or set `HF_TOKEN` (or put it
   in `--env_file`, default `.env`), same convention as the training script.
-- `--merge_lora` merges the adapter into the base weights after loading (slightly
-  faster forward passes); off by default so the run always reflects the adapter exactly
-  as published, un-merged.
+- `--merge_lora` merges the adapter into the base weights after loading; off by default.
 """
 
 import argparse
@@ -285,15 +268,23 @@ def score_chunk_with_oom_retry(model, tokenizer, chunk, build_prompt_fn, device,
     return left + right
 
 
+# "subject": header uses the per-example `Subject` field (what `mmlu_build_prompt` does when a
+# subject is present); "generic": always the subject-less header. Set from --mmlu_header in main().
+MMLU_HEADER_MODE = "subject"
+
+
 def build_prompt(ex: dict) -> str:
-    return (
-        f"{ex['Question']}\n"
-        f"A. {ex['A']}\n"
-        f"B. {ex['B']}\n"
-        f"C. {ex['C']}\n"
-        f"D. {ex['D']}\n"
-        f"Answer:"
-    )
+    """Identical to `mmlu_build_prompt` in training/MidAlign/Qwen1.5-MoE-A2.7B.py
+    (the training MMLU loader also .strip()s question / choices / subject)."""
+    question = str(ex["Question"]).strip()
+    choices = [str(ex[k]).strip() for k in LETTERS]
+    subject = str(ex.get("Subject") or "").strip() if MMLU_HEADER_MODE == "subject" else ""
+    if subject:
+        header = f"The following are multiple choice questions (with answers) about {subject.replace('_', ' ')}.\n\n"
+    else:
+        header = "The following are multiple choice questions (with answers).\n\n"
+    choice_lines = "\n".join(f"{LETTERS[i]}. {c}" for i, c in enumerate(choices))
+    return f"{header}{question}\n{choice_lines}\nAnswer:"
 
 
 def load_test_data(lang_dir: str):
@@ -396,7 +387,7 @@ def compute_subject_breakdown(records):
 
 def merge_subject_breakdown(subject_totals: dict, breakdown: dict) -> None:
     """In-place merge of one language's subject breakdown into the running,
-    all-languages totals used to build mmmlu_subject_results_lora.csv."""
+    all-languages totals used to build mmmlu_subject_results_lora_trainprompt.csv."""
     for subj, stats in breakdown.items():
         entry = subject_totals.setdefault(subj, {"correct": 0, "total": 0})
         entry["correct"] += stats["correct"]
@@ -404,7 +395,7 @@ def merge_subject_breakdown(subject_totals: dict, breakdown: dict) -> None:
 
 
 def load_existing_results(json_path: str):
-    """Load a previous run's mmmlu_results_lora.json, if any, so we can resume.
+    """Load a previous run's mmmlu_results_lora_trainprompt.json, if any, so we can resume.
 
     Returns (results, subject_totals, langs_missing_breakdown):
       - results: {lang: {...}} for every language already fully evaluated
@@ -414,7 +405,7 @@ def load_existing_results(json_path: str):
       - langs_missing_breakdown: languages found in the file that predate
         the "subject_breakdown" field (saved by an older version of this
         script). They still count as done and are skipped, but can't
-        contribute to mmmlu_subject_results_lora.csv since their raw per-example
+        contribute to mmmlu_subject_results_lora_trainprompt.csv since their raw per-example
         records are gone."""
     if not os.path.exists(json_path):
         return {}, {}, []
@@ -441,11 +432,11 @@ def load_existing_results(json_path: str):
 
 def write_all_outputs(output_dir, base_model_name, lora_model_id, lora_revision, merged,
                        results, subject_totals, total_skipped):
-    """(Re)write mmmlu_results_lora.csv, mmmlu_subject_results_lora.csv, and
-    mmmlu_results_lora.json from current in-memory state. Called after every
+    """(Re)write mmmlu_results_lora_trainprompt.csv, mmmlu_subject_results_lora_trainprompt.csv, and
+    mmmlu_results_lora_trainprompt.json from current in-memory state. Called after every
     single language finishes (not just once at the end) so a crash never
     loses more than the language currently in progress, and so the next run
-    can resume by reading mmmlu_results_lora.json."""
+    can resume by reading mmmlu_results_lora_trainprompt.json."""
     overall_correct = sum(r["accuracy"] * r["n_examples"] for r in results.values())
     overall_total = sum(r["n_examples"] for r in results.values())
     overall_micro_acc = overall_correct / overall_total if overall_total > 0 else 0.0
@@ -458,10 +449,10 @@ def write_all_outputs(output_dir, base_model_name, lora_model_id, lora_revision,
     lang_df = pd.DataFrame(lang_rows, columns=["language", "accuracy", "n_examples", "n_skipped"])
     if not lang_df.empty:
         lang_df = lang_df.sort_values("language")
-    csv_path = os.path.join(output_dir, "mmmlu_results_lora.csv")
+    csv_path = os.path.join(output_dir, "mmmlu_results_lora_trainprompt.csv")
     atomic_write_csv(csv_path, lang_df)
 
-    subj_csv_path = os.path.join(output_dir, "mmmlu_subject_results_lora.csv")
+    subj_csv_path = os.path.join(output_dir, "mmmlu_subject_results_lora_trainprompt.csv")
     if subject_totals:
         subj_rows = [
             {
@@ -484,7 +475,7 @@ def write_all_outputs(output_dir, base_model_name, lora_model_id, lora_revision,
         "macro_average_accuracy": macro_acc,
         "total_skipped": total_skipped,
     }
-    json_path = os.path.join(output_dir, "mmmlu_results_lora.json")
+    json_path = os.path.join(output_dir, "mmmlu_results_lora_trainprompt.json")
     atomic_write_json(json_path, summary)
 
     return overall_micro_acc, macro_acc, csv_path, subj_csv_path, json_path
@@ -558,6 +549,7 @@ def evaluate_language(model, tokenizer, lang, data_root, device, batch_size, max
 
 
 def main():
+    global MMLU_HEADER_MODE
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name_or_path", default="Qwen/Qwen1.5-MoE-A2.7B",
                          help="Base model to load before attaching the LoRA adapter.")
@@ -582,20 +574,31 @@ def main():
     parser.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
     parser.add_argument("--save_predictions", action="store_true")
     parser.add_argument(
+        "--mmlu_header", choices=["subject", "generic"], default="subject",
+        help="'subject' (default): header 'The following are multiple choice questions (with answers) "
+             "about <Subject>.' exactly like mmlu_build_prompt in training; 'generic': always the "
+             "subject-less header. 'generic' results go to <output_dir>/generic_header/.",
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
-        help="Ignore any existing mmmlu_results_lora.json and re-evaluate every language from scratch "
+        help="Ignore any existing mmmlu_results_lora_trainprompt.json and re-evaluate every language from scratch "
              "(by default, languages already present in that file are skipped and treated as done).",
     )
     args = parser.parse_args()
 
+    MMLU_HEADER_MODE = args.mmlu_header
+    if args.mmlu_header == "generic":
+        args.output_dir = os.path.join(args.output_dir, "generic_header")
+    print(f"MMLU prompt header mode: {args.mmlu_header} (output_dir={args.output_dir})")
+
     os.makedirs(args.output_dir, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    json_path = os.path.join(args.output_dir, "mmmlu_results_lora.json")
+    json_path = os.path.join(args.output_dir, "mmmlu_results_lora_trainprompt.json")
 
     # ------------------------------------------------------------------
-    # Resume support: mmmlu_results_lora.json doubles as the checkpoint. Any
+    # Resume support: mmmlu_results_lora_trainprompt.json doubles as the checkpoint. Any
     # language already recorded there from a previous run is skipped below,
     # unless --overwrite is passed.
     # ------------------------------------------------------------------
@@ -610,7 +613,7 @@ def main():
         print(
             f"[WARN] {len(langs_missing_breakdown)} of those were saved by an older version of "
             f"this script with no stored subject breakdown ({langs_missing_breakdown}); they'll "
-            f"still be skipped, but won't contribute to mmmlu_subject_results_lora.csv. Pass "
+            f"still be skipped, but won't contribute to mmmlu_subject_results_lora_trainprompt.csv. Pass "
             f"--overwrite if you need to regenerate subject-level stats for them."
         )
 
@@ -654,7 +657,7 @@ def main():
             for r in records:
                 r["language"] = lang
             atomic_write_csv(
-                os.path.join(args.output_dir, f"mmmlu_predictions_{lang}_lora.csv"), pd.DataFrame(records)
+                os.path.join(args.output_dir, f"mmmlu_predictions_{lang}_lora_trainprompt.csv"), pd.DataFrame(records)
             )
 
         # Save/checkpoint immediately -- a crash on the *next* language will

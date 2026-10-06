@@ -1,42 +1,39 @@
 """
 Zero-shot XNLI evaluation for the MidAlign baseline (LoRA) of Qwen1.5-MoE-A2.7B
-via log-likelihood scoring.
+via log-likelihood scoring -- TRAINING-PROMPT VERSION.
 
-This is the MidAlign-baseline counterpart of `eval/Qwen1.5-MoE-A2.7B/XNLI_eval.py`
-(base model) and a sibling of the plain-Finetuning version at
-`eval/finetuning/Qwen1.5-MoE-A2.7B/XNLI_eval.py`. The
-scoring method (prompt, candidates, length-normalized log-likelihood, metrics) is
-IDENTICAL to that script -- the only differences are:
+This is the MidAlign XNLI eval with ONE change: the prompt and the three candidate
+continuations are now EXACTLY the ones taught by the task step of
+`training/MidAlign/Qwen1.5-MoE-A2.7B.py` (`snli_build_prompt` + `LABEL_TO_WORD` there),
+instead of the generic "True / Neither / False" prompt used by the base-model script.
+Model loading (base model + LoRA adapter from the Hub), the length-normalized
+log-likelihood scoring and the metrics are unchanged.
 
-  1. Model loading: we load the base model `Qwen/Qwen1.5-MoE-A2.7B` and then attach the
-     LoRA adapter checkpoint that was pushed to the Hugging Face Hub by
-     `training/MidAlign/Qwen1.5-MoE-A2.7B.py` (default repo id
-     "ducanhdinh/Qwen1.5-MoE-A2.7B-MidAlign", same default as `--hub_model_id` in that
-     training script).
-  2. This file lives one level deeper (`eval/MidAlign/Qwen1.5-MoE-A2.7B/`), so the
-     default `--output_dir` points at `eval/MidAlign/Qwen1.5-MoE-A2.7B/results` and
-     result filenames get a `_lora` suffix, so a base-model run and a LoRA run never
-     overwrite each other's output.
+Prompt (premise / hypothesis kept in the original language, instruction in English):
 
-Method
-------
-For every (premise, hypothesis) pair we build ONE prompt (English instruction,
-premise/hypothesis kept in the original language) and score three candidate
-continuations that correspond to the three XNLI labels:
+    Premise: {premise}
+    Hypothesis: {hypothesis}
+    Question: What is the relationship between the premise and the hypothesis? Choose one: entailment, neutral, or contradiction.
+    Answer:
 
-    label 0 (entailment)   -> " True"
-    label 1 (neutral)      -> " Neither"
-    label 2 (contradiction)-> " False"
+Candidates scored right after "Answer:" (same " <label_word>" form as the training target,
+which is " <label_word><eos>" -- the eos is not scored here):
 
-For each candidate we compute the *length-normalized* log-likelihood of the
-continuation tokens given the prompt (teacher forcing, no sampling / no free
-generation). The candidate with the highest average log-prob is the model's
-prediction.
+    label 0 (entailment)    -> " entailment"
+    label 1 (neutral)       -> " neutral"
+    label 2 (contradiction) -> " contradiction"
 
-Only `test.json` is used for every language folder under
-`data/downstream/xnli/<lang>/`.
+For each candidate we compute the *length-normalized* log-likelihood of the continuation
+tokens given the prompt (teacher forcing, no sampling / free generation); the candidate
+with the highest average log-prob is the prediction.
 
-Usage
+NOTE: because the prompt differs from the base-model / original-prompt scripts, these
+numbers are NOT directly comparable with runs of those scripts. Result filenames get a
+`_lora_trainprompt` suffix so they never overwrite the original-prompt LoRA results.
+
+Only `test.json` is used for every language folder under `data/downstream/xnli/<lang>/`.
+
+Usage (run from the repo root)
 -----
     python XNLI_eval.py \
         --model_name_or_path Qwen/Qwen1.5-MoE-A2.7B \
@@ -45,22 +42,14 @@ Usage
         --batch_size 8 \
         --output_dir eval/MidAlign/Qwen1.5-MoE-A2.7B/results
 
-(run from the repo root, same convention as `eval/Qwen1.5-MoE-A2.7B/XNLI_eval.py`)
-
 Notes
 -----
-- Requires a GPU with enough VRAM to hold the base model (Qwen1.5-MoE-A2.7B has
-  ~14.3B total params / 2.7B activated, so budget ~28GB in bf16) plus the (small) LoRA
-  adapter. Falls back to CPU automatically but will be very slow.
-- `--lora_model_id` / `--lora_revision` select which Hub repo/commit the adapter is
-  pulled from. If the repo is private, pass `--hf_token` or set `HF_TOKEN` (or put it in
+- `--lora_model_id` / `--lora_revision` select which Hub repo/commit the adapter is pulled
+  from. If the repo is private, pass `--hf_token` or set `HF_TOKEN` (or put it in
   `--env_file`, default `.env`), same convention as the training script.
-- `--merge_lora` merges the adapter into the base weights after loading (slightly
-  faster forward passes); off by default so the run always reflects the adapter exactly
-  as published, un-merged.
-- `--languages` lets you restrict to a subset, e.g. `--languages en vi zh`.
-- `--max_examples` is handy to smoke-test the pipeline on a few examples before
-  launching the full run.
+- `--merge_lora` merges the adapter into the base weights after loading; off by default.
+- `--languages` restricts to a subset, e.g. `--languages en vi zh`.
+- `--max_examples` is handy to smoke-test the pipeline on a few examples.
 """
 
 import argparse
@@ -82,7 +71,9 @@ except ImportError:
 
 # XNLI label id -> candidate continuation text (leading space matters for BPE tokenizers)
 LABEL_NAMES = ["entailment", "neutral", "contradiction"]
-CANDIDATES = [" True", " Neither", " False"]  # index-aligned with LABEL_NAMES / label ids 0,1,2
+# Same label words as LABEL_TO_WORD in training/MidAlign/Qwen1.5-MoE-A2.7B.py
+# (training target is " <label_word><eos>", i.e. with a leading space after "Answer:").
+CANDIDATES = [" " + w for w in LABEL_NAMES]  # index-aligned with LABEL_NAMES / label ids 0,1,2
 
 # Same env var names / precedence used by training/MidAlign/Qwen1.5-MoE-A2.7B.py
 _HF_TOKEN_ENV_VARS = ("HF_TOKEN", "HUGGINGFACE_HUB_TOKEN", "HUGGING_FACE_HUB_TOKEN")
@@ -123,7 +114,17 @@ def load_hf_token(env_file, cli_token):
 
 
 def build_prompt(premise: str, hypothesis: str) -> str:
-    return f"{premise}\nQuestion: {hypothesis} True, False, or Neither?\nAnswer:"
+    """Identical to `snli_build_prompt` in training/MidAlign/Qwen1.5-MoE-A2.7B.py
+    (the training SNLI loader also .strip()s premise and hypothesis)."""
+    premise = str(premise).strip()
+    hypothesis = str(hypothesis).strip()
+    return (
+        f"Premise: {premise}\n"
+        f"Hypothesis: {hypothesis}\n"
+        f"Question: What is the relationship between the premise and the hypothesis? "
+        f"Choose one: entailment, neutral, or contradiction.\n"
+        f"Answer:"
+    )
 
 
 def load_test_data(lang_dir: str):
@@ -307,7 +308,7 @@ def main():
 
         if args.save_predictions:
             pd.DataFrame(records).to_csv(
-                os.path.join(args.output_dir, f"xnli_predictions_{lang}_lora.csv"), index=False
+                os.path.join(args.output_dir, f"xnli_predictions_{lang}_lora_trainprompt.csv"), index=False
             )
 
     overall_correct = sum(r["accuracy"] * r["n_examples"] for r in results.values())
@@ -322,7 +323,7 @@ def main():
     df = pd.DataFrame(
         [{"language": lang, "accuracy": r["accuracy"], "n_examples": r["n_examples"]} for lang, r in results.items()]
     ).sort_values("language")
-    csv_path = os.path.join(args.output_dir, "xnli_results_lora.csv")
+    csv_path = os.path.join(args.output_dir, "xnli_results_lora_trainprompt.csv")
     df.to_csv(csv_path, index=False)
 
     summary = {
@@ -330,11 +331,12 @@ def main():
         "lora_model_id": args.lora_model_id,
         "lora_revision": args.lora_revision or "main",
         "merged": args.merge_lora,
+        "prompt_format": "MidAlign training prompt (snli_build_prompt), candidates: entailment/neutral/contradiction",
         "per_language": results,
         "overall_micro_accuracy": overall_micro_acc,
         "macro_average_accuracy": macro_acc,
     }
-    json_path = os.path.join(args.output_dir, "xnli_results_lora.json")
+    json_path = os.path.join(args.output_dir, "xnli_results_lora_trainprompt.json")
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
 

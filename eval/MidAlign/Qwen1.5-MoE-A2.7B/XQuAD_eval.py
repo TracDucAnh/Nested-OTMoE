@@ -1,32 +1,29 @@
 #!/usr/bin/env python3
 """
 Zero-shot generative evaluation of the MidAlign baseline (LoRA) of
-Qwen1.5-MoE-A2.7B on XQuAD.
+Qwen1.5-MoE-A2.7B on XQuAD -- TRAINING-PROMPT VERSION.
 
-This is the MidAlign-baseline counterpart of `eval/Qwen1.5-MoE-A2.7B/XQuAD_eval.py`
-(base model) and a sibling of the plain-Finetuning version at
-`eval/finetuning/Qwen1.5-MoE-A2.7B/XQuAD_eval.py`. The
-scoring method (zero-shot generation, SQuAD-style EM / F1 with multilingual
-normalization) is IDENTICAL to that script -- the only differences are:
+This is the MidAlign XQuAD eval with ONE change: the prompt is now EXACTLY the one used by
+the task step of `training/MidAlign/Qwen1.5-MoE-A2.7B.py` (`squad_build_prompt` there),
+instead of the instruction-style prompt shared with the base-model script:
 
-  1. Model loading: we load the base model `Qwen/Qwen1.5-MoE-A2.7B` and then attach the
-     LoRA adapter checkpoint that was pushed to the Hugging Face Hub by
-     `training/MidAlign/Qwen1.5-MoE-A2.7B.py` (default repo id
-     "ducanhdinh/Qwen1.5-MoE-A2.7B-MidAlign", same default as `--hub_model_id` in that
-     training script).
-  2. This file lives one level deeper (`eval/MidAlign/Qwen1.5-MoE-A2.7B/` instead of
-     `eval/Qwen1.5-MoE-A2.7B/`), so the default `--data_root` gains one extra `../` to
-     still reach `data/downstream/xquad` from the repo root, and result filenames get a
-     `_lora` suffix (`{lang}_predictions_lora.json`, `summary_lora.json`), so a
-     base-model run and a LoRA run never overwrite each other's output.
+    Context: {context}
+    Question: {question}
+    Answer:
+
+The model was trained to continue this prompt with " <answer><eos>", so greedy decoding
+stops at the eos token. Model loading (base model + LoRA adapter from the Hub), generation
+settings, answer cleaning and the SQuAD-style EM / F1 metrics (multilingual normalization,
+character-level F1 for zh/th) are unchanged. Context windowing, which training applies only
+to over-long samples, is not needed here (XQuAD paragraphs are short).
+
+NOTE: because the prompt differs from the base-model / original-prompt scripts, these
+numbers are NOT directly comparable with runs of those scripts. Result filenames get a
+`_lora_trainprompt` suffix (`{lang}_predictions_lora_trainprompt.json`,
+`summary_lora_trainprompt.json`) so they never overwrite the original-prompt LoRA results.
 
 For every language available under `data/downstream/xquad/<lang>/validation.json`,
-the model is prompted zero-shot (no in-context examples) to *generate* an answer
-given the (context, question) pair. Generated answers are scored against the gold
-answers with standard SQuAD-style Exact Match (EM) and token-level F1, using the
-multilingual normalization scheme from the official XQuAD/MLQA evaluation scripts
-(character-level matching for languages without whitespace word boundaries:
-Chinese and Thai; whitespace-token matching otherwise).
+the model is prompted zero-shot (no in-context examples) to *generate* an answer.
 
 Usage (run from eval/MidAlign/Qwen1.5-MoE-A2.7B/):
     python XQuAD_eval.py \
@@ -48,9 +45,7 @@ LoRA notes
 - `--lora_model_id` / `--lora_revision` select which Hub repo/commit the adapter is
   pulled from. If the repo is private, pass `--hf_token` or set `HF_TOKEN` (or put it
   in `--env_file`, default `.env`), same convention as the training script.
-- `--merge_lora` merges the adapter into the base weights after loading (slightly
-  faster generation); off by default so the run always reflects the adapter exactly as
-  published, un-merged.
+- `--merge_lora` merges the adapter into the base weights after loading; off by default.
 """
 
 import argparse
@@ -84,19 +79,16 @@ XQUAD_LANGS = ["ar", "de", "el", "en", "es", "hi", "ro", "ru", "th", "tr", "vi",
 # MLQA evaluation scripts).
 MIXED_SEGMENTATION_LANGS = {"zh", "th"}
 
-# Zero-shot instruction template. Kept in English on purpose: the instruction
-# language is fixed while context/question vary by target language, which is
-# the standard XTREME/XQuAD zero-shot cross-lingual transfer protocol -- we
-# want to measure the model's ability to read/answer in each language, not
-# its ability to follow instructions written in that language.
-PROMPT_TEMPLATE = (
-    "Answer the question using only the information in the context below. "
-    "Give the shortest possible answer, copied verbatim from the context, "
-    "with no explanation.\n\n"
-    "Context: {context}\n\n"
-    "Question: {question}\n\n"
-    "Answer:"
-)
+# Prompt used by the task step of training/MidAlign/Qwen1.5-MoE-A2.7B.py
+# (`squad_build_prompt`). Training target = " <answer><eos>" right after "Answer:".
+# The training SQuAD loader .strip()s context and question, so we do the same here.
+def build_prompt(context: str, question: str) -> str:
+    return (
+        f"Context: {str(context).strip()}\n"
+        f"Question: {str(question).strip()}\n"
+        f"Answer:"
+    )
+
 
 # Same env var names / precedence used by training/MidAlign/Qwen1.5-MoE-A2.7B.py
 _HF_TOKEN_ENV_VARS = ("HF_TOKEN", "HUGGINGFACE_HUB_TOKEN", "HUGGING_FACE_HUB_TOKEN")
@@ -337,7 +329,7 @@ def evaluate_language(model, tokenizer, lang, records, batch_size, max_new_token
 
     for start in tqdm(range(0, n, batch_size), desc=f"{lang}", unit="batch"):
         batch = records[start:start + batch_size]
-        prompts = [PROMPT_TEMPLATE.format(context=r["context"], question=r["question"]) for r in batch]
+        prompts = [build_prompt(r["context"], r["question"]) for r in batch]
 
         preds = generate_batch(model, tokenizer, prompts, max_new_tokens, device)
 
@@ -421,7 +413,7 @@ def main():
         print(f"  {lang}: EM={lang_result['em']:.2f}  F1={lang_result['f1']:.2f}  (n={lang_result['num_examples']})")
 
         # Save per-language predictions immediately (safe against crashes on later langs)
-        with open(os.path.join(args.output_dir, f"{lang}_predictions_lora.json"), "w", encoding="utf-8") as f:
+        with open(os.path.join(args.output_dir, f"{lang}_predictions_lora_trainprompt.json"), "w", encoding="utf-8") as f:
             json.dump(lang_result["predictions"], f, ensure_ascii=False, indent=2)
 
     # ------------------------------------------------------------------- #
@@ -443,6 +435,7 @@ def main():
         "lora_model_id": args.lora_model_id,
         "lora_revision": args.lora_revision or "main",
         "merged": args.merge_lora,
+        "prompt_format": "MidAlign training prompt (squad_build_prompt)",
     }
     for lang, r in results.items():
         summary[lang] = {"num_examples": r["num_examples"], "em": round(r["em"], 2), "f1": round(r["f1"], 2)}
@@ -463,9 +456,9 @@ def main():
     print("=" * 46)
     print(f"Total time: {time.time() - t0:.1f}s")
 
-    with open(os.path.join(args.output_dir, "summary_lora.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(args.output_dir, "summary_lora_trainprompt.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
-    print(f"\nSaved per-language predictions and summary_lora.json to: {args.output_dir}")
+    print(f"\nSaved per-language predictions and summary_lora_trainprompt.json to: {args.output_dir}")
 
 
 if __name__ == "__main__":
