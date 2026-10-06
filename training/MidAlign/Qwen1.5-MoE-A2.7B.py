@@ -29,7 +29,7 @@ LAP LAI de bat kip so task step. Ban nay lam dung nhu vay:
   * TASK = anchor. N = ceil(n_task / (task_batch_size * world_size)) = so task step MOI epoch.
     Moi epoch la 1 hoan vi (seed, epoch) cua TOAN BO pool task -> MOI sample task duoc dung >= 1 lan /
     epoch (chi toi da task_batch_size*world_size - 1 sample bi dem them 1 lan de du batch cuoi).
-  * ALIGN = pool NHO, lay NGAU NHIEN theo --seed (42): doc het flores + opus + ted (mac dinh), voi MOI
+  * ALIGN = pool NHO, lay NGAU NHIEN theo --seed (42): doc het flores + ntrex + ted (mac dinh), voi MOI
     ngon ngu gom tat ca cap eng-other tu ca 3 tap roi boc ngau nhien dung --align_pairs_per_lang cap
     (mac dinh 500 — cung bac "vai tram" cua paper; ngon ngu co it hon thi lay het) bang reservoir
     sampling seed co dinh -> pool tai lap duoc 100%.
@@ -62,13 +62,13 @@ all-reduce 1 lan duy nhat -> khong con nguy co NCCL watchdog / "marked ready twi
 Cac dieu kien giu nguyen tu ban MidAlign truoc:
   1. LoRA ap dung cho RANGE layer [L/3, 2L/3), tach bach voi layer tinh alignment loss.
      Attention / router / experts moi nhom 1 rank rieng.
-  2. Cap ngon ngu english - other, doc tu du lieu multiway-parallel JSON (flores/opus/ntrex/ted).
+  2. Cap ngon ngu english - other, doc tu du lieu multiway-parallel JSON (flores/ntrex/ted).
   3. Checkpoint chi giu ban moi nhat, push len HF Hub, resume tu checkpoint.
 
 Vi du chay (8 GPU):
     torchrun --standalone --nproc_per_node=8 Qwen1.5-MoE-A2.7B.py \\
         --model_name_or_path Qwen/Qwen1.5-MoE-A2.7B \\
-        --data_dir data/processed_alignment --alignment_data flores opus ted \\
+        --data_dir data/processed_alignment --alignment_data flores ntrex ted \\
         --align_pairs_per_lang 500 --seed 42 \\
         --squad_file data/english_task/squad/train.json \\
         --snli_file data/english_task/snli/train.json \\
@@ -170,7 +170,6 @@ def load_hf_token(env_file: Optional[str], cli_token: Optional[str]) -> Optional
 ALIGNMENT_DATASET_FILES = {
     "flores": "flores.json",
     "ntrex": "ntrex.json",
-    "opus": "opus.json",
     "ted": "ted.json",      # giong code finetuning: --alignment_data ... ted -> <data_dir>/ted.json
 }
 
@@ -207,9 +206,9 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--data_dir", type=str, default="data/processed_alignment")
     p.add_argument("--alignment_data", type=str, nargs="+",
                     choices=sorted(ALIGNMENT_DATASET_FILES.keys()),
-                    default=["flores", "opus", "ted"],
-                    help="Nguon du lieu alignment: flores | opus | ntrex | ted (1 hoac nhieu). Mac dinh flores opus ted "
-                         "(doc <data_dir>/flores.json, opus.json, ted.json).")
+                    default=["flores", "ntrex", "ted"],
+                    help="Nguon du lieu alignment: flores | ntrex | ted (1 hoac nhieu). Mac dinh flores ntrex ted "
+                         "(doc <data_dir>/flores.json, ntrex.json, ted.json).")
     p.add_argument("--data_files", type=str, nargs="+", default=None,
                     help="[Nang cao] Ghi de --alignment_data bang danh sach file JSON trong --data_dir.")
     p.add_argument("--eng_key", type=str, default="eng_Latn")
