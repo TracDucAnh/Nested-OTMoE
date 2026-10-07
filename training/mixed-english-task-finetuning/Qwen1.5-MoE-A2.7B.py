@@ -2,7 +2,7 @@
 
 How to run:
 
-torchrun --standalone --nproc_per_node=8 Qwen1.5-MoE-A2.7B-Finetuning.py \
+torchrun --standalone --nproc_per_node=8 Qwen1.5-MoE-A2.7B.py \
   --model_name_or_path Qwen/Qwen1.5-MoE-A2.7B \
   --snli_file data/english_task/snli/train.json \
   --squad_file data/english_task/squad/train.json \
@@ -1628,7 +1628,11 @@ def main():
     # Lay thang decoder + lm_head de chi tinh logits tai cac vi tri co nhan (LoRA da duoc inject
     # vao cac module ben trong nen forward qua decoder van di qua LoRA binh thuong).
     inner_lm = model.get_base_model()
-    decoder = inner_lm.get_decoder() if hasattr(inner_lm, "get_decoder") else inner_lm.model
+    decoder = getattr(inner_lm, "model", None)  # Qwen2MoeForCausalLM.model = Qwen2MoeModel (backbone)
+    if decoder is None and hasattr(inner_lm, "get_decoder"):
+        decoder = inner_lm.get_decoder()
+    if decoder is None:
+        raise RuntimeError(f"Khong tim thay decoder trong {type(inner_lm).__name__}")
     lm_head = inner_lm.get_output_embeddings()
     model_device = next(model.parameters()).device
 
