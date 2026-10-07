@@ -7,7 +7,7 @@ torchrun --standalone --nproc_per_node=8 Qwen1.5-MoE-A2.7B.py \
   --snli_file data/english_task/snli/train.json \
   --squad_file data/english_task/squad/train.json \
   --mmlu_file data/english_task/mmlu/auxiliary_train.json \
-  --max_tokens_per_batch 24576 \
+  --batch_size 8 \
   --save_steps 200 \
   --push_to_hub
 
@@ -226,12 +226,16 @@ def build_argparser() -> argparse.ArgumentParser:
 
     # Training schedule (giong cac file goc)
     p.add_argument("--num_train_epochs", type=int, default=3)
-    p.add_argument("--max_tokens_per_batch", type=int, default=24576,
-                    help="Tran so token SAU KHI PAD cua 1 batch tren MOI rank (= so sample x do dai "
-                         "sample dai nhat trong batch). 24576 ~ tuong duong batch goc (SNLI 512x~60, "
-                         "MMLU 128x~200, SQuAD 64x~300). Tang len neu con du VRAM.")
+    p.add_argument("--batch_size", type=int, default=8,
+                    help="So sample cua 1 batch tren MOI GPU/rank (co dinh). Batch toan cuc moi optimizer "
+                         "step = batch_size x so GPU. Chinh theo VRAM cua may: OOM thi giam, con du VRAM "
+                         "thi tang.")
+    p.add_argument("--max_tokens_per_batch", type=int, default=0,
+                    help="MAC DINH 0 = TAT (dung --batch_size co dinh). Dat > 0 (vd 24576) de bat che do "
+                         "token-budget: batch bi gioi han boi so token SAU KHI PAD (= so sample x do dai "
+                         "sample dai nhat), toi da --max_batch_size sample; khi do --batch_size bi bo qua.")
     p.add_argument("--max_batch_size", type=int, default=512,
-                    help="Tran so sample cua 1 batch (de batch SNLI rat ngan khong phinh qua to).")
+                    help="Chi dung khi --max_tokens_per_batch > 0: tran so sample cua 1 batch.")
     p.add_argument("--min_batch_size", type=int, default=1,
                     help="Khi OOM, chunk <= gia tri nay ma van OOM thi bo qua chunk do.")
     p.add_argument("--pool_size", type=int, default=20000,
@@ -830,7 +834,9 @@ def get_or_build_dataset(args, tokenizer, tasks: List[str], rank: int, is_distri
 # Token-budget batch sampler (mix deu giua cac rank, can bang tai theo token)
 # ============================================================================================
 class TokenBudgetBatchSampler:
-    """Ke hoach batch cho 1 epoch (xac dinh hoan toan boi seed + epoch, GIONG NHAU tren moi rank):
+    """Ke hoach batch cho 1 epoch (xac dinh hoan toan boi seed + epoch, GIONG NHAU tren moi rank).
+    Mac dinh batch CO DINH `batch_size` sample/rank; neu max_tokens > 0 thi chuyen sang token-budget.
+    Cac buoc:
       1. Shuffle toan bo index -> cat thanh pool `pool_size` sample.
       2. Trong moi pool: sort theo do dai, gom tham lam thanh batch sao cho
          so_sample * do_dai_pad(sample dai nhat) <= max_tokens va so_sample <= max_batch_size
@@ -844,13 +850,14 @@ class TokenBudgetBatchSampler:
 
     def __init__(self, lengths: np.ndarray, label_tokens: np.ndarray, max_tokens: int,
                  max_batch_size: int, world_size: int, rank: int, seed: int, num_epochs: int,
-                 pool_size: int = 20000, pad_multiple: int = 8):
+                 pool_size: int = 20000, pad_multiple: int = 8, batch_size: int = 8):
         self.lengths = np.asarray(lengths, dtype=np.int64)
         self.label_tokens = np.asarray(label_tokens, dtype=np.int64)
         self.padded = ((self.lengths + pad_multiple - 1) // pad_multiple) * pad_multiple
         self._padded_list = self.padded.tolist()
         self.max_tokens = max_tokens
         self.max_batch_size = max_batch_size
+        self.batch_size = max(int(batch_size), 1)  # chi dung khi max_tokens <= 0 (batch co dinh)
         self.world_size = max(world_size, 1)
         self.rank = rank
         self.seed = seed
@@ -867,7 +874,8 @@ class TokenBudgetBatchSampler:
         if self.steps_per_epoch <= 0:
             raise RuntimeError(
                 f"Khong du du lieu de tao 1 step (world_size={self.world_size}, "
-                f"max_tokens_per_batch={max_tokens}). Giam --max_tokens_per_batch hoac them du lieu."
+                f"batch_size={self.batch_size}, max_tokens_per_batch={max_tokens}). "
+                f"Giam --batch_size (hoac --max_tokens_per_batch) hoac them du lieu."
             )
         self.n_batches_epoch0 = len(first_batches)
         padded_total = sum(len(b) * self._padded_list[b[-1]] if False else
@@ -887,11 +895,17 @@ class TokenBudgetBatchSampler:
             cur: List[int] = []
             for i in pool:
                 pad_len = plist[i]  # tang dan => sample hien tai la dai nhat trong batch
-                if cur and ((len(cur) + 1) * pad_len > self.max_tokens or len(cur) >= self.max_batch_size):
+                if self.max_tokens > 0:  # che do token-budget
+                    flush = bool(cur) and ((len(cur) + 1) * pad_len > self.max_tokens
+                                           or len(cur) >= self.max_batch_size)
+                else:  # che do batch co dinh: du batch_size sample thi dong batch
+                    flush = len(cur) >= self.batch_size
+                if flush:
                     batches.append(cur)
                     cur = []
                 cur.append(i)
-            if cur:
+            # batch co dinh: bo batch cuoi chua du batch_size (toi da batch_size-1 sample/pool/epoch)
+            if cur and (self.max_tokens > 0 or len(cur) >= self.batch_size):
                 batches.append(cur)
         rng.shuffle(batches)
         return batches
@@ -1427,7 +1441,7 @@ Phan sau `Answer:` la phan model sinh ra va la phan DUY NHAT duoc tinh loss.
 
 ## Training
 - {args.num_train_epochs} epoch, lr = {args.learning_rate}, warmup = {args.warmup_ratio}, grad clip = {args.gradient_clip_norm}
-- Token-budget batching: toi da {args.max_tokens_per_batch} token (sau pad) va {args.max_batch_size} sample moi batch moi GPU.
+- Batch: {"token-budget, toi da " + str(args.max_tokens_per_batch) + " token (sau pad) va " + str(args.max_batch_size) + " sample" if args.max_tokens_per_batch > 0 else "co dinh " + str(args.batch_size) + " sample"} moi batch moi GPU.
 - `max_length` = {args.max_length}; context SQuAD qua dai duoc windowing quanh vi tri dap an.
 
 ## Diagnostics
@@ -1548,12 +1562,15 @@ def main():
     batch_sampler = TokenBudgetBatchSampler(
         lengths, label_tokens, max_tokens=args.max_tokens_per_batch, max_batch_size=args.max_batch_size,
         world_size=world_size, rank=rank, seed=args.seed, num_epochs=args.num_train_epochs,
-        pool_size=args.pool_size,
+        pool_size=args.pool_size, batch_size=args.batch_size,
     )
     steps_per_epoch = batch_sampler.steps_per_epoch
     total_steps = steps_per_epoch * args.num_train_epochs
+    batch_mode = (f"Token-budget batching (max_tokens={args.max_tokens_per_batch})"
+                  if args.max_tokens_per_batch > 0
+                  else f"Batch co dinh {args.batch_size} sample/GPU (batch toan cuc = {args.batch_size * world_size})")
     logger.info(
-        f"Token-budget batching: ~{batch_sampler.mean_batch_size:.1f} sample/batch, "
+        f"{batch_mode}: ~{batch_sampler.mean_batch_size:.1f} sample/batch, "
         f"padding efficiency ~{batch_sampler.padding_efficiency * 100:.1f}%, "
         f"{steps_per_epoch} step/epoch x {args.num_train_epochs} epoch = {total_steps} step "
         f"(world_size={world_size})."
@@ -1668,7 +1685,7 @@ def main():
                     f"Ke hoach batch hien tai (steps_per_epoch={steps_per_epoch}, world_size={world_size}) "
                     f"KHAC luc luu checkpoint (steps_per_epoch={state.get('steps_per_epoch')}, "
                     f"world_size={state.get('world_size')}) -> vi tri resume trong epoch co the khong khop. "
-                    f"Nen giu nguyen world_size/--max_tokens_per_batch/--max_batch_size/--pool_size/--seed/--tasks."
+                    f"Nen giu nguyen world_size/--batch_size/--max_tokens_per_batch/--max_batch_size/--pool_size/--seed/--tasks."
                 )
             if start_step_in_epoch >= steps_per_epoch:
                 start_epoch += 1
