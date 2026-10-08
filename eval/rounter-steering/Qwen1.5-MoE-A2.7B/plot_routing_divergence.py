@@ -35,6 +35,7 @@ Outputs (in --output_dir)
     routing_divergence.json   per-language x per-layer divergence (also the resume checkpoint)
     routing_divergence.csv    same numbers as a table
     routing_divergence_u_shape.png / .pdf
+    routing_divergence_mean_std.png / .pdf   mean (bold line) +- 1 std (faint band) across all languages
 
 Resume: languages already present in routing_divergence.json (same settings) are skipped.
 Use --overwrite to start from scratch.
@@ -281,6 +282,47 @@ def plot_u_shape(div, layers, legend_langs, png_path, model_name, mark_layers=No
     plt.close(fig)
 
 
+def plot_mean_std(div, layers, png_path, model_name, mark_layers=None, dpi=200):
+    """Per-layer mean divergence across ALL languages (bold line) with a faint +-1 std band.
+    std is the population std (ddof=0) over the languages, computed independently at each layer."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    arr = np.array([div[l] for l in div], dtype=np.float64)  # (n_langs, L)
+    mean = np.nanmean(arr, axis=0)
+    std = np.nanstd(arr, axis=0)
+    x = np.asarray(layers)
+    n_langs = arr.shape[0]
+    color = "#1f77b4"
+
+    fig, ax = plt.subplots(figsize=(13, 6.5))
+    ax.fill_between(x, mean - std, mean + std, color=color, alpha=0.2, linewidth=0, zorder=2,
+                    label=r"$\pm$1 std across languages")
+    ax.plot(x, mean, color=color, lw=3.2, marker="o", ms=4.5, zorder=5,
+            label=f"Mean over {n_langs} languages")
+
+    if mark_layers:
+        a, b = mark_layers
+        ax.axvspan(a - 0.5, b + 0.5, color="gray", alpha=0.13, zorder=0)
+        ax.text((a + b) / 2, 0.985, f"Steering layers {a}\u2013{b}", ha="center", va="top",
+                transform=ax.get_xaxis_transform(), fontsize=10, color="dimgray")
+
+    ax.set_xlabel("Layer Number", fontsize=12)
+    ax.set_ylabel("Mean JS-div (entropy-normalized)", fontsize=12)
+    ax.set_xticks(x if len(x) <= 30 else x[:: max(1, len(x) // 24)])
+    ax.set_xlim(x.min() - 0.5, x.max() + 0.5)
+    ax.grid(True, alpha=0.3)
+    ax.set_title(f"Routing Divergence from English, per Layer: mean \u00b1 std\n"
+                 f"[{model_name}] \u2013 {n_langs} FLORES-200 languages", fontsize=14, fontweight="bold")
+    ax.legend(loc="upper center", frameon=True, fontsize=10).get_frame().set_alpha(0.95)
+
+    fig.savefig(png_path, dpi=dpi, bbox_inches="tight")
+    fig.savefig(os.path.splitext(png_path)[0] + ".pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
 def write_csv(path, div, layers):
     with open(path, "w", encoding="utf-8") as f:
         f.write("language,name," + ",".join(f"layer_{l}" for l in layers) + "\n")
@@ -322,6 +364,7 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     json_path = os.path.join(args.output_dir, "routing_divergence.json")
     png_path = os.path.join(args.output_dir, "routing_divergence_u_shape.png")
+    mean_std_path = os.path.join(args.output_dir, "routing_divergence_mean_std.png")
     model_short = args.model_name_or_path.rstrip("/").split("/")[-1]
 
     cache = {"meta": {}, "layers": [], "divergence": {}}
@@ -399,9 +442,11 @@ def main():
         print(f"[WARN] legend languages not available and skipped: {missing}")
 
     plot_u_shape(div, layers, args.legend_langs, png_path, model_short, args.mark_layers, args.dpi)
+    plot_mean_std(div, layers, mean_std_path, model_short, args.mark_layers, args.dpi)
     write_csv(os.path.join(args.output_dir, "routing_divergence.csv"), div, layers)
     print_layer_summary(div, layers)
-    print(f"\nSaved: {png_path}\nSaved: {os.path.splitext(png_path)[0]}.pdf\nSaved: {json_path}")
+    print(f"\nSaved: {png_path}\nSaved: {os.path.splitext(png_path)[0]}.pdf"
+          f"\nSaved: {mean_std_path}\nSaved: {os.path.splitext(mean_std_path)[0]}.pdf\nSaved: {json_path}")
 
 
 if __name__ == "__main__":
