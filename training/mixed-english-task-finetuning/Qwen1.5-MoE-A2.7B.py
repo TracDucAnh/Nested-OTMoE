@@ -358,9 +358,12 @@ def setup_distributed(nccl_timeout_minutes: int):
     return rank, local_rank, world_size, is_distributed, device
 
 
-def cleanup_distributed(is_distributed: bool):
+def cleanup_distributed(is_distributed: bool, barrier: bool = True):
+    """barrier=False khi dang thoat vi loi/ngat: neu 1 rank crash ma van cho o barrier thi no se doi
+    cac rank khac (dang ket o collective khac) -> ca job treo thay vi crash kem traceback."""
     if is_distributed and dist.is_available() and dist.is_initialized():
-        dist.barrier()
+        if barrier:
+            dist.barrier()
         dist.destroy_process_group()
 
 
@@ -390,10 +393,18 @@ def sync_grads_across_ranks(trainable_params: List[torch.nn.Parameter]):
     theo token tren toan bo global batch."""
     from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
+    # QUAN TRONG (MoE): expert nao khong nhan token tren rank nay thi LoRA cua no khong nam trong do
+    # thi autograd -> p.grad = None. Moi rank co batch khac nhau nen tap param co grad KHAC NHAU giua
+    # cac rank -> buffer phang khac kich thuoc -> all_reduce lech -> NCCL treo (hoac cong sai grad).
+    # Giai phap: param nao chua co grad thi dien 0, de moi rank luon all-reduce dung cung 1 danh
+    # sach tensor (theo thu tu trainable_params) va cung kich thuoc buffer.
+    for p in trainable_params:
+        if p.grad is None:
+            p.grad = torch.zeros_like(p)
+
     grads_by_dtype: Dict[torch.dtype, List[torch.Tensor]] = {}
     for p in trainable_params:
-        if p.grad is not None:
-            grads_by_dtype.setdefault(p.grad.dtype, []).append(p.grad)
+        grads_by_dtype.setdefault(p.grad.dtype, []).append(p.grad)
 
     for grads in grads_by_dtype.values():
         flat = _flatten_dense_tensors(grads)
@@ -1712,6 +1723,7 @@ def main():
     # ------------------------------------------------------------------------------ training loop
     model.train()
     last_epoch, last_step_in_epoch = start_epoch, max(start_step_in_epoch - 1, 0)
+    training_ok = False  # chi True khi train xong binh thuong -> moi duoc barrier trong cleanup
     try:
         for epoch in range(start_epoch, args.num_train_epochs):
             plan = batch_sampler.plan(epoch)
@@ -1791,6 +1803,7 @@ def main():
             logger.info("Training hoan tat.")
         if is_distributed:
             dist.barrier()
+        training_ok = True
 
     except KeyboardInterrupt:
         logger.warning("Nhan KeyboardInterrupt — luu checkpoint khan cap truoc khi thoat ...")
@@ -1804,7 +1817,7 @@ def main():
             pusher.wait()
         for h in hooks:
             h.remove()
-        cleanup_distributed(is_distributed)
+        cleanup_distributed(is_distributed, barrier=training_ok)
 
 
 if __name__ == "__main__":
