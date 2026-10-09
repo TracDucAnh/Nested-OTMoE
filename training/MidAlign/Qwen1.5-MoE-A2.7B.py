@@ -18,7 +18,8 @@ step CHI toi uu MOT trong hai objective, xen ke theo step:
   - step LE (1, 3, 5, ...) = ALIGN (contrastive) step:
         L_align = Eq.(1) paper (MOT CHIEU) giua mean-pooled hidden state cua cau tieng Anh va cau
         target (cap english-other), tai DUNG 1 layer (--align_layer, mac dinh TU DONG
-        = num_hidden_layers // 2 cua backbone dang load).
+        = layer GIUA cua khoang layer finetune LoRA: block (min+max)//2 cua --layers, vd --layers 7-14
+        -> block 10 (0-indexed) = --align_layer 11; khong co --layers thi khoang [L/3, 2L/3)).
 
 VAI TRO DATA (DUNG NHU PAPER): TASK LA ANCHOR, ALIGNMENT DATA NHO VA LAP LAI
 -----------------------------------------------------------------------------
@@ -60,8 +61,10 @@ Dong bo gradient: all-reduce gradient thu cong (khong DDP). Sau backward, MOI th
 all-reduce 1 lan duy nhat -> khong con nguy co NCCL watchdog / "marked ready twice".
 
 Cac dieu kien giu nguyen tu ban MidAlign truoc:
-  1. LoRA ap dung cho RANGE layer [L/3, 2L/3), tach bach voi layer tinh alignment loss.
-     Attention / router / experts moi nhom 1 rank rieng.
+  1. LoRA mac dinh ap dung cho RANGE layer [L/3, 2L/3), tach bach voi layer tinh alignment loss.
+     Co the chi dinh chinh xac cac layer can finetune bang --layers (vd: --layers 8-15 hoac
+     --layers 4,5,6,10-12; chi so block tinh tu 0, khoang a-b dong ca 2 dau); khong truyen thi
+     dung mac dinh [L/3, 2L/3). Attention / router / experts moi nhom 1 rank rieng.
   2. Cap ngon ngu english - other, doc tu du lieu multiway-parallel JSON (flores/ntrex/ted).
   3. Checkpoint chi giu ban moi nhat, push len HF Hub, resume tu checkpoint.
 
@@ -275,7 +278,9 @@ def build_argparser() -> argparse.ArgumentParser:
     # MidAlign: alignment objective
     p.add_argument("--align_layer", type=int, default=None,
                     help="Layer lay hidden state cho contrastive loss (hidden_states[align_layer]). "
-                         "None = TU DONG num_hidden_layers // 2 cua backbone dang load.")
+                         "Chi so 1-indexed (hidden_states[i] = output cua block i-1). None = TU DONG lay "
+                         "layer GIUA khoang layer finetune: block (min+max)//2 cua --layers (vd 7-14 -> "
+                         "block 10 0-indexed -> align_layer = 11); khong co --layers thi dung [L/3, 2L/3).")
     p.add_argument("--align_temperature", type=float, default=1.5,
                     help="tau (paper: tim trong {0.1,1.0,1.5,2.0}; Qwen dung 1.5, Llama 0.1).")
     p.add_argument("--align_loss", type=str, default="oneway", choices=["oneway", "symmetric"],
@@ -312,6 +317,11 @@ def build_argparser() -> argparse.ArgumentParser:
                     help="Rank cho gate/up/down_proj cua experts VA shared_expert.")
     p.add_argument("--lora_alpha", type=int, default=16)
     p.add_argument("--lora_dropout", type=float, default=0.1)
+    p.add_argument("--layers", type=str, default=None,
+                    help="Danh sach layer (block, chi so tu 0) duoc finetune LoRA. Vi du: '8,9,10' hoac "
+                         "'8-15' hoac '0-3,10,12-14' (khoang a-b gom ca a va b). Neu KHONG truyen thi "
+                         "mac dinh finetune cac layer [L/3, 2L/3). Khac voi --align_layer (layer tinh "
+                         "contrastive loss).")
 
     # Checkpoint / resume
     p.add_argument("--save_steps", type=int, default=200)
@@ -1032,6 +1042,58 @@ def get_num_layers(config) -> int:
         if hasattr(config, attr):
             return int(getattr(config, attr))
     raise ValueError("Khong tim thay so luong layer trong model.config. Hay kiem tra ten attribute.")
+
+
+def parse_layers_arg(spec: str, num_layers: int) -> List[int]:
+    """Parse chuoi --layers ('8,9,10', '8-15', '0-3,10,12-14') thanh list layer da sap xep, khong trung.
+    Khoang a-b la dong (gom ca a va b). Bao loi neu sai cu phap hoac chi so ngoai [0, num_layers)."""
+    indices = set()
+    for part in spec.replace(" ", "").split(","):
+        if not part:
+            continue
+        try:
+            if "-" in part:
+                lo_s, hi_s = part.split("-", 1)
+                lo, hi = int(lo_s), int(hi_s)
+                if lo > hi:
+                    raise ValueError(f"khoang '{part}' co dau > cuoi")
+                indices.update(range(lo, hi + 1))
+            else:
+                indices.add(int(part))
+        except ValueError as e:
+            raise ValueError(f"--layers '{spec}' khong hop le tai '{part}': {e}") from e
+    if not indices:
+        raise ValueError(f"--layers '{spec}' khong chua layer nao.")
+    bad = sorted(i for i in indices if i < 0 or i >= num_layers)
+    if bad:
+        raise ValueError(f"--layers co chi so ngoai pham vi [0, {num_layers - 1}]: {bad}")
+    return sorted(indices)
+
+
+def format_layers(layers: Sequence[int]) -> str:
+    """[8,9,10,12] -> '8-10, 12' (de log / model card)."""
+    parts, start, prev = [], None, None
+    for i in sorted(layers):
+        if start is None:
+            start = prev = i
+        elif i == prev + 1:
+            prev = i
+        else:
+            parts.append(f"{start}-{prev}" if prev > start else f"{start}")
+            start = prev = i
+    if start is not None:
+        parts.append(f"{start}-{prev}" if prev > start else f"{start}")
+    return ", ".join(parts)
+
+
+def infer_align_layer_from_lora_range(lora_layers: Sequence[int]) -> int:
+    """Tu dong chon align_layer = layer GIUA cua KHOANG layer finetune LoRA [min, max] (khoang bao
+    gom ca 2 dau, ke ca khi --layers khong lien tuc). Block 0-indexed o giua = (min + max) // 2
+    (so layer chan -> lay layer giua BEN TRAI), vd khoang 7..14 -> block 10.
+    Tra ve align_layer theo quy uoc 1-indexed cua hidden_states (= block 0-indexed + 1), vd 7..14 -> 11.
+    Voi mac dinh [L/3, 2L/3) cua backbone 24 layer = 8..15 -> block 11 -> align_layer 12 (nhu truoc).
+    """
+    return (min(lora_layers) + max(lora_layers)) // 2 + 1
 
 
 def infer_middle_layer(num_layers: int) -> int:
@@ -1768,7 +1830,7 @@ def plot_all(jsonl_path, task_png, align_png, align_layer, smooth_window):
 # Hugging Face Hub push
 # ============================================================================================
 def build_model_card(args, num_experts, top_k, align_layer_0based, num_layers,
-                      lora_layer_start, lora_layer_end, n_task, n_align, steps_per_side,
+                      lora_layers, n_task, n_align, steps_per_side,
                       task_stats, world_size) -> str:
     task_lines = "\n".join(f"  - {k}: {v['kept']} sample (doc {v['loaded']}, bo {v['dropped']})"
                            for k, v in task_stats.items())
@@ -1807,7 +1869,7 @@ Training: step chan = task step (LM loss), step le = contrastive align step.
   task_batch_size = {args.task_batch_size} (per-rank), task_micro_batch_tokens = {args.task_micro_batch_tokens}.
 
 ## LoRA
-- Range layer `[{lora_layer_start}, {lora_layer_end})` (0-indexed), attention / router / experts + shared expert.
+- Layer finetune: `{format_layers(lora_layers)}` ({len(lora_layers)} layer, 0-indexed){' - chi dinh qua --layers' if args.layers else ' - mac dinh [L/3, 2L/3)'}, attention / router / experts + shared expert.
 - Rank: attention {args.lora_r_attn}, router {args.lora_r_router}, experts {args.lora_r_expert};
   alpha = {args.lora_alpha}, dropout = {args.lora_dropout}.
 
@@ -1916,24 +1978,35 @@ def main():
     base_model.to(device)
 
     num_layers = get_num_layers(base_model.config)
+    if args.layers:
+        lora_layers = parse_layers_arg(args.layers, num_layers)
+        layers_src = "chon qua --layers"
+    else:
+        # Mac dinh: [L/3, 2L/3) (exclusive o cuoi)
+        lora_layers = list(range(num_layers // 3, (2 * num_layers) // 3))
+        layers_src = "mac dinh [L/3, 2L/3)"
+    layer_indices = set(lora_layers)
+
     if args.align_layer is None:
-        args.align_layer = infer_middle_layer(num_layers)
-        logger.info(f"--align_layer khong duoc chi dinh -> middle layer = {args.align_layer} "
-                    f"(num_hidden_layers={num_layers}, num_layers // 2).")
+        args.align_layer = infer_align_layer_from_lora_range(lora_layers)
+        logger.info(f"--align_layer khong duoc chi dinh -> lay layer GIUA khoang LoRA "
+                    f"[{min(lora_layers)}, {max(lora_layers)}]: block {args.align_layer - 1} (0-indexed) "
+                    f"-> align_layer = {args.align_layer} (num_hidden_layers={num_layers}).")
     if not (1 <= args.align_layer <= num_layers):
         raise ValueError(f"--align_layer={args.align_layer} phai nam trong [1, {num_layers}].")
     align_layer_0based = args.align_layer - 1
 
-    lora_layer_start = num_layers // 3
-    lora_layer_end = (2 * num_layers) // 3  # exclusive
-    layer_indices = set(range(lora_layer_start, lora_layer_end))
     logger.info(f"Tong so layer = {num_layers}. Align tai layer {args.align_layer} "
-                f"(block 0-indexed {align_layer_0based}). LoRA tren range "
-                f"[{lora_layer_start}, {lora_layer_end}) ({len(layer_indices)} layer).")
-    if align_layer_0based not in layer_indices:
-        logger.warning(f"[canh bao] align layer (block {align_layer_0based}) nam NGOAI range LoRA "
-                       f"[{lora_layer_start}, {lora_layer_end}) -> contrastive loss khong day "
-                       f"gradient vao tham so LoRA nao.")
+                f"(block 0-indexed {align_layer_0based}). LoRA tren layer {layers_src}: "
+                f"{format_layers(lora_layers)} ({len(lora_layers)} layer).")
+    if min(lora_layers) > align_layer_0based:
+        logger.warning(f"[canh bao] moi layer LoRA ({format_layers(lora_layers)}) deu nam SAU align layer "
+                       f"(block {align_layer_0based}) -> contrastive loss khong day gradient vao "
+                       f"tham so LoRA nao.")
+    elif align_layer_0based not in layer_indices:
+        logger.warning(f"[canh bao] align layer (block {align_layer_0based}) khong thuoc cac layer LoRA "
+                       f"({format_layers(lora_layers)}); chi cac layer LoRA <= block {align_layer_0based} "
+                       f"nhan gradient tu contrastive loss.")
 
     target_modules = build_lora_target_modules(base_model, layer_indices)
     if not target_modules:
@@ -2103,7 +2176,7 @@ def main():
     torch.manual_seed(args.seed + 7919 * rank + global_step)
 
     readme_text = build_model_card(args, num_experts, top_k, align_layer_0based, num_layers,
-                                    lora_layer_start, lora_layer_end, n_task, n_align, N,
+                                    lora_layers, n_task, n_align, N,
                                     task_stats, world_size)
 
     def _save_and_push(epoch_, step_in_epoch_, final=False):

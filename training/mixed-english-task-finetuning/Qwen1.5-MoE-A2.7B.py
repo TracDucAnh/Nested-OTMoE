@@ -21,8 +21,11 @@ Loss = L_LM (cross-entropy chuan, CHI tinh tren token cua phan dap an "<answer><
        trong khoang layer duoc gan LoRA).
 
 GIU NGUYEN so voi 3 file goc (cung 1 setting cho ca 3 task):
-  1. LoRA chi ap dung tren middle layers [L/3, 2L/3), chi len attention / router / experts,
+  1. LoRA mac dinh chi ap dung tren middle layers [L/3, 2L/3), chi len attention / router / experts,
      moi thanh phan mot rank rieng (router r=4, attention r=16, experts r=16), alpha=32, dropout=0.05.
+     Co the chi dinh chinh xac cac layer can finetune bang --layers (vd: --layers 8-15 hoac
+     --layers 4,5,6,10-12; chi so tinh tu 0, khoang a-b la dong ca 2 dau). Neu khong truyen --layers
+     thi dung mac dinh [L/3, 2L/3).
   2. Prompt format, mask loss, windowing context cua SQuAD, loc sample qua dai, lb_loss_coef=0.01,
      lr 2e-4, 3 epoch, warmup 3%, grad clip 1.0 — deu nhu cac file goc.
   3. Checkpointing + resume (--resume_from_checkpoint auto), luu moi --save_steps step, push hub.
@@ -267,8 +270,14 @@ def build_argparser() -> argparse.ArgumentParser:
                     help="Rank LoRA rieng cho cac expert FFN (mac dinh 16).")
     p.add_argument("--lora_alpha", type=int, default=32)
     p.add_argument("--lora_dropout", type=float, default=0.05)
-    p.add_argument("--lora_layer_start_ratio", type=float, default=1.0 / 3.0)
-    p.add_argument("--lora_layer_end_ratio", type=float, default=2.0 / 3.0)
+    p.add_argument("--layers", type=str, default=None,
+                    help="Danh sach layer duoc finetune (chi so tu 0). Vi du: '8,9,10' hoac '8-15' "
+                         "hoac '0-3,10,12-14' (khoang a-b bao gom ca a va b). Neu KHONG truyen thi "
+                         "mac dinh finetune cac layer [L/3, 2L/3).")
+    p.add_argument("--lora_layer_start_ratio", type=float, default=1.0 / 3.0,
+                    help="Chi dung khi KHONG co --layers: layer bat dau = int(L * ratio).")
+    p.add_argument("--lora_layer_end_ratio", type=float, default=2.0 / 3.0,
+                    help="Chi dung khi KHONG co --layers: layer ket thuc (loai tru) = int(L * ratio).")
 
     # Checkpoint / resume
     p.add_argument("--save_steps", type=int, default=200,
@@ -945,6 +954,49 @@ def get_num_layers(config) -> int:
     raise ValueError("Khong tim thay so luong layer trong model.config. Hay kiem tra ten attribute.")
 
 
+def parse_layers_arg(spec: str, num_layers: int) -> List[int]:
+    """Parse chuoi --layers ('8,9,10', '8-15', '0-3,10,12-14') thanh list layer da sap xep, khong trung.
+    Khoang a-b la dong (gom ca a va b). Bao loi neu sai cu phap hoac chi so ngoai [0, num_layers)."""
+    indices = set()
+    for part in spec.replace(" ", "").split(","):
+        if not part:
+            continue
+        try:
+            if "-" in part:
+                lo_s, hi_s = part.split("-", 1)
+                lo, hi = int(lo_s), int(hi_s)
+                if lo > hi:
+                    raise ValueError(f"khoang '{part}' co dau > cuoi")
+                indices.update(range(lo, hi + 1))
+            else:
+                indices.add(int(part))
+        except ValueError as e:
+            raise ValueError(f"--layers '{spec}' khong hop le tai '{part}': {e}") from e
+    if not indices:
+        raise ValueError(f"--layers '{spec}' khong chua layer nao.")
+    bad = sorted(i for i in indices if i < 0 or i >= num_layers)
+    if bad:
+        raise ValueError(f"--layers co chi so ngoai pham vi [0, {num_layers - 1}]: {bad}")
+    return sorted(indices)
+
+
+def format_layers(layers: Sequence[int]) -> str:
+    """[8,9,10,12] -> '8-10, 12' (de log / model card)."""
+    layers = sorted(layers)
+    parts, start, prev = [], None, None
+    for i in layers:
+        if start is None:
+            start = prev = i
+        elif i == prev + 1:
+            prev = i
+        else:
+            parts.append(f"{start}-{prev}" if prev > start else f"{start}")
+            start = prev = i
+    if start is not None:
+        parts.append(f"{start}-{prev}" if prev > start else f"{start}")
+    return ", ".join(parts)
+
+
 def is_router_leaf_name(name: str) -> bool:
     leaf = name.split(".")[-1]
     return leaf in ("gate", "router", "gating") and ".experts." not in name
@@ -1381,7 +1433,7 @@ def plot_all(jsonl_path, diagnostics_dir, task_names: List[str], window: int):
 # ============================================================================================
 # Hugging Face Hub push (bat dong bo, khong upload optimizer state)
 # ============================================================================================
-def build_model_card(args, tasks, task_counts, num_experts, top_k, layer_start, layer_end, num_layers) -> str:
+def build_model_card(args, tasks, task_counts, num_experts, top_k, layers, num_layers) -> str:
     counts_str = ", ".join(f"{t}: {task_counts.get(t, 0)}" for t in tasks)
     return f"""---
 license: apache-2.0
@@ -1438,7 +1490,7 @@ Answer: <letter>
 Phan sau `Answer:` la phan model sinh ra va la phan DUY NHAT duoc tinh loss.
 
 ## Cau hinh LoRA
-- Layer duoc finetune: `[{layer_start}, {layer_end})` trong tong so `{num_layers}` layer (khoang 1L/3 -> 2L/3).
+- Layer duoc finetune: `{format_layers(layers)}` ({len(layers)} layer) trong tong so `{num_layers}` layer{' (chi dinh qua --layers)' if args.layers else ' (mac dinh 1L/3 -> 2L/3)'}.
 - Module gan LoRA: **attention** (r = {args.lora_r_attention}), **router** (r = {args.lora_r_router}),
   **experts** (r = {args.lora_r_experts}) trong khoang layer tren (rank rieng qua `rank_pattern` cua PEFT).
 - alpha = {args.lora_alpha}, dropout = {args.lora_dropout}
@@ -1598,10 +1650,17 @@ def main():
         base_model.to(args.device)
 
     num_layers = get_num_layers(base_model.config)
-    layer_start = int(num_layers * args.lora_layer_start_ratio)
-    layer_end = int(num_layers * args.lora_layer_end_ratio)
-    layer_indices = set(range(layer_start, layer_end))
-    logger.info(f"Tong so layer = {num_layers}. Ap dung LoRA cho layer [{layer_start}, {layer_end}).")
+    if args.layers:
+        layers_list = parse_layers_arg(args.layers, num_layers)
+        logger.info(f"Tong so layer = {num_layers}. Ap dung LoRA cho cac layer chon qua --layers: "
+                    f"{format_layers(layers_list)} ({len(layers_list)} layer).")
+    else:
+        layer_start = int(num_layers * args.lora_layer_start_ratio)
+        layer_end = int(num_layers * args.lora_layer_end_ratio)
+        layers_list = list(range(layer_start, layer_end))
+        logger.info(f"Tong so layer = {num_layers}. Khong co --layers -> mac dinh ap dung LoRA cho "
+                    f"layer [{layer_start}, {layer_end}).")
+    layer_indices = set(layers_list)
 
     target_modules, module_kinds = build_lora_target_modules(base_model, layer_indices)
     if not target_modules:
@@ -1706,7 +1765,7 @@ def main():
     if is_main_process(rank):
         with open(readme_path, "w", encoding="utf-8") as f:
             f.write(build_model_card(args, tasks, task_counts, num_experts, top_k,
-                                     layer_start, layer_end, num_layers))
+                                     layers_list, num_layers))
         if args.push_to_hub:
             pusher = AsyncHubPusher(diagnostics_dir, args.hub_model_id, args.hub_private,
                                     readme_path, hf_token)
