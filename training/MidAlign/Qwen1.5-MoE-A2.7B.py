@@ -1,89 +1,53 @@
 """
-MidAlign baseline cho mo hinh Mixture-of-Experts Qwen/Qwen1.5-MoE-A2.7B
-(kien truc Qwen2MoeForCausalLM) — TASK STEP = LM loss tren SQuAD + SNLI + MMLU (English-only).
+MidAlign baseline cho Qwen/Qwen1.5-MoE-A2.7B (Qwen2MoeForCausalLM) — Alternate Training:
 
-Adapt tu "Middle-Layer Representation Alignment for Cross-Lingual Transfer in Fine-Tuned
-LLMs" (Liu & Niehues, 2025), dung Alternate Training (Figure 2 trong paper): moi optimizer
-step CHI toi uu MOT trong hai objective, xen ke theo step:
+    step CHAN (0, 2, 4, ...) = TASK step     : GIONG HET Qwen1.5-MoE-A2.7B.py (finetuning english MIX task:
+                                               SNLI + SQuAD + MMLU, LM loss CHI tren phan dap an)
+    step LE   (1, 3, 5, ...) = ALIGN step    : contrastive Eq.(1) MidAlign (Liu & Niehues, 2025) tai 1 middle layer
+                                               tren cap song song english-other  <-- PHAN THEM VAO DUY NHAT
 
-  - step CHAN (0, 2, 4, ...) = TASK step:
-        L_task = L_LM (+ lb_loss_coef * L_LB, phu tro cho backbone MoE)
-        L_LM  : cross-entropy chuan, CHI tinh tren phan dap an (<answer>/<label>/<letter><eos>),
-                prompt bi mask -100 — DUNG cach doc du lieu + build prompt + mask cua cac file
-                finetuning english-task-only (Qwen1.5-MoE-A2.7B-SQuAD/SNLI/MMLU.py):
-                  SQuAD: "Context: ...\nQuestion: ...\nAnswer: <answer><eos>" (co context windowing)
-                  SNLI : "Premise/Hypothesis/Question/Answer: <entailment|neutral|contradiction><eos>"
-                  MMLU : "The following are multiple choice questions ... Answer: <letter><eos>"
-        Ba tap duoc GOP THANH 1 POOL DUY NHAT, moi task step lay 1 batch tu pool nay.
-  - step LE (1, 3, 5, ...) = ALIGN (contrastive) step:
-        L_align = Eq.(1) paper (MOT CHIEU) giua mean-pooled hidden state cua cau tieng Anh va cau
-        target (cap english-other), tai DUNG 1 layer (--align_layer, mac dinh TU DONG
-        = layer GIUA cua khoang layer finetune LoRA: block (min+max)//2 cua --layers, vd --layers 7-14
-        -> block 10 (0-indexed) = --align_layer 11; khong co --layers thi khoang [L/3, 2L/3)).
+NGUYEN TAC: bo phan ALIGN ra thi chuoi TASK step phai la chuoi step cua file finetuning english mix task.
+Vi vay moi thu cua task step duoc lay NGUYEN VAN tu file finetuning:
+  * doc du lieu, build prompt, windowing SQuAD, loc do dai, tokenize 1 lan, mask nhan (prompt = khong tinh loss)
+  * thu tu task mac dinh snli,squad,mmlu (-> cung thu tu noi du lieu)
+  * TokenBudgetBatchSampler (batch co dinh --batch_size sample / rank, pool sort theo do dai, shuffle batch);
+    cung seed + world_size + batch_size => cung chuoi batch nhu file finetuning
+  * L_task = sum CE(token nhan) / TONG token nhan TOAN CUC cua step + lb_loss_coef * L_LB
+    (L_LB tinh gop token cua moi router layer nhu HF load_balancing_loss_func), gradient all-reduce SUM
+  * dynamic OOM handling, clip grad 1.0, AdamW (weight_decay 0)
+  * hyper-param: lr 2e-4, warmup 3% roi GIAM TUYEN TINH ve 0, 3 epoch, lb_loss_coef 0.01,
+    LoRA router r=4 / attention r=16 / experts r=16, alpha=32, dropout=0.05, layers = [L/3, 2L/3) hoac --layers
+  * KHONG LoRA len shared_expert (file finetuning khong co) — bat lai bang --include_shared_expert
 
-VAI TRO DATA (DUNG NHU PAPER): TASK LA ANCHOR, ALIGNMENT DATA NHO VA LAP LAI
------------------------------------------------------------------------------
-Paper: task data quyet dinh do dai training (toi da 5 epoch tren task data); alignment data chi la
-"vai tram cau song song" / ngon ngu (Javanese 264, Swahili 371, Welsh 823 — Appendix B) va duoc
-LAP LAI de bat kip so task step. Ban nay lam dung nhu vay:
+Lich xen ke: moi epoch co N task step (N = steps_per_epoch cua sampler finetuning) va N align step,
+step_in_epoch chan = task, le = align. LR scheduler chi tien 1 buoc moi CAP (task k, align k), nen task step
+thu k co DUNG learning rate ma file finetuning dung o step k; align step k dung chung LR voi task step k.
+Optimizer (AdamW) la 1 doi tuong chung cho ca 2 loai step (nhu paper), moi step 1 lan optimizer.step().
 
-  * TASK = anchor. N = ceil(n_task / (task_batch_size * world_size)) = so task step MOI epoch.
-    Moi epoch la 1 hoan vi (seed, epoch) cua TOAN BO pool task -> MOI sample task duoc dung >= 1 lan /
-    epoch (chi toi da task_batch_size*world_size - 1 sample bi dem them 1 lan de du batch cuoi).
-  * ALIGN = pool NHO, lay NGAU NHIEN theo --seed (42): doc het flores + ntrex + ted (mac dinh), voi MOI
-    ngon ngu gom tat ca cap eng-other tu ca 3 tap roi boc ngau nhien dung --align_pairs_per_lang cap
-    (mac dinh 500 — cung bac "vai tram" cua paper; ngon ngu co it hon thi lay het) bang reservoir
-    sampling seed co dinh -> pool tai lap duoc 100%.
-  * Moi epoch co N align step xen ke voi N task step; moi align step can align_batch_size * world_size
-    cap -> moi epoch can N * world_size * align_batch_size cap align, lay tu pool nho bang cach LAP LAI
-    pool (nhieu luot hoan vi noi tiep). Neu --align_lang_balance (mac dinh bat, paper 4.3) thi moi ngon
-    ngu nhan ~1/L tong so mau moi epoch (resample ve phan phoi xap xi deu).
-  * Ke hoach batch xac dinh hoan toan theo (seed, epoch) nen resume giua epoch ra dung cac batch cu.
+ALIGN (giu nguyen tu ban truoc): Eq.(1) paper, 1 chieu, cosine / temperature (1.5), mean-pooled hidden state tai
+--align_layer (mac dinh = layer giua cua khoang layer LoRA), negative chi trong mini-batch 32 (--align_micro_batch_size),
+pool nho seed co dinh (--align_pairs_per_lang cap / ngon ngu tu flores+ntrex+ted), lap lai de du N align step / epoch,
+resample deu giua cac ngon ngu (--align_lang_balance). Align step dung gradient TRUNG BINH qua rank.
 
-CAC DIEU CHINH KHAC SO VOI PAPER (giu nguyen tu ban truoc)
-----------------------------------------------------------
-  * Align loss = Eq.(1) MOT CHIEU: -log exp(sim(h_s,h_t)) / sum_{v in B} exp(sim(h_s,h_v)), sim = cosine,
-    chia temperature (mac dinh 1.5 cho Qwen). --align_loss symmetric de quay lai InfoNCE doi xung.
-  * Batch: --align_batch_size / --task_batch_size la PER-RANK (mac dinh 128); contrastive chi dung
-    MINI-BATCH 32 (--align_micro_batch_size): negative CHI nam trong mini-batch 32 cap, gradient cong don
-    qua 4 mini-batch roi moi optimizer.step() (footnote 11 paper). Voi world_size > 1 effective batch =
-    128 * world_size (paper: 128 tong) — giam --*_batch_size neu muon khop effective batch cua paper.
-  * LoRA: r=8, alpha=16, dropout=0.1, nhung van gioi han o range layer [L/3, 2L/3) theo yeu cau.
-  * Toi uu: LR 5e-4, lich inverse-sqrt, warmup 0.03 (paper Appendix D.1).
-  * Khong co early stopping (khong co dev set trong pipeline nay); dung --save_steps/--num_train_epochs.
+Dong bo gradient: all-reduce thu cong (khong DDP). Task step: SUM (loss da chuan hoa theo token nhan toan cuc);
+align step: MEAN.
 
-Batch task cua moi rank tu dong chia thanh nhieu micro-batch (theo ngan sach token
---task_micro_batch_tokens, sort theo do dai de giam padding) va cong don gradient truoc
-optimizer.step(). Contrastive step khong chia micro-batch duoc ngoai mini-batch (can in-batch negatives).
-
-Dong bo gradient: all-reduce gradient thu cong (khong DDP). Sau backward, MOI tham so trainable
-(ke ca LoRA cua expert khong nhan token nao trong step do -> grad None) deu duoc dien 0 roi
-all-reduce 1 lan duy nhat -> khong con nguy co NCCL watchdog / "marked ready twice".
-
-Cac dieu kien giu nguyen tu ban MidAlign truoc:
-  1. LoRA mac dinh ap dung cho RANGE layer [L/3, 2L/3), tach bach voi layer tinh alignment loss.
-     Co the chi dinh chinh xac cac layer can finetune bang --layers (vd: --layers 8-15 hoac
-     --layers 4,5,6,10-12; chi so block tinh tu 0, khoang a-b dong ca 2 dau); khong truyen thi
-     dung mac dinh [L/3, 2L/3). Attention / router / experts moi nhom 1 rank rieng.
-  2. Cap ngon ngu english - other, doc tu du lieu multiway-parallel JSON (flores/ntrex/ted).
-  3. Checkpoint chi giu ban moi nhat, push len HF Hub, resume tu checkpoint.
-
-Vi du chay (8 GPU):
-    torchrun --standalone --nproc_per_node=8 Qwen1.5-MoE-A2.7B.py \\
+Vi du chay (8 GPU) — task step khop file finetuning (--batch_size 8):
+    torchrun --standalone --nproc_per_node=8 Qwen1.5-MoE-A2.7B-midalign.py \\
         --model_name_or_path Qwen/Qwen1.5-MoE-A2.7B \\
         --data_dir data/processed_alignment --alignment_data flores ntrex ted \\
         --align_pairs_per_lang 500 --seed 42 \\
-        --squad_file data/english_task/squad/train.json \\
         --snli_file data/english_task/snli/train.json \\
+        --squad_file data/english_task/squad/train.json \\
         --mmlu_file data/english_task/mmlu/auxiliary_train.json \\
-        --push_to_hub
+        --batch_size 8 --align_batch_size 32 --push_to_hub
 
 Smoke test (1 GPU, du lieu nho):
-    python Qwen1.5-MoE-A2.7B.py --max_task_samples 5000 --align_pairs_per_lang 50 --no_push_to_hub
+    python Qwen1.5-MoE-A2.7B-midalign.py --max_samples_per_task 2000 --align_pairs_per_lang 50 --no_push_to_hub
 
 Resume:
-    torchrun --standalone --nproc_per_node=8 Qwen1.5-MoE-A2.7B.py --resume_from_checkpoint auto
-(Resume yeu cau giu nguyen world_size, batch size va du lieu de N khong doi — se bao loi neu lech.)
+    torchrun ... --resume_from_checkpoint auto
+(giu nguyen world_size, --batch_size, --align_batch_size, --seed, --tasks, du lieu — se bao loi neu steps_per_epoch lech.)
 """
 
 import argparse
@@ -100,6 +64,7 @@ import shutil
 import string
 import time
 from datetime import timedelta
+from types import SimpleNamespace
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -108,7 +73,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from tqdm.auto import tqdm
 
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, get_linear_schedule_with_warmup
 from peft import LoraConfig, get_peft_model, PeftModel
 
 try:
@@ -197,7 +162,7 @@ def resolve_data_files(alignment_data: Sequence[str], data_files: Optional[Seque
 # ============================================================================================
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="MidAlign (alternate task-LM[SQuAD+SNLI+MMLU] / contrastive align) cho Qwen1.5-MoE-A2.7B"
+        description="MidAlign: alternate [task step = finetuning english mix SNLI+SQuAD+MMLU] / [align step = contrastive] cho Qwen1.5-MoE-A2.7B"
     )
 
     # Model / output
@@ -230,15 +195,15 @@ def build_argparser() -> argparse.ArgumentParser:
                     help="[Debug] Gioi han TONG so cap bitext sau khi da boc --align_pairs_per_lang, "
                          "None = dung het.")
 
-    # Du lieu TASK (task step, LM loss) — doc giong het cac file finetuning english-task-only
-    p.add_argument("--task_datasets", type=str, nargs="+", choices=["squad", "snli", "mmlu"],
-                    default=["squad", "snli", "mmlu"],
-                    help="Cac tap duoc gop vao pool task step.")
-    p.add_argument("--squad_file", type=str, default="data/english_task/squad/train.json")
+    # Du lieu TASK (task step) — DUNG GIONG HET file finetuning english mix task
+    p.add_argument("--tasks", type=str, default="snli,squad,mmlu",
+                    help="Task mix cho task step, cach nhau dau phay (tap con cua snli,squad,mmlu). THU TU quyet dinh "
+                         "task_id + thu tu noi du lieu -> giu mac dinh de chuoi batch khop file finetuning.")
     p.add_argument("--snli_file", type=str, default="data/english_task/snli/train.json")
+    p.add_argument("--squad_file", type=str, default="data/english_task/squad/train.json")
     p.add_argument("--mmlu_file", type=str, default="data/english_task/mmlu/auxiliary_train.json")
-    p.add_argument("--max_task_samples", type=int, default=None,
-                    help="Gioi han so sample MOI tap task (debug), None = dung het.")
+    p.add_argument("--max_samples_per_task", type=int, default=None,
+                    help="[Debug] Gioi han so sample MOI task, None = dung het.")
 
     # Hugging Face Hub
     p.add_argument("--push_to_hub", action="store_true", default=True)
@@ -250,27 +215,31 @@ def build_argparser() -> argparse.ArgumentParser:
 
     # Training schedule + batch (xem docstring dau file ve cach tinh so step)
     p.add_argument("--num_train_epochs", type=int, default=3)
+    # --- TASK step (khop file finetuning)
+    p.add_argument("--batch_size", type=int, default=8,
+                    help="TASK step: so sample cua 1 batch tren MOI rank (co dinh). Batch toan cuc moi task step = "
+                         "batch_size x world_size. Giu bang --batch_size cua file finetuning de khop task step.")
+    p.add_argument("--max_tokens_per_batch", type=int, default=0,
+                    help="MAC DINH 0 = TAT (batch co dinh --batch_size). > 0 = token-budget batching (giong file finetuning).")
+    p.add_argument("--max_batch_size", type=int, default=512, help="Chi dung khi --max_tokens_per_batch > 0.")
+    p.add_argument("--min_batch_size", type=int, default=1,
+                    help="Khi OOM, chunk <= gia tri nay ma van OOM thi bo qua chunk do.")
+    p.add_argument("--pool_size", type=int, default=20000,
+                    help="Moi epoch: shuffle toan bo sample, cat pool N sample, sort theo do dai trong pool.")
+    p.add_argument("--task_max_length", type=int, default=512,
+                    help="max_length (token) cua 1 sample task (SQuAD qua dai duoc windowing, SNLI/MMLU qua dai bi bo).")
+    # --- ALIGN step (phan them vao)
     p.add_argument("--align_batch_size", type=int, default=128,
-                    help="EFFECTIVE batch size align per-rank (paper: 128). Duoc chia thanh mini-batch "
-                         "--align_micro_batch_size de tinh contrastive loss + cong don gradient. Moi epoch "
-                         "can N * world_size * align_batch_size cap align (N tinh tu TASK); pool align nho "
-                         "duoc LAP LAI de du so cap nay (dung nhu paper).")
-    p.add_argument("--task_batch_size", type=int, default=128,
-                    help="Batch size task per-rank (so sample task / rank / task step). TASK LA ANCHOR: "
-                         "N = ceil(n_task / (task_batch_size * world_size)) = so task step = so align step "
-                         "moi epoch; MOI sample task duoc dung >= 1 lan / epoch.")
+                    help="ALIGN step: so cap align / rank / align step (paper: effective 128). Chia thanh mini-batch "
+                         "--align_micro_batch_size de tinh contrastive loss + cong don gradient. Moi epoch co N align "
+                         "step (N = so task step / epoch) -> can N * world_size * align_batch_size cap, lay tu pool nho "
+                         "bang cach LAP LAI. Chi phi align ~ align_batch_size, giam neu align step qua cham so voi task step.")
     p.add_argument("--align_micro_batch_size", type=int, default=32,
                     help="Kich thuoc MINI-BATCH contrastive (paper: 32). Negative chi nam trong mini-batch; "
                          "gradient cong don qua cac mini-batch cua 1 align step. 0 = khong chia.")
-    p.add_argument("--task_micro_batch_tokens", type=int, default=16384,
-                    help="Ngan sach token (so sample * do dai da padding) cho 1 micro-batch cua task "
-                         "step. Giam neu OOM, tang neu con du VRAM.")
     p.add_argument("--max_length", type=int, default=256,
                     help="max_length cho cau alignment (contrastive step).")
-    p.add_argument("--task_max_length", type=int, default=512,
-                    help="max_length cho sample task (SQuAD can 512; sample SQuAD dai hon duoc "
-                         "windowing, MMLU/SNLI dai hon bi bo).")
-    p.add_argument("--learning_rate", type=float, default=5e-4)
+    p.add_argument("--learning_rate", type=float, default=2e-4)
     p.add_argument("--weight_decay", type=float, default=0.0)
     p.add_argument("--warmup_ratio", type=float, default=0.03)
     p.add_argument("--gradient_clip_norm", type=float, default=1.0)
@@ -303,20 +272,24 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--no_mask_false_negatives", dest="mask_false_negatives", action="store_false")
 
     # MoE loss (phu tro cho task step)
-    p.add_argument("--lb_loss_coef", type=float, default=None,
-                    help="He so load-balancing loss. None = config.router_aux_loss_coef, fallback "
-                         "0.01. Dat 0 de task loss la LM thuan tuy.")
+    p.add_argument("--lb_loss_coef", type=float, default=0.01,
+                    help="He so load-balancing loss cua TASK step. Mac dinh 0.01 nhu file finetuning. "
+                         "Truyen -1 de lay config.router_aux_loss_coef cua model.")
     p.add_argument("--num_local_experts", type=int, default=None)
     p.add_argument("--num_experts_per_tok", type=int, default=None)
 
     # LoRA
-    p.add_argument("--lora_r", type=int, default=8, help="Rank fallback (paper: 8).")
-    p.add_argument("--lora_r_router", type=int, default=8)
-    p.add_argument("--lora_r_attn", type=int, default=8)
-    p.add_argument("--lora_r_expert", type=int, default=8,
-                    help="Rank cho gate/up/down_proj cua experts VA shared_expert.")
-    p.add_argument("--lora_alpha", type=int, default=16)
-    p.add_argument("--lora_dropout", type=float, default=0.1)
+    p.add_argument("--lora_r", type=int, default=16, help="Rank fallback (khong dung khi 3 nhom deu co rank rieng).")
+    p.add_argument("--lora_r_router", type=int, default=4, help="Rank LoRA cho router/gating (finetuning: 4).")
+    p.add_argument("--lora_r_attn", "--lora_r_attention", dest="lora_r_attn", type=int, default=16,
+                    help="Rank LoRA cho attention Q/K/V/O (finetuning: 16).")
+    p.add_argument("--lora_r_expert", "--lora_r_experts", dest="lora_r_expert", type=int, default=16,
+                    help="Rank LoRA cho cac expert FFN (finetuning: 16).")
+    p.add_argument("--lora_alpha", type=int, default=32)
+    p.add_argument("--lora_dropout", type=float, default=0.05)
+    p.add_argument("--include_shared_expert", action="store_true", default=False,
+                    help="Them LoRA len shared_expert. MAC DINH TAT vi file finetuning english mix task KHONG co "
+                         "(de tap tham so train duoc giong het).")
     p.add_argument("--layers", type=str, default=None,
                     help="Danh sach layer (block, chi so tu 0) duoc finetune LoRA. Vi du: '8,9,10' hoac "
                          "'8-15' hoac '0-3,10,12-14' (khoang a-b gom ca a va b). Neu KHONG truyen thi "
@@ -335,6 +308,8 @@ def build_argparser() -> argparse.ArgumentParser:
     # Misc
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16", "float32"])
+    p.add_argument("--attn_implementation", type=str, default="sdpa",
+                    choices=["sdpa", "eager", "flash_attention_2"], help="Giong file finetuning (sdpa).")
     p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu",
                     help="Chi dung khi CHAY DON PROCESS (khong qua torchrun)")
     p.add_argument("--trust_remote_code", action="store_true", default=True)
@@ -354,8 +329,9 @@ def build_argparser() -> argparse.ArgumentParser:
     return p
 
 
-def sync_grads_across_ranks(trainable_params: List[torch.Tensor], world_size: int):
-    """All-reduce (trung binh) gradient THU CONG, gop thanh 1 buffer lien tuc theo dtype.
+def sync_grads_across_ranks(trainable_params: List[torch.Tensor], world_size: int, average: bool = True):
+    """All-reduce gradient THU CONG (average=True: TRUNG BINH — dung cho ALIGN step; average=False: SUM — dung cho
+    TASK step, vi loss task da chia cho TONG token nhan TOAN CUC nen tong gradient cac rank la dung gradient can tim), gop thanh 1 buffer lien tuc theo dtype.
     Tham so khong co grad (None) — vd LoRA cua expert khong nhan token nao tren rank nay — duoc
     dien 0 TRUOC khi gop, de MOI rank luon all-reduce buffer cung kich thuoc va cung thu tu."""
     from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
@@ -369,7 +345,8 @@ def sync_grads_across_ranks(trainable_params: List[torch.Tensor], world_size: in
     for _, grads in grads_by_dtype.items():
         flat = _flatten_dense_tensors(grads)
         dist.all_reduce(flat, op=dist.ReduceOp.SUM)
-        flat.div_(world_size)
+        if average:
+            flat.div_(world_size)
         for g, synced in zip(grads, _unflatten_dense_tensors(flat, grads)):
             g.copy_(synced)
 
@@ -442,22 +419,6 @@ def cleanup_distributed(is_distributed: bool):
 def get_underlying_model(model):
     """Tra ve PeftModel thuc su ben duoi, bo qua lop boc DDP neu co."""
     return model.module if hasattr(model, "module") else model
-
-
-_BACKBONE_CACHE: Dict[int, Tuple] = {}
-
-
-def get_backbone_and_head(model):
-    """(backbone, lm_head) cua CausalLM goc ben duoi PeftModel -> chay backbone roi CHI nhan lm_head
-    tren cac vi tri co nhan (phan dap an). (None, None) neu khong tim thay (se quay ve forward day du)."""
-    key = id(model)
-    if key not in _BACKBONE_CACHE:
-        m = get_underlying_model(model)
-        if hasattr(m, "get_base_model"):
-            m = m.get_base_model()
-        backbone, head = getattr(m, "model", None), getattr(m, "lm_head", None)
-        _BACKBONE_CACHE[key] = (backbone, head) if (backbone is not None and head is not None) else (None, None)
-    return _BACKBONE_CACHE[key]
 
 
 def transformers_at_least(ver: str) -> bool:
@@ -611,260 +572,43 @@ def load_bitext_pairs(data_dir: str, data_files: Sequence[str], eng_key: str,
 
 
 # ============================================================================================
-# Doc du lieu TASK — COPY NGUYEN VAN tu cac file finetuning english-task-only
-# (chi doi ten build_prompt/build_full_text/build_examples them tien to squad_/snli_/mmlu_ de khong trung ten)
+# Doc du lieu TASK — COPY NGUYEN VAN tu file finetuning english mix task (Qwen1.5-MoE-A2.7B.py)
 # ============================================================================================
-WORD_SPAN_PATTERN = re.compile(r"\S+")
-CHOICE_LETTERS = string.ascii_uppercase
-
-
+# Tang DATA_FORMAT_VERSION neu doi prompt/cach build du lieu de vo hieu hoa cache cu.
+ALL_TASKS = ("snli", "squad", "mmlu")
+DATA_FORMAT_VERSION = 1
 LABEL_TO_WORD = {0: "entailment", 1: "neutral", 2: "contradiction"}
+CHOICE_LETTERS = string.ascii_uppercase
+WORD_SPAN_PATTERN = re.compile(r"\S+")
+# Layout vector thong ke moi task step (all-reduce 1 lan): [ce_sum, n_label_tok, n_correct, lb_sum,
+# n_samples, n_skipped, n_padded_tok] + [task_ce_sum]*T + [task_tok]*T + [task_correct]*T
+_N_BASE_STATS = 7
 
 
-# ---------------------------------------- SQuAD ----------------------------------------
-def load_squad_records(data_file: str) -> List[Dict]:
-    """Doc file JSON dang list cac object SQuAD chuan:
-        {"id", "title", "context", "question",
-         "answers": {"text": [...], "answer_start": [...]}}
-    Bo qua record thieu field, khong co dap an (SQuAD 2.0 "unanswerable", answers.text rong —
-    khong phu hop voi muc tieu zero-shot tren cac benchmark luon-co-dap-an nhu XQuAD), hoac
-    answer_start khong khop voi noi dung context (loi du lieu)."""
-    if not os.path.exists(data_file):
-        raise FileNotFoundError(f"Khong tim thay file du lieu SQuAD: {data_file}")
-    with open(data_file, "r", encoding="utf-8") as f:
+def is_oom_error(e: RuntimeError) -> bool:
+    msg = str(e).lower()
+    return "out of memory" in msg or ("cuda error" in msg and "memory" in msg)
+
+
+
+def _read_json_records(path: str, name: str) -> list:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Khong tim thay file du lieu {name}: {path}")
+    with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
-    records: List[Dict] = []
-    n_skipped_missing = 0
-    n_skipped_unanswerable = 0
-    n_skipped_mismatch = 0
-    for rec in data:
-        if not isinstance(rec, dict):
-            n_skipped_missing += 1
-            continue
-        context = rec.get("context")
-        question = rec.get("question")
-        answers = rec.get("answers")
-        if context is None or question is None or not isinstance(answers, dict):
-            n_skipped_missing += 1
-            continue
-        texts = answers.get("text") or []
-        starts = answers.get("answer_start") or []
-        if not texts or not starts:
-            n_skipped_unanswerable += 1
-            continue
-
-        # SQuAD train thuong chi co 1 dap an/cau hoi; neu co nhieu, lay dap an dau tien de train
-        # (giong quy uoc pho bien khi finetune generative QA tren SQuAD).
-        answer_text = str(texts[0]).strip()
-        try:
-            answer_start = int(starts[0])
-        except (TypeError, ValueError):
-            n_skipped_missing += 1
-            continue
-        if not answer_text:
-            n_skipped_unanswerable += 1
-            continue
-
-        context = str(context)
-        # Kiem tra answer_start co thuc su tro dung vao answer_text trong context khong (an
-        # toan du lieu — mot so file SQuAD-like bi lech offset do tien xu ly khac nhau).
-        span = context[answer_start: answer_start + len(answer_text)]
-        if span.strip() != answer_text.strip():
-            # Thu tim lai vi tri chinh xac trong context (fallback) truoc khi bo qua han.
-            found_at = context.find(answer_text)
-            if found_at == -1:
-                n_skipped_mismatch += 1
-                continue
-            answer_start = found_at
-
-        records.append({
-            "id": rec.get("id"),
-            "context": context.strip(),
-            "question": str(question).strip(),
-            "answer_text": answer_text,
-            "answer_start": answer_start,
-        })
-    logger.info(
-        f"Da doc {len(records)} sample hop le tu {data_file} "
-        f"(bo qua {n_skipped_missing} record thieu field, "
-        f"{n_skipped_unanswerable} cau hoi khong co dap an, "
-        f"{n_skipped_mismatch} record lech offset answer_start/context)."
-    )
-    return records
+    if isinstance(data, dict):
+        for key in ("data", "train", "examples"):
+            if isinstance(data.get(key), list):
+                return data[key]
+        raise ValueError(f"File {path} la dict nhung khong co key list nao trong (data/train/examples).")
+    return data
 
 
-def squad_build_prompt(context: str, question: str) -> str:
-    """Prompt dang instruction cho extractive QA. Phan sau 'Answer:' la phan model phai sinh ra
-    va la phan DUY NHAT duoc tinh loss (xem squad_build_full_text + mask trong
-    forward_backward_one_subbatch). Dung format nay de tuong thich truc tiep voi cach eval
-    zero-shot pho bien cho SQuAD/XQuAD (prompt giong het khi generate o eval, chi bo phan dap an)."""
-    return (
-        f"Context: {context}\n"
-        f"Question: {question}\n"
-        f"Answer:"
-    )
-
-
-def squad_build_full_text(context: str, question: str, answer_text: str, eos_token: str) -> Tuple[str, str]:
-    prompt = squad_build_prompt(context, question)
-    full_text = f"{prompt} {answer_text}{eos_token}"
-    return prompt, full_text
-
-
-def select_context_window(context: str, answer_start: int, answer_text: str,
-                           tokenizer, max_context_tokens: int) -> str:
-    """Khi full_text vuot qua --max_length, KHONG truncate tho tu tokenizer (se cat mat phan
-    'Answer: ...' nam o cuoi chuoi), ma chon 1 CUA SO cac TU trong context BAO QUANH vi tri
-    cua answer (dua vao answer_start), roi mo rong dan sang trai/phai (giu nguyen tung tu) cho
-    toi khi vua sat ngan sach max_context_tokens. Nho vay context van luon chua answer.
-
-    TOI UU: ban cu tokenize lai ca cua so sau MOI lan mo rong 1 tu (O(so_tu) lan goi tokenizer /
-    sample, ~50 giay cho 213 sample SQuAD). Gio: tokenize tung tu 1 lan (batch) -> tong tich luy ->
-    mo rong bang uoc luong O(1); roi KIEM TRA lai bang tokenizer that va thu hep neu uoc luong
-    thap hon thuc te, nen ket qua van dam bao <= max_context_tokens."""
-    spans = [m.span() for m in WORD_SPAN_PATTERN.finditer(context)]
-    if not spans:
-        return context
-
-    answer_end = answer_start + len(answer_text)
-    left_idx, right_idx = None, None
-    for i, (s_, e_) in enumerate(spans):
-        if e_ > answer_start and left_idx is None:
-            left_idx = i
-        if s_ < answer_end:
-            right_idx = i
-    if left_idx is None or right_idx is None:
-        left_idx, right_idx = 0, 0
-    lo, hi = left_idx, right_idx
-
-    def window_text(lo, hi):
-        return context[spans[lo][0]: spans[hi][1]]
-
-    def token_len(t: str) -> int:
-        return len(tokenizer(t, add_special_tokens=False)["input_ids"])
-
-    cur_text = window_text(lo, hi)
-    if token_len(cur_text) > max_context_tokens:
-        # Ngay ca cua so toi thieu (chi vua du cac tu cua answer) da vuot ngan sach -> tra ve
-        # nguyen trang, ham goi se tu phat hien full_text van qua dai va skip sample nay.
-        return cur_text
-
-    words = [" " + context[a_:b_] for a_, b_ in spans]
-    wl = tokenizer(words, add_special_tokens=False)["input_ids"]
-    cum = [0]
-    for ids in wl:
-        cum.append(cum[-1] + len(ids))
-
-    def est(lo, hi):
-        return cum[hi + 1] - cum[lo]
-
-    while True:
-        moved = False
-        if lo > 0 and est(lo - 1, hi) <= max_context_tokens:
-            lo -= 1
-            moved = True
-        if hi < len(spans) - 1 and est(lo, hi + 1) <= max_context_tokens:
-            hi += 1
-            moved = True
-        if not moved:
-            break
-
-    # Kiem tra bang tokenizer that (uoc luong theo tung tu co the lech vai token); thu hep neu can.
-    while (lo, hi) != (left_idx, right_idx) and token_len(window_text(lo, hi)) > max_context_tokens:
-        if lo < left_idx and (hi == right_idx or (left_idx - lo) >= (hi - right_idx)):
-            lo += 1
-        else:
-            hi -= 1
-    return window_text(lo, hi)
-
-
-def compute_token_ids(tokenizer, texts: Sequence[str], chunk_size: int = 4000,
-                       desc: str = "Tokenize") -> List[np.ndarray]:
-    """Tokenize batch (fast tokenizer) -> list np.int32. GIU LAI ids (khong chi do dai) de luc train
-    khong phai tokenize lai tung step. Khong tao attention_mask / token_type_ids (khong dung)."""
-    out: List[np.ndarray] = []
-    for i in tqdm(range(0, len(texts), chunk_size), desc=desc):
-        enc = tokenizer(list(texts[i:i + chunk_size]), add_special_tokens=True,
-                        return_attention_mask=False)["input_ids"]
-        out.extend(np.asarray(x, dtype=np.int32) for x in enc)
-    return out
-
-
-def squad_build_examples(records: List[Dict], tokenizer, eos_token: str, max_length: int) -> Tuple[List[Dict], List[int]]:
-    """Tien xu ly: moi record -> {"prompt", "full_text", "answer_text"}.
-    Sample nao co full_text vuot qua max_length se duoc "windowing" lai context (xem
-    select_context_window); neu van khong vua sau khi windowing (hiem) thi bi bo qua.
-    Tra ve (examples, lengths) da loc, dong bo index voi nhau — dung truc tiep cho
-    LengthGroupedBatchSampler, tranh phai tokenize lai toan bo lan nua."""
-    # Buoc 1: build naive (chua windowing) cho toan bo, tinh do dai token 1 lan (batch, nhanh).
-    naive_examples = []
-    for rec in records:
-        prompt, full_text = squad_build_full_text(rec["context"], rec["question"], rec["answer_text"], eos_token)
-        naive_examples.append({
-            "prompt": prompt,
-            "full_text": full_text,
-            "answer_text": rec["answer_text"],
-            "context": rec["context"],
-            "question": rec["question"],
-            "answer_start": rec["answer_start"],
-        })
-    naive_ids = compute_token_ids(tokenizer, [ex["full_text"] for ex in naive_examples],
-                                  desc="SQuAD: tokenize")
-    naive_lengths = [len(x) for x in naive_ids]
-
-    # Buoc 2: chi ap dung windowing (co the cham hon, goi tokenizer nhieu lan) cho phan THIEU SO
-    # sample vuot qua max_length — da so sample SQuAD se vua trong 1 lan, khong can qua buoc nay.
-    examples: List[Dict] = []
-    lengths: List[int] = []
-    n_windowed = 0
-    n_dropped_too_long = 0
-    for ex, naive_len, naive_id in zip(naive_examples, naive_lengths, naive_ids):
-        if naive_len <= max_length:
-            examples.append({"prompt": ex["prompt"], "full_text": ex["full_text"], "ids": naive_id})
-            lengths.append(naive_len)
-            continue
-
-        # Ngan sach token danh cho context = max_length tru phan "Context: \nQuestion: ...\n
-        # Answer: <answer><eos>" (moi thu tru context), tru them margin an toan cho cac dac thu
-        # tokenization (BOS/khoang trang noi tu ...).
-        overhead_text = f"Context: \nQuestion: {ex['question']}\nAnswer: {ex['answer_text']}{eos_token}"
-        overhead_tokens = len(tokenizer(overhead_text, add_special_tokens=True)["input_ids"])
-        max_context_tokens = max_length - overhead_tokens - 8
-        if max_context_tokens <= 0:
-            n_dropped_too_long += 1
-            continue
-
-        windowed_context = select_context_window(
-            ex["context"], ex["answer_start"], ex["answer_text"], tokenizer, max_context_tokens
-        )
-        new_prompt, new_full_text = squad_build_full_text(windowed_context, ex["question"], ex["answer_text"], eos_token)
-        new_ids = np.asarray(tokenizer(new_full_text, add_special_tokens=True)["input_ids"], dtype=np.int32)
-        new_len = len(new_ids)
-        if new_len > max_length:
-            n_dropped_too_long += 1
-            continue
-
-        examples.append({"prompt": new_prompt, "full_text": new_full_text, "ids": new_ids})
-        lengths.append(new_len)
-        n_windowed += 1
-
-    logger.info(
-        f"squad_build_examples: {len(examples)} sample giu lai (trong do {n_windowed} sample da duoc "
-        f"windowing context vi vuot max_length={max_length}), bo qua {n_dropped_too_long} sample "
-        f"van qua dai ngay ca sau khi windowing."
-    )
-    return examples, lengths
-
-
-# ---------------------------------------- SNLI -----------------------------------------
+# ------------------------------------------------------------------------------------- SNLI
 def load_snli_records(data_file: str) -> List[Dict]:
-    """Doc file JSON dang list cac object {"premise": ..., "hypothesis": ..., "label": 0/1/2}.
-    Bo qua record thieu field, hoac label khong nam trong {0, 1, 2} (SNLI goc dung -1 cho
-    cac cau khong dong thuan giua annotator)."""
-    if not os.path.exists(data_file):
-        raise FileNotFoundError(f"Khong tim thay file du lieu SNLI: {data_file}")
-    with open(data_file, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    """List cac object {"premise", "hypothesis", "label": 0/1/2}. Bo qua record thieu field, hoac
+    label khong nam trong {0, 1, 2} (SNLI goc dung -1 cho cac cau khong dong thuan)."""
+    data = _read_json_records(data_file, "SNLI")
     records: List[Dict] = []
     n_skipped = 0
     for rec in data:
@@ -890,13 +634,12 @@ def load_snli_records(data_file: str) -> List[Dict]:
             "hypothesis": str(hypothesis).strip(),
             "label": label,
         })
-    logger.info(f"Da doc {len(records)} sample hop le tu {data_file} (bo qua {n_skipped} record loi/label khong hop le).")
+    logger.info(f"[SNLI] Da doc {len(records)} sample hop le tu {data_file} "
+                f"(bo qua {n_skipped} record loi/label khong hop le).")
     return records
 
 
-def snli_build_prompt(premise: str, hypothesis: str) -> str:
-    """Prompt dang instruction cho NLI. Phan sau 'Answer:' la phan model phai sinh ra va la
-    phan DUY NHAT duoc tinh loss (xem snli_build_full_text + mask trong forward_backward_one_subbatch)."""
+def build_snli_prompt(premise: str, hypothesis: str) -> str:
     return (
         f"Premise: {premise}\n"
         f"Hypothesis: {hypothesis}\n"
@@ -906,38 +649,193 @@ def snli_build_prompt(premise: str, hypothesis: str) -> str:
     )
 
 
-def snli_build_full_text(premise: str, hypothesis: str, label: int, eos_token: str) -> Tuple[str, str]:
-    prompt = snli_build_prompt(premise, hypothesis)
-    label_word = LABEL_TO_WORD[label]
-    full_text = f"{prompt} {label_word}{eos_token}"
-    return prompt, full_text
-
-
-def snli_build_examples(records: List[Dict], eos_token: str) -> List[Dict]:
-    """Tien xu ly 1 lan: moi record -> {"prompt", "full_text", "label", "label_word"}.
-    Tranh phai build lai chuoi prompt/full_text moi lan __getitem__/moi epoch."""
+def build_snli_examples(records: List[Dict], tokenizer, eos_token: str, max_length: int) -> List[Dict]:
     examples = []
     for rec in records:
-        prompt, full_text = snli_build_full_text(rec["premise"], rec["hypothesis"], rec["label"], eos_token)
-        examples.append({
-            "prompt": prompt,
-            "full_text": full_text,
-            "label": rec["label"],
-            "label_word": LABEL_TO_WORD[rec["label"]],
-        })
+        prompt = build_snli_prompt(rec["premise"], rec["hypothesis"])
+        examples.append({"prompt": prompt,
+                         "full_text": f"{prompt} {LABEL_TO_WORD[rec['label']]}{eos_token}"})
     return examples
 
 
-# ---------------------------------------- MMLU -----------------------------------------
+# ------------------------------------------------------------------------------------ SQuAD
+def load_squad_records(data_file: str) -> List[Dict]:
+    """List cac object {"id", "title", "context", "question", "answers": {"text": [...],
+    "answer_start": [...]}}. Bo qua record thieu field, khong co dap an (SQuAD 2.0 unanswerable),
+    hoac answer_start khong khop voi noi dung context."""
+    data = _read_json_records(data_file, "SQuAD")
+    records: List[Dict] = []
+    n_skipped_missing = 0
+    n_skipped_unanswerable = 0
+    n_skipped_mismatch = 0
+    for rec in data:
+        if not isinstance(rec, dict):
+            n_skipped_missing += 1
+            continue
+        context = rec.get("context")
+        question = rec.get("question")
+        answers = rec.get("answers")
+        if context is None or question is None or not isinstance(answers, dict):
+            n_skipped_missing += 1
+            continue
+        texts = answers.get("text") or []
+        starts = answers.get("answer_start") or []
+        if not texts or not starts:
+            n_skipped_unanswerable += 1
+            continue
+
+        # SQuAD train thuong chi co 1 dap an/cau hoi; neu co nhieu, lay dap an dau tien.
+        answer_text = str(texts[0]).strip()
+        try:
+            answer_start = int(starts[0])
+        except (TypeError, ValueError):
+            n_skipped_missing += 1
+            continue
+        if not answer_text:
+            n_skipped_unanswerable += 1
+            continue
+
+        context = str(context)
+        span = context[answer_start: answer_start + len(answer_text)]
+        if span.strip() != answer_text.strip():
+            found_at = context.find(answer_text)
+            if found_at == -1:
+                n_skipped_mismatch += 1
+                continue
+            answer_start = found_at
+
+        records.append({
+            "id": rec.get("id"),
+            "context": context.strip(),
+            "question": str(question).strip(),
+            "answer_text": answer_text,
+            "answer_start": answer_start,
+        })
+    logger.info(
+        f"[SQuAD] Da doc {len(records)} sample hop le tu {data_file} "
+        f"(bo qua {n_skipped_missing} record thieu field, "
+        f"{n_skipped_unanswerable} cau hoi khong co dap an, "
+        f"{n_skipped_mismatch} record lech offset answer_start/context)."
+    )
+    return records
+
+
+def build_squad_prompt(context: str, question: str) -> str:
+    return f"Context: {context}\nQuestion: {question}\nAnswer:"
+
+
+def select_context_window(context: str, answer_start: int, answer_text: str,
+                           tokenizer, max_context_tokens: int) -> str:
+    """Khi full_text vuot qua --max_length, KHONG truncate tho (se cat mat phan 'Answer: ...' o cuoi
+    chuoi), ma chon 1 CUA SO cac TU trong context BAO QUANH vi tri cua answer, roi mo rong dan
+    sang trai/phai (giu nguyen tung tu) cho toi khi vua sat ngan sach max_context_tokens."""
+    spans = [m.span() for m in WORD_SPAN_PATTERN.finditer(context)]
+    if not spans:
+        return context
+
+    answer_end = answer_start + len(answer_text)
+    left_idx, right_idx = None, None
+    for i, (s, e) in enumerate(spans):
+        if e > answer_start and left_idx is None:
+            left_idx = i
+        if s < answer_end:
+            right_idx = i
+    if left_idx is None or right_idx is None:
+        left_idx, right_idx = 0, 0
+    lo, hi = left_idx, right_idx
+
+    def window_text(lo, hi):
+        return context[spans[lo][0]: spans[hi][1]]
+
+    def token_len(s: str) -> int:
+        return len(tokenizer(s, add_special_tokens=False)["input_ids"])
+
+    cur_text = window_text(lo, hi)
+    if token_len(cur_text) > max_context_tokens:
+        # Ngay ca cua so toi thieu da vuot ngan sach -> ham goi se tu phat hien va skip sample nay.
+        return cur_text
+
+    while True:
+        moved = False
+        if lo > 0:
+            candidate = window_text(lo - 1, hi)
+            if token_len(candidate) <= max_context_tokens:
+                lo -= 1
+                cur_text = candidate
+                moved = True
+        if hi < len(spans) - 1:
+            candidate = window_text(lo, hi + 1)
+            if token_len(candidate) <= max_context_tokens:
+                hi += 1
+                cur_text = candidate
+                moved = True
+        if not moved:
+            break
+    return cur_text
+
+
+def compute_lengths(tokenizer, texts: Sequence[str], chunk_size: int = 1000, desc: str = "") -> List[int]:
+    lengths: List[int] = []
+    for i in tqdm(range(0, len(texts), chunk_size), desc=desc or "Tinh do dai token"):
+        enc = tokenizer(list(texts[i:i + chunk_size]), add_special_tokens=True)
+        lengths.extend(len(ids) for ids in enc["input_ids"])
+    return lengths
+
+
+def build_squad_examples(records: List[Dict], tokenizer, eos_token: str, max_length: int) -> List[Dict]:
+    """Sample nao co full_text vuot qua max_length se duoc windowing lai context; neu van khong vua
+    sau khi windowing (hiem) thi bi bo qua."""
+    naive = []
+    for rec in records:
+        prompt = build_squad_prompt(rec["context"], rec["question"])
+        naive.append({
+            "prompt": prompt,
+            "full_text": f"{prompt} {rec['answer_text']}{eos_token}",
+            "answer_text": rec["answer_text"],
+            "context": rec["context"],
+            "question": rec["question"],
+            "answer_start": rec["answer_start"],
+        })
+    naive_lengths = compute_lengths(tokenizer, [ex["full_text"] for ex in naive],
+                                    desc="[SQuAD] Tinh do dai token")
+
+    examples: List[Dict] = []
+    n_windowed = 0
+    n_dropped = 0
+    for ex, naive_len in tqdm(list(zip(naive, naive_lengths)), desc="[SQuAD] Windowing context qua dai"):
+        if naive_len <= max_length:
+            examples.append({"prompt": ex["prompt"], "full_text": ex["full_text"]})
+            continue
+
+        overhead_text = f"Context: \nQuestion: {ex['question']}\nAnswer: {ex['answer_text']}{eos_token}"
+        overhead_tokens = len(tokenizer(overhead_text, add_special_tokens=True)["input_ids"])
+        max_context_tokens = max_length - overhead_tokens - 8
+        if max_context_tokens <= 0:
+            n_dropped += 1
+            continue
+
+        windowed_context = select_context_window(
+            ex["context"], ex["answer_start"], ex["answer_text"], tokenizer, max_context_tokens
+        )
+        new_prompt = build_squad_prompt(windowed_context, ex["question"])
+        new_full_text = f"{new_prompt} {ex['answer_text']}{eos_token}"
+        new_len = len(tokenizer(new_full_text, add_special_tokens=True)["input_ids"])
+        if new_len > max_length:
+            n_dropped += 1
+            continue
+        examples.append({"prompt": new_prompt, "full_text": new_full_text})
+        n_windowed += 1
+
+    logger.info(f"[SQuAD] build_examples: {len(examples)} sample giu lai (trong do {n_windowed} sample "
+                f"da windowing vi vuot max_length={max_length}), bo qua {n_dropped} sample van qua dai.")
+    return examples
+
+
+# ------------------------------------------------------------------------------------- MMLU
 def load_mmlu_records(data_file: str) -> List[Dict]:
-    """Doc file JSON dang list cac object MMLU chuan:
-        {"question": str, "choices": [str, ...], "answer": int, "subject": str}
-    Bo qua record thieu field, choices khong hop le (khong phai list, < 2 phan tu), hoac answer
-    khong nam trong khoang [0, len(choices)-1]."""
-    if not os.path.exists(data_file):
-        raise FileNotFoundError(f"Khong tim thay file du lieu MMLU: {data_file}")
-    with open(data_file, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    """List cac object {"question": str, "choices": [str, ...], "answer": int, "subject": str}.
+    Bo qua record thieu field, choices khong hop le, hoac answer ngoai khoang [0, len(choices)-1]."""
+    data = _read_json_records(data_file, "MMLU")
     records: List[Dict] = []
     n_skipped_missing = 0
     n_skipped_bad_answer = 0
@@ -957,10 +855,7 @@ def load_mmlu_records(data_file: str) -> List[Dict]:
         except (TypeError, ValueError):
             n_skipped_bad_answer += 1
             continue
-        if not (0 <= answer < len(choices)):
-            n_skipped_bad_answer += 1
-            continue
-        if len(choices) > len(CHOICE_LETTERS):
+        if not (0 <= answer < len(choices)) or len(choices) > len(CHOICE_LETTERS):
             n_skipped_bad_answer += 1
             continue
 
@@ -971,18 +866,15 @@ def load_mmlu_records(data_file: str) -> List[Dict]:
             "subject": str(subject).strip() if subject else "",
         })
     logger.info(
-        f"Da doc {len(records)} sample hop le tu {data_file} "
+        f"[MMLU] Da doc {len(records)} sample hop le tu {data_file} "
         f"(bo qua {n_skipped_missing} record thieu field, "
         f"{n_skipped_bad_answer} record answer/choices khong hop le)."
     )
     return records
 
 
-def mmlu_build_prompt(question: str, choices: List[str], subject: str) -> str:
-    """Prompt dang trac nghiem, DUNG CHUAN format pho bien khi eval MMLU (lm-evaluation-harness
-    / paper goc), de tuong thich truc tiep voi zero-shot eval tren MMLU/MMMLU. Phan sau
-    'Answer:' la phan model phai sinh ra va la phan DUY NHAT duoc tinh loss (xem mmlu_build_full_text
-    + mask trong forward_backward_one_subbatch)."""
+def build_mmlu_prompt(question: str, choices: List[str], subject: str) -> str:
+    """Dung chuan format eval MMLU (lm-evaluation-harness / paper goc), khong kem few-shot."""
     if subject:
         header = f"The following are multiple choice questions (with answers) about {subject.replace('_', ' ')}.\n\n"
     else:
@@ -991,44 +883,85 @@ def mmlu_build_prompt(question: str, choices: List[str], subject: str) -> str:
     return f"{header}{question}\n{choice_lines}\nAnswer:"
 
 
-def mmlu_build_full_text(question: str, choices: List[str], subject: str, answer_idx: int,
-                     eos_token: str) -> Tuple[str, str]:
-    prompt = mmlu_build_prompt(question, choices, subject)
-    letter = CHOICE_LETTERS[answer_idx]
-    full_text = f"{prompt} {letter}{eos_token}"
-    return prompt, full_text
-
-
-def mmlu_build_examples(records: List[Dict], tokenizer, eos_token: str, max_length: int) -> Tuple[List[Dict], List[int]]:
-    """Tien xu ly 1 lan: moi record -> {"prompt", "full_text"}. Khac SQuAD (khong co "context"
-    dai can windowing) — MMLU prompt thuong ngan, sample nao (hiem) vuot max_length se bi BO QUA
-    hoan toan (KHONG truncate tho, vi truncation se cat mat dung phan "Answer: <letter>" o cuoi
-    chuoi). Tra ve (examples, lengths) da loc, dong bo index — dung truc tiep cho
-    LengthGroupedBatchSampler."""
-    full_texts, prompts = [], []
+def build_mmlu_examples(records: List[Dict], tokenizer, eos_token: str, max_length: int) -> List[Dict]:
+    examples = []
     for rec in records:
-        prompt, full_text = mmlu_build_full_text(rec["question"], rec["choices"], rec["subject"],
-                                             rec["answer"], eos_token)
-        prompts.append(prompt)
-        full_texts.append(full_text)
+        prompt = build_mmlu_prompt(rec["question"], rec["choices"], rec["subject"])
+        examples.append({"prompt": prompt,
+                         "full_text": f"{prompt} {CHOICE_LETTERS[rec['answer']]}{eos_token}"})
+    return examples
 
-    ids_all = compute_token_ids(tokenizer, full_texts, desc="MMLU: tokenize")
 
-    examples: List[Dict] = []
-    lengths: List[int] = []
-    n_dropped_too_long = 0
-    for prompt, full_text, ids in zip(prompts, full_texts, ids_all):
-        if len(ids) > max_length:
-            n_dropped_too_long += 1
-            continue
-        examples.append({"prompt": prompt, "full_text": full_text, "ids": ids})
-        lengths.append(len(ids))
+TASK_REGISTRY = {
+    "snli": {"file_arg": "snli_file", "loader": load_snli_records, "builder": build_snli_examples},
+    "squad": {"file_arg": "squad_file", "loader": load_squad_records, "builder": build_squad_examples},
+    "mmlu": {"file_arg": "mmlu_file", "loader": load_mmlu_records, "builder": build_mmlu_examples},
+}
 
-    logger.info(
-        f"mmlu_build_examples: {len(examples)} sample giu lai, bo qua {n_dropped_too_long} sample "
-        f"vuot qua max_length={max_length} (khong truncate de tranh cat mat nhan)."
-    )
-    return examples, lengths
+
+def parse_tasks(tasks_arg: str) -> List[str]:
+    tasks = [t.strip().lower() for t in tasks_arg.split(",") if t.strip()]
+    if not tasks:
+        raise ValueError("--tasks rong. Chon tap con cua: " + ",".join(ALL_TASKS))
+    unknown = [t for t in tasks if t not in TASK_REGISTRY]
+    if unknown:
+        raise ValueError(f"Task khong ho tro: {unknown}. Chon trong: {list(ALL_TASKS)}")
+    if len(set(tasks)) != len(tasks):
+        raise ValueError(f"--tasks bi lap: {tasks}")
+    return tasks
+
+
+def tokenize_examples(examples: List[Dict], tokenizer, max_length: int, task_id: int,
+                      task_name: str, chunk_size: int = 2000) -> List[Dict]:
+    """Tokenize full_text + prompt DUNG 1 LAN. Moi sample -> {"input_ids": int32[L], "prompt_len",
+    "n_lab" (so token nhan = L - prompt_len, gom ca eos), "task"}. Sample co L > max_length bi bo
+    qua (KHONG truncate vi se cat mat nhan o cuoi chuoi)."""
+    out: List[Dict] = []
+    n_too_long = 0
+    n_no_label = 0
+    for i in tqdm(range(0, len(examples), chunk_size), desc=f"[{task_name}] Tokenize"):
+        chunk = examples[i:i + chunk_size]
+        full_ids = tokenizer([ex["full_text"] for ex in chunk], add_special_tokens=True)["input_ids"]
+        prompt_ids = tokenizer([ex["prompt"] for ex in chunk], add_special_tokens=True)["input_ids"]
+        for f_ids, p_ids in zip(full_ids, prompt_ids):
+            length, plen = len(f_ids), len(p_ids)
+            if length > max_length:
+                n_too_long += 1
+                continue
+            if plen < 1 or plen >= length:
+                n_no_label += 1
+                continue
+            out.append({
+                "input_ids": np.asarray(f_ids, dtype=np.int32),
+                "prompt_len": plen,
+                "n_lab": length - plen,
+                "task": task_id,
+            })
+    logger.info(f"[{task_name}] Tokenize xong: giu {len(out)}/{len(examples)} sample "
+                f"(bo {n_too_long} sample vuot max_length={max_length}, {n_no_label} sample khong co nhan).")
+    return out
+
+
+def build_mixed_examples(args, tokenizer, tasks: List[str]) -> List[Dict]:
+    all_examples: List[Dict] = []
+    for task_id, name in enumerate(tasks):
+        spec = TASK_REGISTRY[name]
+        records = spec["loader"](getattr(args, spec["file_arg"]))
+        if args.max_samples_per_task and len(records) > args.max_samples_per_task:
+            random.Random(args.seed + task_id).shuffle(records)
+            records = records[: args.max_samples_per_task]
+            logger.info(f"[{name}] Gioi han con {len(records)} sample (--max_samples_per_task).")
+        if not records:
+            raise RuntimeError(f"Task {name} khong doc duoc sample nao — kiem tra lai file du lieu.")
+        examples = spec["builder"](records, tokenizer, tokenizer.eos_token, args.task_max_length)
+        tokenized = tokenize_examples(examples, tokenizer, args.task_max_length, task_id, name)
+        if not tokenized:
+            raise RuntimeError(f"Task {name} khong con sample nao sau buoc loc do dai — thu tang --task_max_length.")
+        all_examples.extend(tokenized)
+
+    return all_examples
+
+
 
 
 # ============================================================================================
@@ -1106,19 +1039,26 @@ def infer_middle_layer(num_layers: int) -> int:
     return num_layers // 2
 
 
+def is_routed_expert_name(name: str) -> bool:
+    return ".experts." in name or ".expert." in name
+
+
+def is_shared_expert_name(name: str) -> bool:
+    return ".shared_expert." in name or ".shared_experts." in name
+
+
+def is_expert_name(name: str, include_shared: bool = False) -> bool:
+    """Mac dinh CHI routed experts (mlp.experts.N.*) — dung nhu file finetuning english mix task.
+    include_shared=True them shared expert (mlp.shared_expert.*) cua Qwen1.5-MoE."""
+    return is_routed_expert_name(name) or (include_shared and is_shared_expert_name(name))
+
+
 def is_router_leaf_name(name: str) -> bool:
     leaf = name.split(".")[-1]
-    return leaf in ("gate", "router", "gating") and not is_expert_name(name)
+    return leaf in ("gate", "router", "gating") and not is_routed_expert_name(name) and not is_shared_expert_name(name)
 
 
-def is_expert_name(name: str) -> bool:
-    """Linear projection cua routed experts (mlp.experts.N.*) HOAC shared expert (mlp.shared_expert.*).
-    (ban truoc chi bat '.experts.'/'.expert.' nen BO SOT shared_expert cua Qwen1.5-MoE.)"""
-    return (".experts." in name or ".expert." in name or ".shared_expert." in name
-            or ".shared_experts." in name)
-
-
-def build_lora_target_modules(model, layer_indices: set) -> List[str]:
+def build_lora_target_modules(model, layer_indices: set, include_shared_expert: bool = False) -> List[str]:
     targets = []
     for name, module in model.named_modules():
         if not isinstance(module, torch.nn.Linear):
@@ -1130,7 +1070,7 @@ def build_lora_target_modules(model, layer_indices: set) -> List[str]:
         if idx not in layer_indices:
             continue
         is_attn = bool(re.search(r"(self_attn|attention|attn)\.", name))
-        is_expert = is_expert_name(name)
+        is_expert = is_expert_name(name, include_shared_expert)
         is_router = is_router_leaf_name(name)
         if is_attn or is_expert or is_router:
             targets.append(name)
@@ -1152,16 +1092,14 @@ def build_rank_pattern(attn_names, expert_names, router_names, r_attn, r_expert,
     return rp
 
 
-def categorize_lora_targets(target_modules: Sequence[str]) -> Tuple[List[str], List[str], List[str]]:
-    """Chia danh sach target_modules (da duoc build_lora_target_modules loc) thanh 3 nhom rieng
-    biet — attention / experts / router — dung LAI CHINH XAC cung dieu kien nhu trong
-    build_lora_target_modules(), de dam bao khop 1-1 voi target_modules truyen vao LoraConfig.
-    Dung cho rank_pattern (dieu kien thay doi #2: moi nhom co the mang 1 rank LoRA rieng)."""
+def categorize_lora_targets(target_modules: Sequence[str],
+                            include_shared_expert: bool = False) -> Tuple[List[str], List[str], List[str]]:
+    """Chia target_modules thanh attention / experts / router — DUNG CUNG dieu kien voi build_lora_target_modules."""
     attn_names, expert_names, router_names = [], [], []
     for name in target_modules:
         if is_router_leaf_name(name):
             router_names.append(name)
-        elif is_expert_name(name):
+        elif is_expert_name(name, include_shared_expert):
             expert_names.append(name)
         elif re.search(r"(self_attn|attention|attn)\.", name):
             attn_names.append(name)
@@ -1212,33 +1150,35 @@ def infer_moe_dims(config, args):
 
 def compute_load_balancing_loss(router_logits_list: List[torch.Tensor], attention_mask: torch.Tensor,
                                  num_experts: int, top_k: int):
-    """attention_mask: [batch, seq_len] (1 = token that, 0 = padding). Padding bi loai bang TRONG SO
-    (0/1) thay vi boolean-index logits[mask] (cach cu moi lan goi gay 1 device sync / layer). Ket qua
-    bang het: mean tren cac token that cua [so token chon expert] va [xac suat router]."""
-    w_full = attention_mask.reshape(-1).to(torch.float32)
+    """Loai bo padding truoc khi tinh thong ke, noi (concat) token cua TAT CA router layer da hook
+    lai thanh 1 tap DUY NHAT roi moi tinh f_i / P_i / loss (dung cach cua HF load_balancing_loss_func)."""
+    mask_flat = attention_mask.reshape(-1).bool()
 
-    losses = []
+    valid_logits = []
     for logits in router_logits_list:
-        logits = logits.reshape(-1, logits.shape[-1]).float()
-        if logits.shape[0] == w_full.shape[0]:
-            w = w_full
+        logits = logits.reshape(-1, logits.shape[-1]).to(mask_flat.device)
+        if logits.shape[0] == mask_flat.shape[0]:
+            logits = logits[mask_flat]
         else:
             logger.warning(
                 "compute_load_balancing_loss: kich thuoc router logits "
-                f"({logits.shape[0]}) khong khop attention_mask ({w_full.shape[0]}) -> "
+                f"({logits.shape[0]}) khong khop attention_mask ({mask_flat.shape[0]}) -> "
                 "bo qua loc padding cho lan tinh nay."
             )
-            w = torch.ones(logits.shape[0], device=logits.device, dtype=torch.float32)
-        n_valid = w.sum().clamp(min=1.0)
-        routing_weights = F.softmax(logits, dim=-1)
-        _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
-        expert_mask = torch.zeros_like(routing_weights).scatter_(1, selected_experts, 1.0)   # [T, E]
-        tokens_per_expert = (expert_mask * w[:, None]).sum(dim=0) / n_valid
-        avg_prob_per_expert = (routing_weights * w[:, None]).sum(dim=0) / n_valid
-        losses.append(num_experts * torch.sum(tokens_per_expert * avg_prob_per_expert))
-    if not losses:
+        if logits.shape[0] > 0:
+            valid_logits.append(logits)
+
+    if not valid_logits:
         return torch.tensor(0.0, device=attention_mask.device)
-    return torch.stack(losses).mean()
+
+    concatenated_logits = torch.cat(valid_logits, dim=0)
+    routing_weights = F.softmax(concatenated_logits.float(), dim=-1)
+    _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+    expert_mask = F.one_hot(selected_experts, num_experts).float()
+    tokens_per_expert = expert_mask.sum(dim=1).mean(dim=0)  # f_i, da chia trung binh theo token
+    avg_prob_per_expert = routing_weights.mean(dim=0)
+    return num_experts * torch.sum(tokens_per_expert * avg_prob_per_expert)
+
 
 
 # ============================================================================================
@@ -1423,130 +1363,282 @@ def align_step_accumulate(eng_texts: List[str], other_texts: List[str], tokenize
 
 
 # ============================================================================================
-# Task pool: gop SQuAD + SNLI + MMLU thanh 1 danh sach example duy nhat {"prompt","full_text","src"}
-# (doc/build prompt/windowing/loc do dai bang CHINH cac ham cua cac file finetuning goc)
+# TASK side: sampler + collate + forward/backward + dynamic OOM + stats — COPY NGUYEN VAN tu file finetuning
 # ============================================================================================
-def build_task_pool(args, tokenizer) -> Dict:
-    eos = tokenizer.eos_token
-    rng = random.Random(args.seed)
-    examples: List[Dict] = []
-    lengths: List[int] = []
-    stats: Dict[str, Dict[str, int]] = {}
+class TokenBudgetBatchSampler:
+    """Ke hoach batch cho 1 epoch (xac dinh hoan toan boi seed + epoch, GIONG NHAU tren moi rank).
+    Mac dinh batch CO DINH `batch_size` sample/rank; neu max_tokens > 0 thi chuyen sang token-budget.
+    Cac buoc:
+      1. Shuffle toan bo index -> cat thanh pool `pool_size` sample.
+      2. Trong moi pool: sort theo do dai, gom tham lam thanh batch sao cho
+         so_sample * do_dai_pad(sample dai nhat) <= max_tokens va so_sample <= max_batch_size
+         => batch it padding, va moi batch co ~ cung so token (tai tinh toan ~ bang nhau).
+      3. Shuffle TAT CA batch cua cac pool, roi step s lay world_size batch lien tiep: rank r nhan
+         batch thu r. Vi batch tren cac rank thuoc cac vung do dai (=> cac task) ngau nhien, 1
+         optimizer step tren nhieu GPU se tron ca 3 task.
+    So step/epoch duoc co dinh = min tren cac epoch (batch du ra o cuoi bi bo) de scheduler/resume on dinh.
 
-    def _cap(records):
-        if args.max_task_samples and len(records) > args.max_task_samples:
-            records = list(records)
-            rng.shuffle(records)
-            records = records[: args.max_task_samples]
-        return records
+    plan(epoch) tra ve list (theo step) cac tuple (index_cua_rank_nay, tong_so_token_nhan_toan_cuc_cua_step)."""
 
-    src_order: List[str] = []
+    def __init__(self, lengths: np.ndarray, label_tokens: np.ndarray, max_tokens: int,
+                 max_batch_size: int, world_size: int, rank: int, seed: int, num_epochs: int,
+                 pool_size: int = 20000, pad_multiple: int = 8, batch_size: int = 8):
+        self.lengths = np.asarray(lengths, dtype=np.int64)
+        self.label_tokens = np.asarray(label_tokens, dtype=np.int64)
+        self.padded = ((self.lengths + pad_multiple - 1) // pad_multiple) * pad_multiple
+        self._padded_list = self.padded.tolist()
+        self.max_tokens = max_tokens
+        self.max_batch_size = max_batch_size
+        self.batch_size = max(int(batch_size), 1)  # chi dung khi max_tokens <= 0 (batch co dinh)
+        self.world_size = max(world_size, 1)
+        self.rank = rank
+        self.seed = seed
+        self.pool_size = max(pool_size, 1)
 
-    def _add(src: str, exs: List[Dict], lens: List[int], n_loaded: int):
-        for ex, ln in zip(exs, lens):
-            examples.append({"prompt": ex["prompt"], "ids": ex["ids"], "src": len(src_order)})
-            lengths.append(ln)
-        src_order.append(src)
-        stats[src] = {"loaded": n_loaded, "kept": len(exs), "dropped": n_loaded - len(exs)}
+        counts = []
+        first_batches = None
+        for e in range(max(num_epochs, 1)):
+            batches = self._global_batches(e)
+            if e == 0:
+                first_batches = batches
+            counts.append(len(batches) // self.world_size)
+        self.steps_per_epoch = min(counts)
+        if self.steps_per_epoch <= 0:
+            raise RuntimeError(
+                f"Khong du du lieu de tao 1 step (world_size={self.world_size}, "
+                f"batch_size={self.batch_size}, max_tokens_per_batch={max_tokens}). "
+                f"Giam --batch_size (hoac --max_tokens_per_batch) hoac them du lieu."
+            )
+        self.n_batches_epoch0 = len(first_batches)
+        padded_total = sum(len(b) * self._padded_list[b[-1]] if False else
+                           len(b) * max(self._padded_list[i] for i in b) for b in first_batches)
+        self.padding_efficiency = float(self.lengths.sum()) / max(padded_total, 1)
+        self.mean_batch_size = len(self.lengths) / max(len(first_batches), 1)
 
-    if "squad" in args.task_datasets:
-        recs = _cap(load_squad_records(args.squad_file))
-        exs, lens = squad_build_examples(recs, tokenizer, eos, args.task_max_length)
-        _add("squad", exs, lens, len(recs))
-    if "snli" in args.task_datasets:
-        recs = _cap(load_snli_records(args.snli_file))
-        all_exs = snli_build_examples(recs, eos)
-        all_ids = compute_token_ids(tokenizer, [e["full_text"] for e in all_exs], desc="SNLI: tokenize")
-        keep = []
-        for e, ids in zip(all_exs, all_ids):
-            if len(ids) <= args.task_max_length:
-                e["ids"] = ids
-                keep.append(e)
-        _add("snli", keep, [len(e["ids"]) for e in keep], len(recs))
-    if "mmlu" in args.task_datasets:
-        recs = _cap(load_mmlu_records(args.mmlu_file))
-        exs, lens = mmlu_build_examples(recs, tokenizer, eos, args.task_max_length)
-        _add("mmlu", exs, lens, len(recs))
+    def _global_batches(self, epoch: int) -> List[List[int]]:
+        rng = random.Random(self.seed + epoch)
+        idx = list(range(len(self.lengths)))
+        rng.shuffle(idx)
+        batches: List[List[int]] = []
+        plist = self._padded_list
+        for ps in range(0, len(idx), self.pool_size):
+            pool = idx[ps:ps + self.pool_size]
+            pool.sort(key=plist.__getitem__)  # sort on dinh -> hoa ngau nhien nho shuffle truoc do
+            cur: List[int] = []
+            for i in pool:
+                pad_len = plist[i]  # tang dan => sample hien tai la dai nhat trong batch
+                if self.max_tokens > 0:  # che do token-budget
+                    flush = bool(cur) and ((len(cur) + 1) * pad_len > self.max_tokens
+                                           or len(cur) >= self.max_batch_size)
+                else:  # che do batch co dinh: du batch_size sample thi dong batch
+                    flush = len(cur) >= self.batch_size
+                if flush:
+                    batches.append(cur)
+                    cur = []
+                cur.append(i)
+            # batch co dinh: bo batch cuoi chua du batch_size (toi da batch_size-1 sample/pool/epoch)
+            if cur and (self.max_tokens > 0 or len(cur) >= self.batch_size):
+                batches.append(cur)
+        rng.shuffle(batches)
+        return batches
 
-    for src, st in stats.items():
-        logger.info(f"[task pool] {src}: doc {st['loaded']}, giu {st['kept']}, "
-                    f"bo (qua dai khong the cat) {st['dropped']}")
+    def plan(self, epoch: int) -> List[Tuple[List[int], int]]:
+        batches = self._global_batches(epoch)
+        W = self.world_size
+        steps: List[Tuple[List[int], int]] = []
+        for s in range(self.steps_per_epoch):
+            group = batches[s * W:(s + 1) * W]
+            global_label_tokens = int(sum(int(self.label_tokens[b].sum()) for b in group))
+            steps.append((group[self.rank], max(global_label_tokens, 1)))
+        return steps
 
-    # Dong goi: 1 mang phang int32 + offsets (gon, pickle nhanh) + do dai PROMPT (de mask nhan).
-    # prompt_len = so token cua prompt tokenize RIENG (dung quy uoc cu: mask prompt = -100).
-    # Tinh 1 lan o day (duoc cache) thay vi tokenize lai prompt cua tung sample moi step.
-    prompt_ids = compute_token_ids(tokenizer, [e["prompt"] for e in examples], desc="Tokenize prompt")
-    prompt_len = np.asarray([len(x) for x in prompt_ids], dtype=np.int32)
-    del prompt_ids
-    lens_np = np.asarray(lengths, dtype=np.int64)
-    offs = np.zeros(len(examples) + 1, dtype=np.int64)
-    np.cumsum(lens_np, out=offs[1:])
-    flat = np.empty(int(offs[-1]), dtype=np.int32)
-    for i, e in enumerate(examples):
-        flat[offs[i]:offs[i + 1]] = e["ids"]
-    pool = {
-        "flat": flat, "offs": offs, "lengths": lens_np.astype(np.int32),
-        "prompt_len": np.minimum(prompt_len, lens_np.astype(np.int32)),
-        "src": np.asarray([e["src"] for e in examples], dtype=np.uint8),
-        "src_names": src_order, "stats": stats,
+
+
+
+# ============================================================================================
+# Collate + forward/backward (task step) — nguyen van file finetuning
+# ============================================================================================
+def collate_examples(sub_examples: List[Dict], pad_id: int, device, pad_multiple: int = 8):
+    """List example (da tokenize) -> tensor. Pad ve boi so cua pad_multiple (tensor core), padding
+    ben phai. Tra ve (input_ids [n,T], attention_mask [n,T], target_mask [n,T-1], task_ids [n])
+    trong do target_mask[i, j] = True neu token o vi tri j+1 la token NHAN (tinh loss)."""
+    n = len(sub_examples)
+    lens = np.fromiter((len(ex["input_ids"]) for ex in sub_examples), dtype=np.int64, count=n)
+    plens = np.fromiter((ex["prompt_len"] for ex in sub_examples), dtype=np.int64, count=n)
+    tasks = np.fromiter((ex["task"] for ex in sub_examples), dtype=np.int64, count=n)
+
+    T = int(lens.max())
+    T = -(-T // pad_multiple) * pad_multiple
+    ids = np.full((n, T), pad_id, dtype=np.int64)
+    for i, ex in enumerate(sub_examples):
+        ids[i, : lens[i]] = ex["input_ids"]
+    pos = np.arange(T, dtype=np.int64)[None, :]
+    attn = pos < lens[:, None]
+    label = (pos >= plens[:, None]) & attn  # nhan = tu vi tri prompt_len den het chuoi (gom eos)
+
+    def to_dev(a):
+        return torch.from_numpy(a).to(device)
+
+    return to_dev(ids), to_dev(attn.astype(np.int64)), to_dev(label[:, 1:]), to_dev(tasks)
+
+
+def forward_backward_one_chunk(chunk: List[Dict], ctx, lb_weight: float):
+    """Forward + backward cho 1 chunk (toan bo batch hoac 1 mieng sau khi chia nho vi OOM) va cong
+    don thong ke vao ctx.stats (tren device, KHONG sync CPU).
+
+    L_LM van la cross-entropy TIEU CHUAN next-token, CHI tinh tren phan "<answer><eos>". Thay vi tinh
+    logits cho moi vi tri roi mask, ta lay hidden state tu decoder va chi dua cac vi tri co nhan
+    qua lm_head -> ket qua giong het nhung bo nho logits giam ~50 lan.
+
+    Loss de backward = sum(CE tren token nhan cua chunk) / TONG token nhan TOAN CUC cua step
+                       + lb_loss_coef * L_LB * lb_weight
+    (gradient cac rank/chunk duoc CONG lai nen ra dung gradient cua loss trung binh theo token)."""
+    ids, attn, tgt_mask, task_ids = collate_examples(chunk, ctx.pad_id, ctx.device)
+
+    ctx.router_cache.clear()
+    hidden = ctx.decoder(input_ids=ids, attention_mask=attn, use_cache=False).last_hidden_state
+
+    sel_mask = tgt_mask.to(hidden.device)
+    h_sel = hidden[:, :-1][sel_mask]  # [N_label_tokens, H], thu tu row-major theo sample
+    targets = ids[:, 1:][tgt_mask]
+    logits = ctx.lm_head(h_sel).float()
+    targets = targets.to(logits.device)
+    ce = F.cross_entropy(logits, targets, reduction="none")
+    ce_sum = ce.sum()
+
+    if ctx.router_cache and ctx.num_experts and ctx.top_k:
+        lb_loss = compute_load_balancing_loss(ctx.router_cache, attn, ctx.num_experts, ctx.top_k)
+    else:
+        lb_loss = torch.zeros((), device=ce_sum.device)
+    lb_loss = lb_loss.to(ce_sum.device)
+
+    loss = ce_sum / ctx.global_tokens + ctx.lb_loss_coef * lb_loss * lb_weight
+    loss.backward()
+
+    # Thong ke (khong anh huong gradient)
+    with torch.no_grad():
+        st = ctx.stats
+        dev = st.device
+        T = ctx.n_tasks
+        n_lab = tgt_mask.sum(dim=1)
+        tok_task = torch.repeat_interleave(task_ids.to(dev), n_lab.to(dev), output_size=int(targets.numel()))
+        ce_d = ce.detach().to(dev)
+        correct = (logits.argmax(dim=-1) == targets).float().to(dev)
+
+        st[0] += ce_d.sum()
+        st[1] += float(targets.numel())
+        st[2] += correct.sum()
+        st[3] += lb_loss.detach().to(dev) * len(chunk)
+        st[4] += float(len(chunk))
+        st[6] += float(ids.numel())
+        st[_N_BASE_STATS:_N_BASE_STATS + T].index_add_(0, tok_task, ce_d)
+        st[_N_BASE_STATS + T:_N_BASE_STATS + 2 * T].index_add_(0, tok_task, torch.ones_like(ce_d))
+        st[_N_BASE_STATS + 2 * T:_N_BASE_STATS + 3 * T].index_add_(0, tok_task, correct)
+
+
+def run_batch_with_dynamic_oom_handling(batch_examples: List[Dict], ctx, optimizer, min_batch_size: int):
+    """Chay 1 batch (list example). Neu OOM o bat ky chunk nao: ZERO gradient + stats (de khong con
+    gradient do dang cua lan that bai), halve kich thuoc chunk roi chay lai CA BATCH tu dau. Neu OOM
+    ngay ca khi chunk <= min_batch_size thi bo cac sample do. Luon quay ve kich thuoc batch goc cho
+    batch ke tiep. Khong co collective nao trong ham nay nen moi rank tu xu ly OOM doc lap, khong the
+    gay treo NCCL."""
+    live = list(batch_examples)
+    cap = max(len(live), 1)
+    n_skipped = 0
+
+    while True:
+        optimizer.zero_grad(set_to_none=False)
+        ctx.stats.zero_()
+        ctx.stats[5] = float(n_skipped)
+        if not live:
+            return
+
+        n_live = len(live)
+        failed_size = None
+        failed_ids = None
+        try:
+            for i in range(0, n_live, cap):
+                chunk = live[i:i + cap]
+                failed_size, failed_ids = len(chunk), {id(x) for x in chunk}
+                forward_backward_one_chunk(chunk, ctx, lb_weight=(len(chunk) / n_live) / ctx.world_size)
+            return
+        except RuntimeError as e:
+            if not is_oom_error(e):
+                raise
+        # (da thoat khoi except -> traceback/tensor cua lan that bai duoc giai phong truoc khi retry)
+        ctx.router_cache.clear()
+        clear_memory()
+        if failed_size <= max(min_batch_size, 1):
+            logger.warning(f"OOM ngay ca voi chunk size={failed_size} -> skip {failed_size} sample nay.")
+            live = [x for x in live if id(x) not in failed_ids]
+            n_skipped += failed_size
+        else:
+            cap = max(failed_size // 2, 1)
+            logger.warning(f"OOM voi chunk size={failed_size} -> zero gradient, chay lai batch voi chunk={cap}.")
+
+
+def stats_to_result(stats: List[float], task_names: List[str], lb_loss_coef: float) -> dict:
+    T = len(task_names)
+    ce, ntok, correct, lb_sum, ns, nskip, npad = stats[:_N_BASE_STATS]
+    lm_loss = ce / max(ntok, 1.0)
+    lb_loss = lb_sum / max(ns, 1.0)
+    t_ce = stats[_N_BASE_STATS:_N_BASE_STATS + T]
+    t_tok = stats[_N_BASE_STATS + T:_N_BASE_STATS + 2 * T]
+    t_cor = stats[_N_BASE_STATS + 2 * T:_N_BASE_STATS + 3 * T]
+    task_loss, task_acc, task_tokens = {}, {}, {}
+    for i, name in enumerate(task_names):
+        task_tokens[name] = int(t_tok[i])
+        task_loss[name] = (t_ce[i] / t_tok[i]) if t_tok[i] > 0 else None
+        task_acc[name] = (t_cor[i] / t_tok[i]) if t_tok[i] > 0 else None
+    return {
+        "lm_loss": lm_loss,
+        "lb_loss": lb_loss,
+        "total_loss": lm_loss + lb_loss_coef * lb_loss,
+        "label_acc": correct / max(ntok, 1.0),
+        "n_processed": int(ns),
+        "n_skipped": int(nskip),
+        "padded_tokens": int(npad),
+        "label_tokens": int(ntok),
+        "task_loss": task_loss,
+        "task_acc": task_acc,
+        "task_tokens": task_tokens,
     }
-    return pool
+
+
 
 
 # ============================================================================================
-# Lich xen ke task/align: ALIGN la anchor — moi epoch = N align step dung HET pool align + N task step
-# (task data duoc phep lap lai)
+# ALIGN side: pool nho, lap lai de du N align step / epoch (N = so task step / epoch cua sampler finetuning)
 # ============================================================================================
-def solve_schedule(n_task: int, world_size: int, task_batch_size: int) -> int:
-    """Tra ve N = so task step = so align step MOI epoch. TASK la anchor (dung nhu paper):
-        N = max(1, ceil(n_task / (task_batch_size * world_size)))
-    -> moi sample task duoc dung >= 1 lan / epoch. Align data (pool nho) khong tham gia chon N;
-    no duoc LAP LAI de du N align step."""
-    return max(1, -(-int(n_task) // (int(task_batch_size) * int(world_size))))
-
-
 def split_sizes(total: int, parts: int) -> List[int]:
     """Chia `total` thanh `parts` phan chenh nhau toi da 1 (phan dau nhan them 1 neu du)."""
     base, rem = divmod(total, parts)
     return [base + 1 if i < rem else base for i in range(parts)]
 
 
-class AlternatePlan:
-    """Ke hoach batch cho 1 epoch (xac dinh hoan toan theo (seed, epoch) -> resume giua epoch ra dung
-    cac batch cu). Dung numpy.
-
-    TASK (anchor): hoan vi (seed, epoch) TOAN BO n_task sample, cat thanh N lat, moi lat
-    W * task_batch_size sample (phan thieu o lat cuoi, < 1 step, duoc lap vong tu dau hoan vi) -> MOI sample
-    task xuat hien >= 1 lan / epoch. Moi lat sort theo do dai TRUOC khi chia rank (can bang tai + thuan loi
-    cho micro-batching theo token).
-
-    ALIGN (pool nho, lap lai nhu paper): moi epoch can align_per_epoch = N * W * align_batch_size cap. Luong cap
-    nay duoc sinh tu pool n_align (nho) bang cach lap lai pool:
-      - align_lang_balance (lang_ids != None, paper 4.3): moi ngon ngu nhan ~align_per_epoch / L cap, trong ngon
-        ngu do cac cap duoc quay vong qua nhieu hoan vi noi tiep (deu nhau: moi cap xuat hien floor hoac
-        ceil lan) -> phan phoi ngon ngu xap xi DEU;
+class AlignPlan:
+    """Ke hoach align cho 1 epoch (xac dinh hoan toan theo (seed, epoch) -> resume giua epoch ra dung batch cu).
+    Moi epoch can align_per_epoch = N * W * align_batch_size cap, sinh tu pool n_align (nho) bang cach lap lai pool:
+      - lang_ids != None (paper 4.3): moi ngon ngu nhan ~align_per_epoch / L cap, quay vong qua nhieu hoan vi
+        noi tiep -> phan phoi ngon ngu xap xi DEU;
       - nguoc lai: nhieu hoan vi noi tiep cua ca pool.
     Moi lat align = W * align_batch_size cap, chia rank theo buoc W -> moi rank dung align_batch_size cap
-    (all_gather cua contrastive loss can cung shape tren moi rank)."""
+    (all_gather cua contrastive loss, neu bat, can cung shape tren moi rank).
+    Plan nay KHONG anh huong toi chuoi TASK step (task do TokenBudgetBatchSampler quyet dinh)."""
 
-    def __init__(self, n_task, n_align, task_lengths, steps_per_side, world_size, rank, seed,
-                 task_batch_size, align_batch_size, lang_ids=None):
-        self.n_task, self.n_align = n_task, n_align
+    def __init__(self, n_align, steps_per_epoch_side, world_size, rank, seed, align_batch_size, lang_ids=None):
+        self.n_align = n_align
         self.lang_ids = None if lang_ids is None else np.asarray(lang_ids)
         self._lang_groups = None
         if self.lang_ids is not None:
             order = np.argsort(self.lang_ids, kind="stable")
             _, starts = np.unique(self.lang_ids[order], return_index=True)
             self._lang_groups = np.split(order, starts[1:])
-        self.task_lengths = np.asarray(task_lengths)
-        self.N, self.W, self.rank, self.seed = steps_per_side, world_size, rank, seed
-        self.task_per_step = task_batch_size * world_size              # sample task TOAN CUC / task step
-        self.task_per_epoch = self.task_per_step * steps_per_side
+        self.N, self.W, self.rank, self.seed = steps_per_epoch_side, world_size, rank, seed
         self.align_per_step = align_batch_size * world_size            # cap align TOAN CUC / align step
-        self.align_per_epoch = self.align_per_step * steps_per_side    # M
+        self.align_per_epoch = self.align_per_step * steps_per_epoch_side
 
     def _align_epoch_stream(self, epoch: int) -> np.ndarray:
-        """Day M = align_per_epoch chi so align (lap lai pool nho). Co lang_ids: phan phoi DEU giua cac ngon ngu."""
         M = self.align_per_epoch
         rng = np.random.default_rng([self.seed, epoch, 2])
         if self._lang_groups is None:
@@ -1561,126 +1653,10 @@ class AlternatePlan:
             parts.append(np.concatenate([rng.permutation(g) for _ in range(reps)])[:q])
         return rng.permutation(np.concatenate(parts))
 
-    def epoch_batches(self, epoch: int) -> Tuple[List[np.ndarray], List[np.ndarray]]:
-        # ---- task (anchor): 1 hoan vi cua TOAN BO pool, N lat bang nhau
-        t_perm = np.random.default_rng([self.seed, epoch, 1]).permutation(self.n_task)
-        t_perm = np.resize(t_perm, self.task_per_epoch)      # lap vong phan thieu (< 1 task step)
-        task_batches, align_batches = [], []
-        for k in range(self.N):
-            chunk = t_perm[k * self.task_per_step:(k + 1) * self.task_per_step]
-            chunk = chunk[np.argsort(self.task_lengths[chunk], kind="stable")]
-            task_batches.append(chunk[self.rank::self.W])
-        # ---- align: pool nho, lap lai de du N align step
+    def epoch_batches(self, epoch: int) -> List[np.ndarray]:
         a_stream = self._align_epoch_stream(epoch)
-        for k in range(self.N):
-            chunk = a_stream[k * self.align_per_step:(k + 1) * self.align_per_step]
-            align_batches.append(chunk[self.rank::self.W])
-        return task_batches, align_batches
-
-
-# ============================================================================================
-# Task step: LM loss (chi tren phan dap an) tren batch tron SQuAD/SNLI/MMLU (+ L_LB phu tro MoE)
-# Chia batch cua rank thanh micro-batch theo ngan sach token, cong don gradient.
-# ============================================================================================
-def make_micro_batches(sorted_idx: List[int], lengths: List[int], token_budget: int) -> List[List[int]]:
-    """sorted_idx da sap xep TANG DAN theo do dai -> sample moi them vao luon la dai nhat nen
-    kich thuoc padded cua micro-batch = so_sample * do_dai_sample_moi."""
-    micro, cur = [], []
-    for i in sorted_idx:
-        if cur and (len(cur) + 1) * int(lengths[i]) > token_budget:
-            micro.append(cur)
-            cur = []
-        cur.append(i)
-    if cur:
-        micro.append(cur)
-    return micro
-
-
-def collate_task_micro(pool: Dict, idx: List[int], pad_id: int):
-    """Ghep micro-batch tu ids DA TOKENIZE SAN (pool["flat"]/["offs"]) bang numpy — khong con goi
-    tokenizer 2 lan/sample moi step. Right-pad bang pad_id; nhan = token cua phan dap an
-    (prompt + padding = -100) — giong het cach mask cu."""
-    flat, offs, plen, lens_all = pool["flat"], pool["offs"], pool["prompt_len"], pool["lengths"]
-    lens = lens_all[idx]
-    B, T = len(idx), int(lens.max())
-    ids = np.full((B, T), pad_id, dtype=np.int64)
-    att = np.zeros((B, T), dtype=np.int64)
-    lab = np.full((B, T), -100, dtype=np.int64)
-    for r, i in enumerate(idx):
-        L, st, pl = int(lens[r]), int(offs[i]), int(plen[i])
-        row = flat[st:st + L]
-        ids[r, :L] = row
-        att[r, :L] = 1
-        lab[r, pl:L] = row[pl:]
-    return torch.from_numpy(ids), torch.from_numpy(att), torch.from_numpy(lab)
-
-
-def forward_backward_task_micro(ids_cpu, att_cpu, lab_cpu, model, device,
-                                 router_logits_cache, num_experts, top_k, lb_loss_coef,
-                                 loss_weight):
-    """Forward + backward cho 1 micro-batch. L_LM = cross-entropy CHI tren token cua phan dap an
-    ("<answer|label|letter><eos>"); prompt + padding bi mask -100 (giong cac file finetuning goc).
-
-    TOI UU: chay BACKBONE roi chi nhan lm_head tren cac vi tri co nhan (~1-5% token) thay vi tinh
-    logits [B, T, 151936] cho TOAN BO token (~5 GB bf16 / 16k token + them ~5 GB cho grad) roi moi
-    chon. Gia tri loss giong het (lm_head la ham theo tung vi tri). Cac chi so vi tri duoc tinh tren CPU
-    nen khong co device sync. Tra ve (stats[lm, lb, total, n_correct] tensor float64, n_answer_tokens)."""
-    input_ids = ids_cpu.to(device, non_blocking=True)
-    attention_mask = att_cpu.to(device, non_blocking=True)
-
-    shift_cpu = lab_cpu[:, 1:]
-    rows, cols = (shift_cpu != -100).nonzero(as_tuple=True)       # tren CPU
-    n_ans = int(rows.numel())
-    sel_labels = shift_cpu[rows, cols].to(device, non_blocking=True)
-    rows_d, cols_d = rows.to(device, non_blocking=True), cols.to(device, non_blocking=True)
-
-    router_logits_cache.clear()
-    backbone, lm_head = get_backbone_and_head(model)
-    if backbone is not None:
-        hidden = backbone(input_ids=input_ids, attention_mask=attention_mask,
-                          use_cache=False).last_hidden_state            # [B, T, H]
-        sel_logits = lm_head(hidden[:, :-1][rows_d, cols_d]) if n_ans else None   # [n_ans, V]
-        anchor = hidden.sum() * 0.0
-    else:                                                               # fallback: forward day du
-        logits = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
-        sel_logits = logits[:, :-1][rows_d, cols_d] if n_ans else None
-        anchor = logits.sum() * 0.0
-
-    lm_loss = F.cross_entropy(sel_logits.float(), sel_labels) if n_ans else anchor
-
-    if router_logits_cache and num_experts and top_k:
-        lb_loss = compute_load_balancing_loss(router_logits_cache, attention_mask, num_experts, top_k)
-        lb_loss = lb_loss.to(lm_loss.device)
-    else:
-        lb_loss = torch.zeros((), device=lm_loss.device)
-
-    total_loss = lm_loss + lb_loss_coef * lb_loss
-    (total_loss * loss_weight).backward()
-
-    with torch.no_grad():
-        n_correct = (sel_logits.argmax(dim=-1) == sel_labels).sum().to(torch.float64) if n_ans \
-            else torch.zeros((), dtype=torch.float64, device=lm_loss.device)
-        stats = torch.stack([lm_loss.detach().double(), lb_loss.detach().double(),
-                             total_loss.detach().double(), n_correct])
-    router_logits_cache.clear()
-    return stats, n_ans
-
-
-def compute_task_step(batch_idx: List[int], pool: Dict, pad_id: int, model, token_budget: int, device,
-                       router_logits_cache: list, num_experts, top_k, lb_loss_coef: float) -> dict:
-    n = len(batch_idx)
-    acc = torch.zeros(4, dtype=torch.float64, device=device)     # cong don tren GPU, 1 lan .tolist() cuoi step
-    n_ans_total = 0
-    for mb in make_micro_batches(batch_idx, pool["lengths"], token_budget):
-        ids, att, lab = collate_task_micro(pool, mb, pad_id)
-        st, cnt = forward_backward_task_micro(
-            ids, att, lab, model, device, router_logits_cache,
-            num_experts, top_k, lb_loss_coef, loss_weight=len(mb) / n)
-        w = len(mb)
-        acc += st * torch.tensor([w, w, w, 1.0], dtype=torch.float64, device=device)
-        n_ans_total += cnt
-    lm, lb, tot, correct = acc.tolist()
-    return {"lm": lm / n, "lb": lb / n, "tot": tot / n, "correct": correct, "ans": n_ans_total}
+        return [a_stream[k * self.align_per_step:(k + 1) * self.align_per_step][self.rank::self.W]
+                for k in range(self.N)]
 
 
 def reduce_metrics(vals: List[float], device, is_distributed: bool) -> List[float]:
@@ -1724,13 +1700,15 @@ def save_checkpoint_and_rotate(output_dir, model, optimizer, scheduler, epoch, s
 # Diagnostics: jsonl + plot (tach task loss va align loss vi 2 loai step khac nhau)
 # ============================================================================================
 def log_step_to_jsonl(jsonl_f, global_step, epoch, step_type, lm_loss=None, lb_loss=None,
-                       task_total_loss=None, token_acc=None, align_loss=None, n_samples=None):
+                       task_total_loss=None, token_acc=None, align_loss=None, n_samples=None, extra=None):
     rec = {
         "step": global_step, "epoch": epoch, "step_type": step_type,
         "lm_loss": lm_loss, "lb_loss": lb_loss, "task_total_loss": task_total_loss,
         "token_acc": token_acc, "align_loss": align_loss, "n_samples": n_samples,
         "timestamp": time.time(),
     }
+    if extra:
+        rec.update(extra)
     jsonl_f.write(json.dumps(rec, ensure_ascii=False) + "\n")     # handle mo san, line-buffered
 
 
@@ -1829,11 +1807,11 @@ def plot_all(jsonl_path, task_png, align_png, align_layer, smooth_window):
 # ============================================================================================
 # Hugging Face Hub push
 # ============================================================================================
-def build_model_card(args, num_experts, top_k, align_layer_0based, num_layers,
-                      lora_layers, n_task, n_align, steps_per_side,
-                      task_stats, world_size) -> str:
-    task_lines = "\n".join(f"  - {k}: {v['kept']} sample (doc {v['loaded']}, bo {v['dropped']})"
-                           for k, v in task_stats.items())
+def build_model_card(args, tasks, task_counts, num_experts, top_k, align_layer_0based, num_layers,
+                      lora_layers, n_align, steps_per_side, world_size) -> str:
+    task_lines = "\n".join(f"  - {k}: {v} sample" for k, v in task_counts.items())
+    shared = "attention / router / routed experts + shared expert" if args.include_shared_expert \
+        else "attention / router / routed experts (khong co shared expert)"
     return f"""---
 license: apache-2.0
 base_model: {args.model_name_or_path}
@@ -1847,35 +1825,36 @@ tags:
 - midalign
 ---
 
-# Qwen1.5-MoE-A2.7B-MidAlign (task = SQuAD + SNLI + MMLU)
+# Qwen1.5-MoE-A2.7B-MidAlign (task = SNLI + SQuAD + MMLU)
 
-LoRA adapter finetune tu `{args.model_name_or_path}` theo baseline **MidAlign**, Alternate
-Training: step chan = task step (LM loss), step le = contrastive align step.
+LoRA adapter finetune tu `{args.model_name_or_path}`, Alternate Training: step chan = **task step** (giong het
+finetuning english mix task), step le = **align step** (contrastive MidAlign, phan them vao).
 
-## Alternate Training
-- **Task step (chan)**: `L_task = L_LM + lb_loss_coef * L_LB`. `L_LM` chi tinh tren phan dap an
-  (prompt bi mask), tren pool gop cua cac tap: {", ".join(args.task_datasets)}.
+## Task step (chan) — giong file finetuning english mix task
+- `L_task = L_LM + lb_loss_coef * L_LB`, `L_LM` chi tinh tren phan dap an (prompt bi mask), chuan hoa theo tong token nhan toan cuc.
+- Tasks: {", ".join(tasks)}
 {task_lines}
-  - `lb_loss_coef` = {args.lb_loss_coef}, `num_experts` = {num_experts}, `top_k` = {top_k}
-- **Align step (le)**: contrastive Eq.(1) MidAlign ({args.align_loss}, negative trong mini-batch {args.align_micro_batch_size}) giua mean-pooled hidden state cau
-  tieng Anh va cau target tai layer {args.align_layer} (block 0-indexed = {align_layer_0based}
-  / {num_layers} layer), temperature = {args.align_temperature}.
-- Moi epoch: {steps_per_side} task step + {steps_per_side} align step. TASK la anchor: moi epoch dung HET {n_task} sample
-  task (SQuAD/SNLI/MMLU, English-only) >= 1 lan. Align = pool nho {n_align} cap (nguon: {", ".join(args.alignment_data)};
-  {args.align_pairs_per_lang} cap/ngon ngu, boc ngau nhien seed {args.seed}), lap lai de du
-  {steps_per_side * world_size * args.align_batch_size} cap align / epoch (dung nhu paper).
-- Contrastive: effective batch {args.align_batch_size}/rank, mini-batch {args.align_micro_batch_size}, global_negatives = {args.align_global_negatives}, mask_false_negatives = {args.mask_false_negatives}, lang_balance = {args.align_lang_balance}.
-- world_size = {world_size}, align_batch_size = {args.align_batch_size} (per-rank, anchor),
-  task_batch_size = {args.task_batch_size} (per-rank), task_micro_batch_tokens = {args.task_micro_batch_tokens}.
+- `lb_loss_coef` = {args.lb_loss_coef}, `num_experts` = {num_experts}, `top_k` = {top_k}
+- batch co dinh {args.batch_size} sample / rank (token-budget = {args.max_tokens_per_batch or "tat"}), pool_size = {args.pool_size}.
+
+## Align step (le)
+- Contrastive Eq.(1) MidAlign ({args.align_loss}, negative trong mini-batch {args.align_micro_batch_size}) giua mean-pooled hidden state
+  cau tieng Anh va cau target tai layer {args.align_layer} (block 0-indexed = {align_layer_0based} / {num_layers} layer), temperature = {args.align_temperature}.
+- Pool nho {n_align} cap (nguon: {", ".join(args.alignment_data)}; {args.align_pairs_per_lang} cap/ngon ngu, seed {args.seed}), lap lai de du
+  {steps_per_side * world_size * args.align_batch_size} cap align / epoch. global_negatives = {args.align_global_negatives},
+  mask_false_negatives = {args.mask_false_negatives}, lang_balance = {args.align_lang_balance}.
+
+## Lich
+- Moi epoch: {steps_per_side} task step + {steps_per_side} align step. LR scheduler (linear warmup {args.warmup_ratio} -> 0) tien 1 buoc moi cap (task, align).
+- world_size = {world_size}, task batch = {args.batch_size}/rank, align batch = {args.align_batch_size}/rank.
 
 ## LoRA
-- Layer finetune: `{format_layers(lora_layers)}` ({len(lora_layers)} layer, 0-indexed){' - chi dinh qua --layers' if args.layers else ' - mac dinh [L/3, 2L/3)'}, attention / router / experts + shared expert.
-- Rank: attention {args.lora_r_attn}, router {args.lora_r_router}, experts {args.lora_r_expert};
-  alpha = {args.lora_alpha}, dropout = {args.lora_dropout}.
+- Layer: `{format_layers(lora_layers)}` ({len(lora_layers)} layer, 0-indexed){' - chi dinh qua --layers' if args.layers else ' - mac dinh [L/3, 2L/3)'}, {shared}.
+- Rank: attention {args.lora_r_attn}, router {args.lora_r_router}, experts {args.lora_r_expert}; alpha = {args.lora_alpha}, dropout = {args.lora_dropout}.
 
 ## Training
-- {args.num_train_epochs} epoch, gradient all-reduce thu cong (khong DDP), checkpoint chi giu ban moi nhat.
-- Diagnostics (log theo tung step: `diagnostics/loss_log.jsonl`):
+- {args.num_train_epochs} epoch, lr {args.learning_rate}, gradient all-reduce thu cong (khong DDP), checkpoint chi giu ban moi nhat.
+- Diagnostics (`diagnostics/loss_log.jsonl`):
 
 ### Task steps (L_LM, L_LB, L_task_total, token acc)
 ![task loss](diagnostics/task_loss_curve.png)
@@ -1939,8 +1918,10 @@ def main():
     if not is_main:
         logger.setLevel(logging.WARNING)
 
+    tasks = parse_tasks(args.tasks)
     args.data_files = resolve_data_files(args.alignment_data, args.data_files)
     logger.info(f"--alignment_data={args.alignment_data} -> data_files={args.data_files}")
+    logger.info(f"Task mix (task step) = {tasks}")
 
     hf_token = load_hf_token(args.env_file, args.hf_token) if args.push_to_hub else None
 
@@ -1954,15 +1935,17 @@ def main():
 
     dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[args.dtype]
 
-    # ---------------------------------------------------------------------------------- model
+    # ---------------------------------------------------------------------------------- tokenizer
     logger.info(f"Dang load tokenizer va model tu {args.model_name_or_path} ...")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path,
                                                trust_remote_code=args.trust_remote_code)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
+    pad_id = int(tokenizer.pad_token_id)
 
-    load_kwargs = dict(trust_remote_code=args.trust_remote_code)
+    # ---------------------------------------------------------------------------------- model
+    load_kwargs = dict(trust_remote_code=args.trust_remote_code, attn_implementation=args.attn_implementation)
     load_kwargs["dtype" if transformers_at_least("4.56.0") else "torch_dtype"] = dtype
     base_model = None
     if device.type == "cuda":
@@ -2008,21 +1991,22 @@ def main():
                        f"({format_layers(lora_layers)}); chi cac layer LoRA <= block {align_layer_0based} "
                        f"nhan gradient tu contrastive loss.")
 
-    target_modules = build_lora_target_modules(base_model, layer_indices)
+    target_modules = build_lora_target_modules(base_model, layer_indices, args.include_shared_expert)
     if not target_modules:
         raise RuntimeError("Khong tim thay module attention/router/experts nao trong range layer. "
                            "Kiem tra regex trong build_lora_target_modules().")
-    attn_names, expert_names, router_names = categorize_lora_targets(target_modules)
+    attn_names, expert_names, router_names = categorize_lora_targets(target_modules, args.include_shared_expert)
     rank_pattern = build_rank_pattern(attn_names, expert_names, router_names,
                                        args.lora_r_attn, args.lora_r_expert, args.lora_r_router)
     logger.info(f"rank_pattern ({len(rank_pattern)} key regex): {rank_pattern}")
     logger.info(f"{len(target_modules)} target module LoRA: {len(attn_names)} attention "
-                f"(r={args.lora_r_attn}), {len(expert_names)} experts (r={args.lora_r_expert}), "
+                f"(r={args.lora_r_attn}), {len(expert_names)} experts (r={args.lora_r_expert}"
+                f"{', gom shared_expert' if args.include_shared_expert else ', KHONG gom shared_expert'}), "
                 f"{len(router_names)} router (r={args.lora_r_router}).")
 
     num_experts, top_k = infer_moe_dims(base_model.config, args)
     lb_loss_coef = args.lb_loss_coef
-    if lb_loss_coef is None:
+    if lb_loss_coef < 0:
         lb_loss_coef = float(getattr(base_model.config, "router_aux_loss_coef", 0.01))
     args.lb_loss_coef = lb_loss_coef
     logger.info(f"lb_loss_coef (task step) = {lb_loss_coef}")
@@ -2049,6 +2033,15 @@ def main():
     router_logits_cache: list = []
     hooks = register_router_hooks(model, router_names, router_logits_cache)
 
+    # Decoder + lm_head de task step chi tinh logits tai cac vi tri co nhan (giong file finetuning).
+    inner_lm = model.get_base_model()
+    decoder = getattr(inner_lm, "model", None)
+    if decoder is None and hasattr(inner_lm, "get_decoder"):
+        decoder = inner_lm.get_decoder()
+    if decoder is None:
+        raise RuntimeError(f"Khong tim thay decoder trong {type(inner_lm).__name__}")
+    lm_head = inner_lm.get_output_embeddings()
+
     # ------------------------------------------------------------------------------------ data
     cache_dir = None if args.no_cache else (args.cache_dir or os.path.join(args.output_dir, "cache"))
 
@@ -2058,6 +2051,7 @@ def main():
         h = hashlib.md5(json.dumps(sig, sort_keys=True, default=str).encode()).hexdigest()[:12]
         return os.path.join(cache_dir, f"{prefix}_{h}.pkl")
 
+    # ---- ALIGN pool (phan them vao)
     def _build_align():
         logger.info(f"Dang doc bitext {args.eng_key}-other tu {args.data_dir} ({args.data_files}) ...")
         prs, src = load_bitext_pairs(args.data_dir, args.data_files, args.eng_key,
@@ -2070,53 +2064,65 @@ def main():
             raise RuntimeError("Khong doc duoc cap bitext nao — kiem tra --data_dir / --data_files / --eng_key.")
         return {"pairs": prs, "src": src}
 
-    align_sig = {"v": 5, "ppl": args.align_pairs_per_lang, "ted_ppr": args.ted_pairs_per_record, "files": file_signature([os.path.join(args.data_dir, f) for f in args.data_files]),
+    align_sig = {"v": 5, "ppl": args.align_pairs_per_lang, "ted_ppr": args.ted_pairs_per_record,
+                 "files": file_signature([os.path.join(args.data_dir, f) for f in args.data_files]),
                  "eng_key": args.eng_key, "mlp": args.max_lang_pairs_per_record, "seed": args.seed,
                  "max_samples": args.max_samples}
     align_data = cached_build(_cache_path("align", align_sig), _build_align, is_main, is_distributed)
     pairs, align_src = align_data["pairs"], align_data["src"]
     del align_data
 
+    # ---- TASK data: build_mixed_examples cua file finetuning (cung doc/prompt/windowing/tokenize/loc)
     def _build_task():
-        logger.info(f"Dang doc + build pool task ({args.task_datasets}) ...")
-        pl = build_task_pool(args, tokenizer)
-        if len(pl["lengths"]) == 0:
-            raise RuntimeError("Pool task rong — kiem tra --squad_file / --snli_file / --mmlu_file.")
-        return pl
+        logger.info(f"Dang chuan bi du lieu mix {tasks} (nhu file finetuning) ...")
+        exs = build_mixed_examples(args, tokenizer, tasks)
+        if len(exs) == 0:
+            raise RuntimeError("Khong co sample task nao sau khi build du lieu.")
+        return exs
 
-    task_sig = {"v": 2, "files": file_signature([args.squad_file, args.snli_file, args.mmlu_file]),
-                "ds": args.task_datasets, "max_len": args.task_max_length, "mts": args.max_task_samples,
-                "seed": args.seed, "tok": [tokenizer.name_or_path, len(tokenizer), tokenizer.eos_token]}
-    pool = cached_build(_cache_path("task", task_sig), _build_task, is_main, is_distributed)
-    task_lengths, task_stats = pool["lengths"], pool["stats"]
-    pad_id = int(tokenizer.pad_token_id)
+    task_sig = {"v": DATA_FORMAT_VERSION, "tasks": tasks,
+                "files": file_signature([getattr(args, TASK_REGISTRY[t]["file_arg"]) for t in tasks]),
+                "max_len": args.task_max_length, "mspt": args.max_samples_per_task, "seed": args.seed,
+                "tok": [tokenizer.name_or_path, len(tokenizer), tokenizer.eos_token]}
+    examples = cached_build(_cache_path("task", task_sig), _build_task, is_main, is_distributed)
 
-    n_task, n_align = len(task_lengths), len(pairs)
-    task_bs, align_bs = int(args.task_batch_size), int(args.align_batch_size)
-    if task_bs < 1:
-        raise ValueError(f"--task_batch_size phai >= 1 (nhan duoc {args.task_batch_size}).")
+    lengths = np.fromiter((len(ex["input_ids"]) for ex in examples), dtype=np.int64, count=len(examples))
+    label_tokens = np.fromiter((ex["n_lab"] for ex in examples), dtype=np.int64, count=len(examples))
+    task_counts = {t: int(sum(1 for ex in examples if ex["task"] == i)) for i, t in enumerate(tasks)}
+    logger.info("So sample moi task sau khi loc: " + ", ".join(f"{t}={c}" for t, c in task_counts.items())
+                + f" | tong={len(examples)}")
+
+    # ---- Lich: TASK sampler cua file finetuning quyet dinh N; ALIGN chay N step xen ke
+    batch_sampler = TokenBudgetBatchSampler(
+        lengths, label_tokens, max_tokens=args.max_tokens_per_batch, max_batch_size=args.max_batch_size,
+        world_size=world_size, rank=rank, seed=args.seed, num_epochs=args.num_train_epochs,
+        pool_size=args.pool_size, batch_size=args.batch_size,
+    )
+    N = batch_sampler.steps_per_epoch               # so task step / epoch (= so align step / epoch)
+    steps_per_epoch = 2 * N                         # luon chan -> epoch nao cung bat dau bang task step
+    total_task_steps = N * args.num_train_epochs    # == total_steps cua file finetuning (cung cau hinh)
+    total_steps = steps_per_epoch * args.num_train_epochs
+
+    n_align, align_bs = len(pairs), int(args.align_batch_size)
     if align_bs < 2:
         raise ValueError(f"--align_batch_size phai >= 2 (contrastive can >= 2 cap/rank; nhan duoc {align_bs}).")
-    N = solve_schedule(n_task, world_size, task_bs)                      # TASK la anchor
-    steps_per_epoch = 2 * N                       # luon chan -> epoch nao cung bat dau bang task step
-    total_steps = steps_per_epoch * args.num_train_epochs
-    task_per_epoch = N * world_size * task_bs     # >= n_task (dem them < 1 task step)
-    align_per_epoch = N * world_size * align_bs   # cap align can moi epoch (lap lai pool nho)
+    align_per_epoch = N * world_size * align_bs
     align_cover = align_per_epoch / n_align
     src_counts = np.bincount(align_src.astype(np.int64)).tolist() if len(align_src) else []
+    batch_mode = (f"token-budget (max_tokens={args.max_tokens_per_batch})" if args.max_tokens_per_batch > 0
+                  else f"batch co dinh {args.batch_size}/rank (toan cuc {args.batch_size * world_size})")
     logger.info(
-        f"[schedule] ANCHOR = TASK | n_task={n_task} (SQuAD/SNLI/MMLU) -> moi sample dung >= 1 lan/epoch | "
-        f"N={N} task step + {N} align step / epoch (steps_per_epoch={steps_per_epoch}, "
-        f"total_steps={total_steps}) | batch/rank: task={task_bs}, align={align_bs} | "
-        f"align: pool nho {n_align} cap (seed={args.seed}, {args.align_pairs_per_lang}/ngon ngu; theo file "
-        f"{args.data_files}: {src_counts}), moi epoch can {align_per_epoch} cap = {align_cover:.1f}x pool "
-        f"(LAP LAI, dung nhu paper)."
-    )
+        f"[schedule] TASK step = finetuning english mix: {len(examples)} sample, {batch_mode}, ~{batch_sampler.mean_batch_size:.1f} "
+        f"sample/batch, padding eff ~{batch_sampler.padding_efficiency * 100:.1f}% | N={N} task step + {N} align step / epoch "
+        f"(steps_per_epoch={steps_per_epoch}, total_steps={total_steps}, task_steps_total={total_task_steps}) | "
+        f"align: pool {n_align} cap (seed={args.seed}, {args.align_pairs_per_lang}/ngon ngu; theo file {args.data_files}: "
+        f"{src_counts}), batch {align_bs}/rank, can {align_per_epoch} cap/epoch = {align_cover:.1f}x pool (LAP LAI).")
     if align_cover > 100:
         logger.warning(
             f"[canh bao] Moi cap align bi lap ~{align_cover:.0f} lan / epoch (~{align_cover * args.num_train_epochs:.0f} "
-            f"lan trong {args.num_train_epochs} epoch). Paper cung lap pool nho nhieu lan, nhung neu thay align "
-            f"loss ve ~0 som (overfit) hay giam --num_train_epochs hoac tang --align_pairs_per_lang.")
+            f"lan trong {args.num_train_epochs} epoch) vi task step nho (--batch_size {args.batch_size}) cho nhieu step. "
+            f"Neu align loss ve ~0 som (overfit) hoac align step qua cham: giam --align_batch_size, "
+            f"tang --align_pairs_per_lang, hoac giam --num_train_epochs.")
 
     lang_ids = None
     if args.align_lang_balance:
@@ -2126,22 +2132,20 @@ def main():
         cnt = np.bincount(lang_ids, minlength=len(lang_names))
         logger.info(f"[align] resample DEU {len(lang_names)} ngon ngu: ~{align_per_epoch // len(lang_names)} "
                     f"cap/ngon ngu/epoch (pool: min={int(cnt.min())}, max={int(cnt.max())} cap/ngon ngu).")
-    plan = AlternatePlan(n_task, n_align, task_lengths, N, world_size, rank, args.seed, task_bs, align_bs,
-                         lang_ids)
+    align_plan = AlignPlan(n_align, N, world_size, rank, args.seed, align_bs, lang_ids)
 
     # ------------------------------------------------------------------------------- optimizer
     use_fused = device.type == "cuda"
     optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate,
                                    weight_decay=args.weight_decay,
                                    fused=True if use_fused else None, foreach=None if use_fused else True)
-    warmup_steps = max(1, int(total_steps * args.warmup_ratio))
-
-    def _inv_sqrt(step: int) -> float:
-        # paper: inverse square root schedule, warmup tuyen tinh -> lr_max, sau do lr_max * sqrt(warmup / step)
-        step = step + 1
-        return step / warmup_steps if step < warmup_steps else (warmup_steps / step) ** 0.5
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _inv_sqrt)
+    # Giong file finetuning: linear warmup (3%) -> linear decay ve 0, tinh theo TASK step. scheduler.step() chi goi
+    # 1 lan moi CAP (task k, align k) => task step k dung dung LR cua file finetuning o step k.
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=int(total_task_steps * args.warmup_ratio),
+        num_training_steps=total_task_steps,
+    )
 
     start_epoch, start_step_in_epoch, global_step = 0, 0, 0
     prev_checkpoint_dir = resume_dir
@@ -2175,9 +2179,17 @@ def main():
     # RNG rieng moi rank (dropout LoRA khac nhau giua cac rank)
     torch.manual_seed(args.seed + 7919 * rank + global_step)
 
-    readme_text = build_model_card(args, num_experts, top_k, align_layer_0based, num_layers,
-                                    lora_layers, n_task, n_align, N,
-                                    task_stats, world_size)
+    n_tasks = len(tasks)
+    ctx = SimpleNamespace(
+        decoder=decoder, lm_head=lm_head, router_cache=router_logits_cache,
+        num_experts=num_experts, top_k=top_k, lb_loss_coef=lb_loss_coef,
+        pad_id=pad_id, device=device, n_tasks=n_tasks, world_size=world_size,
+        stats=torch.zeros(_N_BASE_STATS + 3 * n_tasks, dtype=torch.float32, device=device),
+        global_tokens=1.0,
+    )
+
+    readme_text = build_model_card(args, tasks, task_counts, num_experts, top_k, align_layer_0based, num_layers,
+                                    lora_layers, n_align, N, world_size)
 
     def _save_and_push(epoch_, step_in_epoch_, final=False):
         nonlocal prev_checkpoint_dir
@@ -2198,10 +2210,12 @@ def main():
     # ------------------------------------------------------------------------------ training loop
     last_done = (start_epoch, start_step_in_epoch - 1)  # (epoch, step_in_epoch) cuoi cung HOAN THANH
     jsonl_f = open(jsonl_path, "a", buffering=1, encoding="utf-8") if is_main else None
+    model.train()
     try:
         for epoch in range(start_epoch, args.num_train_epochs):
             step_offset = start_step_in_epoch if epoch == start_epoch else 0
-            task_batches, align_batches = plan.epoch_batches(epoch)
+            task_plan = batch_sampler.plan(epoch)            # N phan tu (batch_idx_cua_rank, global_label_tokens)
+            align_batches = align_plan.epoch_batches(epoch)  # N mang chi so align cua rank nay
 
             pbar = tqdm(range(step_offset, steps_per_epoch), total=steps_per_epoch,
                         initial=step_offset, desc=f"Epoch {epoch + 1}/{args.num_train_epochs}",
@@ -2210,28 +2224,33 @@ def main():
                 model.train()
                 optimizer.zero_grad(set_to_none=True)
 
-                # Alternate Training: step chan = task, step le = align
-                # (steps_per_epoch chan nen step_in_epoch % 2 == global_step % 2)
+                # Alternate Training: step chan = task, step le = align (steps_per_epoch chan)
                 k = step_in_epoch // 2
                 if step_in_epoch % 2 == 0:
+                    # ======== TASK step: y het vong lap cua file finetuning ========
                     step_type = "task"
-                    r = compute_task_step(
-                        task_batches[k].tolist(), pool, pad_id, model,
-                        args.task_micro_batch_tokens, device,
-                        router_logits_cache, num_experts, top_k, lb_loss_coef)
-                    n_local = len(task_batches[k])
-                    sums = reduce_metrics(
-                        [r["lm"], r["lb"], r["tot"], r["correct"], r["ans"], 1.0, n_local],
-                        device, is_distributed)
-                    nr = sums[5]
-                    log_kwargs = dict(lm_loss=sums[0] / nr, lb_loss=sums[1] / nr,
-                                       task_total_loss=sums[2] / nr,
-                                       token_acc=sums[3] / max(sums[4], 1.0),
-                                       align_loss=None, n_samples=int(sums[6]))
-                    postfix = {"type": "task", "L_LM": f"{log_kwargs['lm_loss']:.4f}",
-                               "L_LB": f"{log_kwargs['lb_loss']:.4f}",
-                               "acc": f"{log_kwargs['token_acc']:.3f}"}
+                    batch_idx, global_label_tokens = task_plan[k]
+                    batch_examples = [examples[i] for i in batch_idx]
+                    ctx.global_tokens = float(global_label_tokens)
+
+                    run_batch_with_dynamic_oom_handling(batch_examples, ctx, optimizer, args.min_batch_size)
+
+                    if is_distributed:
+                        dist.all_reduce(ctx.stats, op=dist.ReduceOp.SUM)
+                    result = stats_to_result(ctx.stats.tolist(), tasks, lb_loss_coef)
+                    do_step = result["n_processed"] > 0  # giong nhau tren moi rank sau all-reduce
+                    if do_step:
+                        if is_distributed:
+                            sync_grads_across_ranks(trainable_params, world_size, average=False)  # SUM
+                    log_kwargs = dict(
+                        lm_loss=result["lm_loss"], lb_loss=result["lb_loss"],
+                        task_total_loss=result["total_loss"], token_acc=result["label_acc"],
+                        align_loss=None, n_samples=result["n_processed"],
+                        extra={"task_loss": result["task_loss"], "n_skipped": result["n_skipped"]})
+                    postfix = {"type": "task", "L_LM": f"{result['lm_loss']:.4f}",
+                               "L_LB": f"{result['lb_loss']:.4f}", "acc": f"{result['label_acc']:.3f}"}
                 else:
+                    # ======== ALIGN step (phan them vao) ========
                     step_type = "align"
                     batch = [pairs[i] for i in align_batches[k].tolist()]
                     eng_texts = [b[0] for b in batch]
@@ -2245,21 +2264,25 @@ def main():
                         symmetric=(args.align_loss == "symmetric"))
                     router_logits_cache.clear()
                     sums = reduce_metrics([align_loss_val, 1.0, len(batch)], device, is_distributed)
+                    do_step = True
+                    if is_distributed:
+                        sync_grads_across_ranks(trainable_params, world_size, average=True)  # MEAN
                     log_kwargs = dict(align_loss=sums[0] / sums[1], n_samples=int(sums[2]))
                     postfix = {"type": "align", "L_align": f"{log_kwargs['align_loss']:.4f}"}
 
-                if is_distributed:
-                    sync_grads_across_ranks(trainable_params, world_size)
-                torch.nn.utils.clip_grad_norm_(trainable_params, args.gradient_clip_norm)
-                optimizer.step()
-                scheduler.step()
+                if do_step:
+                    torch.nn.utils.clip_grad_norm_(trainable_params, args.gradient_clip_norm)
+                    optimizer.step()
+                if step_in_epoch % 2 == 1:
+                    scheduler.step()      # 1 buoc LR / cap (task k, align k)
                 global_step += 1
                 last_done = (epoch, step_in_epoch)
 
                 if is_main:
                     if global_step % args.log_every == 0:
                         pbar.set_postfix(postfix)
-                    log_step_to_jsonl(jsonl_f, global_step, epoch, step_type, **log_kwargs)
+                    if do_step:
+                        log_step_to_jsonl(jsonl_f, global_step, epoch, step_type, **log_kwargs)
                     if args.plot_every and global_step % args.plot_every == 0:
                         plot_all(jsonl_path, task_plot_path, align_plot_path, args.align_layer,
                                  args.smooth_window)
